@@ -1,0 +1,32 @@
+# Common build artifacts and local state that must NOT be copied into images.
+**/.git
+**/.gitignore
+**/node_modules
+**/.next
+**/out
+**/dist
+**/build
+**/__pycache__
+**/.pytest_cache
+**/.venv
+**/venv
+**/.mypy_cache
+**/.ruff_cache
+**/.ipynb_checkpoints
+**/.DS_Store
+**/Thumbs.db
+
+# Local data volumes / runtime
+storage
+postgres-data
+redis-data
+
+# Local secrets
+.env
+.env.local
+.env.*.local
+
+# Editor
+**/.idea
+**/.vscode
+*.swp

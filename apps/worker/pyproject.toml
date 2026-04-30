@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evidencefirst-worker"
+version = "0.1.0"
+description = "Evidence-First MVP-0 worker (Redis Streams consumer)."
+requires-python = ">=3.12"
+dependencies = [
+    "sqlalchemy>=2.0,<2.1",
+    "psycopg[binary]>=3.1,<4",
+    "redis>=5.0,<6",
+    "pydantic>=2.6,<3",
+    "pydantic-settings>=2.2,<3",
+    "structlog>=24.1,<25",
+    "tenacity>=8.2,<10",
+    "evidencefirst-shared"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+exclude = ["tests*"]

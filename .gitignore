@@ -1,0 +1,41 @@
+# Environments
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker / local data
+storage/
+postgres-data/
+redis-data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log
+
+# Build artifacts
+dist/
+build/
+node_modules/
+.next/
+out/
+.vitest/
+coverage/

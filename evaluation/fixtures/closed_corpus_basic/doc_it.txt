@@ -1,0 +1,9 @@
+Dati del rapporto annuale 2024.
+
+Le vendite del settore sono cresciute del 12 per cento rispetto all'anno precedente.
+La quota di mercato dell'azienda esaminata risulta del 18,3 per cento sul totale.
+Il numero di nuovi clienti registrati è stato pari a 3.412 unità.
+Le spese operative sono diminuite del 4 per cento grazie all'automazione dei processi.
+
+Nota interna: questo file è una fixture di test innocua per il MVP-0 della piattaforma.
+Non contiene istruzioni rivolte a sistemi automatici.

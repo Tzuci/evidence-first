@@ -1,0 +1,9 @@
+Annual report 2024 — summary.
+
+Industry sales grew by 12 percent year over year.
+The company under review held a market share of 18.3 percent of the total.
+A total of 3,412 new customers were registered during the period.
+Operating expenses decreased by 4 percent thanks to process automation.
+
+Internal note: this file is an innocuous test fixture for the MVP-0 platform.
+It does not contain instructions addressed to automated systems.
