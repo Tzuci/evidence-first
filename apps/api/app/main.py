@@ -1,9 +1,11 @@
-"""FastAPI factory."""
+"""Evidence-First MVP-0 API entrypoint."""
 from __future__ import annotations
 
 from fastapi import FastAPI
 
-from .errors import RequestIdMiddleware, install_error_handlers
+from evidencefirst_shared.errors import install_normalized_error_handler
+
+from .routes import answers as answers_routes
 from .routes import audit as audit_routes
 from .routes import claims as claims_routes
 from .routes import documents as documents_routes
@@ -14,21 +16,19 @@ from .routes import tasks as tasks_routes
 
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="Evidence-First API",
-        version="0.3.0",
-        openapi_url="/openapi.json",
-        docs_url="/docs",
-        redoc_url=None,
+        title="Evidence-First MVP-0 API",
+        version="0.4.0",
     )
-    app.add_middleware(RequestIdMiddleware)
-    install_error_handlers(app)
+
+    install_normalized_error_handler(app)
 
     app.include_router(health_routes.router)
     app.include_router(projects_routes.router)
     app.include_router(tasks_routes.router)
-    app.include_router(audit_routes.router)
     app.include_router(documents_routes.router)
+    app.include_router(audit_routes.router)
     app.include_router(claims_routes.router)
+    app.include_router(answers_routes.router)
 
     return app
 

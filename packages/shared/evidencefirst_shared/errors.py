@@ -67,7 +67,12 @@ class NormalizedError(Exception):
         self.remediation_hint = remediation_hint
         self.http_status = http_status or HTTP_STATUS.get(code, 500)
 
-    def to_envelope(self, *, request_id: str | None = None, policy_version: str | None = None) -> dict[str, Any]:
+    def to_envelope(
+        self,
+        *,
+        request_id: str | None = None,
+        policy_version: str | None = None,
+    ) -> dict[str, Any]:
         return {
             "error": {
                 "code": self.code.value,
@@ -78,3 +83,51 @@ class NormalizedError(Exception):
                 "remediation_hint": self.remediation_hint,
             }
         }
+
+
+# ---------------------------------------------------------------------------
+# FastAPI integration
+# ---------------------------------------------------------------------------
+def install_normalized_error_handler(app: Any) -> None:
+    """Install FastAPI exception handlers for normalized errors.
+
+    Response envelope:
+        {"error": {"code": "...", "message": "...", "details": {...}, ...}}
+
+    This handles:
+      - application-raised NormalizedError;
+      - FastAPI/Pydantic RequestValidationError, so validation failures do not
+        leak FastAPI's default {"detail": [...]} shape.
+    """
+    from fastapi import Request
+    from fastapi.encoders import jsonable_encoder
+    from fastapi.exceptions import RequestValidationError
+    from fastapi.responses import JSONResponse
+
+    @app.exception_handler(NormalizedError)
+    async def _normalized_error_handler(
+        request: Request,
+        exc: NormalizedError,
+    ) -> JSONResponse:
+        request_id = request.headers.get("x-request-id")
+        return JSONResponse(
+            status_code=exc.http_status,
+            content=exc.to_envelope(request_id=request_id),
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_error_handler(
+        request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        request_id = request.headers.get("x-request-id")
+        normalized = NormalizedError(
+            ErrorCode.VALIDATION_ERROR,
+            "Validation error",
+            details={"errors": jsonable_encoder(exc.errors())},
+            http_status=HTTP_STATUS[ErrorCode.VALIDATION_ERROR],
+        )
+        return JSONResponse(
+            status_code=normalized.http_status,
+            content=normalized.to_envelope(request_id=request_id),
+        )
