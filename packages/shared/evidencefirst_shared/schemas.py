@@ -125,7 +125,7 @@ class AuditEventRead(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Claims (Fase 8.3)
+# Claims (Fase 8.3, invariati)
 # ---------------------------------------------------------------------------
 class RawClaimRead(BaseModel):
     id: uuid.UUID
@@ -194,3 +194,92 @@ class ClaimEvidenceRead(BaseModel):
     latest_entry: ClaimLedgerEntryRead | None
     evidence_links: list[ClaimEvidenceLinkRead]
     verification_records: list[VerificationRecordRead]
+
+
+# ---------------------------------------------------------------------------
+# Answers / Gate / Published (Fase 8.4)
+# ---------------------------------------------------------------------------
+class AgentRunRead(BaseModel):
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    project_id: uuid.UUID
+    task_id: uuid.UUID
+    run_kind: str
+    attempt_no: int
+    status: str
+    started_at: _dt.datetime
+    ended_at: _dt.datetime | None
+    payload: dict[str, Any]
+
+
+class FinalAnswerSpanRead(BaseModel):
+    id: uuid.UUID
+    draft_final_answer_id: uuid.UUID
+    span_index: int
+    char_start: int
+    char_end: int
+    span_text: str
+    span_hash: str
+    created_at: _dt.datetime
+
+
+class FinalAnswerSpanClaimLinkRead(BaseModel):
+    id: uuid.UUID
+    final_answer_span_id: uuid.UUID
+    claim_ledger_entry_id: uuid.UUID
+    claim_logical_id: uuid.UUID
+    link_role: str
+    created_at: _dt.datetime
+
+
+class CoverageGapStatementRead(BaseModel):
+    id: uuid.UUID
+    draft_final_answer_id: uuid.UUID
+    kind: str
+    severity: str
+    gap_key: str
+    details: dict[str, Any]
+    created_at: _dt.datetime
+
+
+class DraftFinalAnswerRead(BaseModel):
+    id: uuid.UUID
+    task_id: uuid.UUID
+    version_no: int
+    compiler_name: str
+    compiler_version: str
+    summary_text: str
+    payload: dict[str, Any]
+    created_at: _dt.datetime
+
+
+class DraftFinalAnswerWithSpansRead(BaseModel):
+    """Aggregate returned by GET /api/v1/tasks/{task_id}/draft."""
+    draft: DraftFinalAnswerRead
+    spans: list[FinalAnswerSpanRead]
+
+
+class FinalGateReportRead(BaseModel):
+    id: uuid.UUID
+    task_id: uuid.UUID
+    draft_final_answer_id: uuid.UUID
+    decision: str
+    reason_code: str
+    payload: dict[str, Any]
+    created_at: _dt.datetime
+    coverage_gap_statements: list[CoverageGapStatementRead] = Field(default_factory=list)
+
+
+class PublishedAnswerRead(BaseModel):
+    id: uuid.UUID
+    task_id: uuid.UUID
+    draft_final_answer_id: uuid.UUID
+    final_gate_report_id: uuid.UUID
+    version_no: int
+    content_hash: str
+    payload: dict[str, Any]
+    status: str
+    published_at: _dt.datetime
+    withdrawn_at: _dt.datetime | None
+    superseded_at: _dt.datetime | None
+    superseded_by_id: uuid.UUID | None
