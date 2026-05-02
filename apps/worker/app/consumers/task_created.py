@@ -1,25 +1,53 @@
-"""task.created consumer (Phase 8.3).
+"""task.created consumer (Phase 8.4, realigned).
 
-If the task has attached documents:
-  - created -> analyzing  (audit task.analyzing)
-  - audit task.docs_loaded with counts
-  - run extractor:
-      audit task.claims_extracted
-      audit task.claims_classified
-      audit task.claims_ledger_initialized
-  - run CVE-lite:
-      audit task.cve_lite_started
-      audit task.cve_lite_completed
-  - analyzing -> analyzed_partial
-      audit task.analyzed_partial
-        reason='claims_verified_by_cve_lite_compilation_pending'
+Pipeline single-consumer. The 8.3 pipeline (extractor + CVE-lite -> analyzed_partial)
+is preserved. After 'task.analyzed_partial', the consumer continues in the same
+event loop with the 8.4 stage (compiler + final answer gate -> published or
+publication_held).
 
-If the task has no attached documents:
-  - created -> analyzing -> blocked (unchanged from 8.1d-patch1)
+Terminality (Phase 8.4, FINAL):
+  - blocked                                                             -> terminal
+  - published                                                            -> terminal
+  - analyzed_partial AND final_gate_reports exists for task              -> terminal (rejected scenario)
+  - analyzed_partial AND no final_gate_reports                           -> NOT terminal, proceeds to compiling
+  - compiling AND no final_gate_reports                                  -> NOT terminal, RESUMES compiler+gate
+  - compiling AND final_gate_reports exists                              -> finalize: drive task to
+                                                                            'published' (if approved) or
+                                                                            back to 'analyzed_partial' (if rejected),
+                                                                            using the existing report. NEVER mark
+                                                                            succeeded leaving the task in 'compiling'
+                                                                            without a final_gate_report.
+  - created/analyzing                                                    -> normal pipeline
+
+Audit sequence (with documents, approved scenario):
+  task.analyzing
+  task.docs_loaded
+  task.claims_extracted
+  task.claims_classified
+  task.claims_ledger_initialized
+  task.cve_lite_started
+  task.cve_lite_completed
+  task.analyzed_partial
+  task.compiling
+  task.draft_compiled
+  task.final_gate_started
+  task.final_gate_completed
+  task.published
+
+Audit sequence (with documents, rejected scenario):
+  ... up to task.final_gate_completed, then:
+  task.publication_held
+
+Resume cases (NOT a fresh run): when the consumer enters with the task already
+in 'compiling' or 'analyzed_partial', the corresponding state-transition audit
+events are NOT re-emitted (they were emitted on the original run). The
+sub-pipeline functions are guarded by status conditions to keep audit history
+free of duplicates.
 
 FK-safety (8.1d-patch1) and post-commit publish (8.1d) preserved.
-Idempotent under redelivery: status guards on every UPDATE; extractor and
-CVE-lite use ON CONFLICT DO NOTHING on every INSERT.
+Idempotent under redelivery: every state transition is guarded by the current
+status; every INSERT in services uses ON CONFLICT DO NOTHING on UNIQUE
+constraints declared in 0004 / 0005.
 """
 from __future__ import annotations
 
@@ -34,13 +62,18 @@ from evidencefirst_shared.db.audit import audit_append
 from evidencefirst_shared.db.idempotency import begin_processing, mark_failed, mark_succeeded
 
 from ..db import transaction
+from ..services.compiler import run_compilation
 from ..services.cve_lite import run_cve_lite
 from ..services.extractor import run_extraction
+from ..services.final_answer_gate import run_final_answer_gate
 
 
 logger = structlog.get_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# read helpers
+# ---------------------------------------------------------------------------
 def _fetch_task_status(conn: Connection, task_id: uuid.UUID) -> str | None:
     row = conn.execute(
         text("SELECT status FROM task_masters WHERE id = :id"),
@@ -55,6 +88,50 @@ def _has_documents(conn: Connection, task_id: uuid.UUID) -> bool:
         {"id": task_id},
     ).scalar_one()
     return int(n) > 0
+
+
+def _fetch_existing_gate_report_for_task(
+    conn: Connection, task_id: uuid.UUID
+) -> dict[str, Any] | None:
+    """Return the existing final_gate_reports row for the task, or None.
+
+    Thanks to the composite FK final_gate_reports_draft_consistency in 0005,
+    final_gate_reports.task_id is guaranteed to match the underlying draft's
+    task_id, so we can query final_gate_reports directly.
+    """
+    row = conn.execute(
+        text(
+            """
+            SELECT id, draft_final_answer_id, decision, reason_code
+            FROM final_gate_reports
+            WHERE task_id = :tid
+            LIMIT 1
+            """
+        ),
+        {"tid": task_id},
+    ).first()
+    if row is None:
+        return None
+    return dict(row._mapping)
+
+
+def _fetch_existing_published_answer_for_task(
+    conn: Connection, task_id: uuid.UUID
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        text(
+            """
+            SELECT id
+            FROM published_answers
+            WHERE task_id = :tid AND version_no = 1
+            LIMIT 1
+            """
+        ),
+        {"tid": task_id},
+    ).first()
+    if row is None:
+        return None
+    return dict(row._mapping)
 
 
 def _docs_load_counts(conn: Connection, task_id: uuid.UUID) -> dict[str, int]:
@@ -83,6 +160,9 @@ def _docs_load_counts(conn: Connection, task_id: uuid.UUID) -> dict[str, int]:
     }
 
 
+# ---------------------------------------------------------------------------
+# state transitions (8.3)
+# ---------------------------------------------------------------------------
 def _advance_to_analyzing(
     conn: Connection,
     *,
@@ -158,7 +238,10 @@ def _advance_to_blocked_no_docs(
     )
 
 
-def _run_pipeline_with_docs(
+# ---------------------------------------------------------------------------
+# 8.3 sub-pipeline (extract + cve_lite + analyzed_partial)
+# ---------------------------------------------------------------------------
+def _run_8_3_extract_and_verify(
     conn: Connection,
     *,
     task_id: uuid.UUID,
@@ -286,6 +369,368 @@ def _run_pipeline_with_docs(
     )
 
 
+# ---------------------------------------------------------------------------
+# 8.4 sub-pipeline (compiler + gate)
+# ---------------------------------------------------------------------------
+def _advance_to_compiling(
+    conn: Connection,
+    *,
+    task_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    project_id: uuid.UUID,
+    consumer_name: str,
+) -> bool:
+    """Try to transition analyzed_partial -> compiling. Audit on success.
+
+    Returns True if the transition happened, False otherwise.
+    """
+    r = conn.execute(
+        text(
+            """
+            UPDATE task_masters SET status = 'compiling'
+            WHERE id = :id AND status = 'analyzed_partial'
+            RETURNING id
+            """
+        ),
+        {"id": task_id},
+    ).first()
+    if r is None:
+        return False
+    audit_append(
+        conn,
+        chain_scope="task",
+        tenant_id=tenant_id, project_id=project_id, task_id=task_id, session_id=None,
+        event_type="task.compiling",
+        actor_type="job", actor_id=consumer_name,
+        redacted_payload={"transition": "analyzed_partial->compiling"},
+        related_entity_type="task_masters",
+        related_entity_id=task_id,
+    )
+    return True
+
+
+def _advance_to_published(
+    conn: Connection,
+    *,
+    task_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    project_id: uuid.UUID,
+    consumer_name: str,
+    final_gate_report_id: str,
+    published_answer_id: str,
+    reason_code: str,
+) -> bool:
+    """Try to transition compiling -> published. Audit on success.
+
+    Returns True if the transition happened, False otherwise.
+    """
+    r = conn.execute(
+        text(
+            """
+            UPDATE task_masters SET status = 'published'
+            WHERE id = :id AND status = 'compiling'
+            RETURNING id
+            """
+        ),
+        {"id": task_id},
+    ).first()
+    if r is None:
+        return False
+    audit_append(
+        conn,
+        chain_scope="task",
+        tenant_id=tenant_id, project_id=project_id, task_id=task_id, session_id=None,
+        event_type="task.published",
+        actor_type="job", actor_id=consumer_name,
+        redacted_payload={
+            "transition": "compiling->published",
+            "reason_code": reason_code,
+            "final_gate_report_id": final_gate_report_id,
+            "published_answer_id": published_answer_id,
+        },
+        related_entity_type="task_masters",
+        related_entity_id=task_id,
+    )
+    return True
+
+
+def _revert_to_analyzed_partial_with_held(
+    conn: Connection,
+    *,
+    task_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    project_id: uuid.UUID,
+    consumer_name: str,
+    final_gate_report_id: str,
+    reason_code: str,
+    coverage_gaps_emitted: int,
+) -> bool:
+    """Try to transition compiling -> analyzed_partial with publication_held audit.
+
+    Returns True if the transition happened, False otherwise.
+    """
+    r = conn.execute(
+        text(
+            """
+            UPDATE task_masters SET status = 'analyzed_partial'
+            WHERE id = :id AND status = 'compiling'
+            RETURNING id
+            """
+        ),
+        {"id": task_id},
+    ).first()
+    if r is None:
+        return False
+    audit_append(
+        conn,
+        chain_scope="task",
+        tenant_id=tenant_id, project_id=project_id, task_id=task_id, session_id=None,
+        event_type="task.publication_held",
+        actor_type="job", actor_id=consumer_name,
+        redacted_payload={
+            "transition": "compiling->analyzed_partial",
+            "reason_code": reason_code,
+            "final_gate_report_id": final_gate_report_id,
+            "coverage_gaps_emitted": int(coverage_gaps_emitted),
+        },
+        related_entity_type="task_masters",
+        related_entity_id=task_id,
+    )
+    return True
+
+
+def _finalize_from_existing_gate_report(
+    conn: Connection,
+    *,
+    task_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    project_id: uuid.UUID,
+    consumer_name: str,
+    gate_report: dict[str, Any],
+) -> None:
+    """Drive the task to a coherent terminal status based on an existing
+    final_gate_reports row.
+
+    Used when the consumer enters with status='compiling' AND a final_gate_report
+    already exists (e.g. crash between gate INSERT and task_masters UPDATE on a
+    previous attempt). Idempotent: if the task is already in the target status,
+    the guarded UPDATE is a no-op and no audit is emitted.
+    """
+    decision = str(gate_report["decision"])
+    reason_code = str(gate_report["reason_code"])
+    report_id = str(gate_report["id"])
+
+    if decision == "approved":
+        published = _fetch_existing_published_answer_for_task(conn, task_id)
+        published_answer_id = str(published["id"]) if published is not None else ""
+        _advance_to_published(
+            conn,
+            task_id=task_id,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            consumer_name=consumer_name,
+            final_gate_report_id=report_id,
+            published_answer_id=published_answer_id,
+            reason_code=reason_code,
+        )
+    elif decision == "rejected":
+        _revert_to_analyzed_partial_with_held(
+            conn,
+            task_id=task_id,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            consumer_name=consumer_name,
+            final_gate_report_id=report_id,
+            reason_code=reason_code,
+            coverage_gaps_emitted=0,
+        )
+    else:
+        # 'held_for_review' or any other future decision: leave the task in
+        # 'compiling' for an operator to inspect. Future phases may add a
+        # specific state for this.
+        logger.warning(
+            "task_created.gate_report_unknown_decision",
+            task_id=str(task_id),
+            decision=decision,
+        )
+
+
+def _run_8_4_compile_and_gate(
+    conn: Connection,
+    *,
+    task_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    project_id: uuid.UUID,
+    consumer_name: str,
+) -> None:
+    """Run the 8.4 stage: compiler -> gate -> publish/hold.
+
+    Pre-condition: the task is in status 'analyzed_partial' or 'compiling',
+    and NO final_gate_report exists yet for this task. The orchestrator
+    `_run_pipeline_with_docs` checks these conditions before calling.
+
+    Idempotent w.r.t. database side-effects via ON CONFLICT DO NOTHING. Audit
+    side-effects are guarded by status-based UPDATEs: re-running this function
+    on a task already in 'compiling' (because a previous attempt crashed after
+    the compiling transition) will NOT re-emit task.compiling but WILL run
+    compiler+gate (idempotently) and emit the remaining 8.4 audit events.
+    """
+    # Try to make the analyzed_partial -> compiling transition. If we are already
+    # in 'compiling' (resume case), this is a no-op and we skip the audit.
+    _advance_to_compiling(
+        conn,
+        task_id=task_id,
+        tenant_id=tenant_id,
+        project_id=project_id,
+        consumer_name=consumer_name,
+    )
+
+    # Run the compiler (idempotent).
+    compile_counts = run_compilation(
+        conn, tenant_id=tenant_id, project_id=project_id, task_id=task_id
+    )
+    audit_append(
+        conn,
+        chain_scope="task",
+        tenant_id=tenant_id, project_id=project_id, task_id=task_id, session_id=None,
+        event_type="task.draft_compiled",
+        actor_type="job", actor_id=consumer_name,
+        redacted_payload={
+            "verified_claim_count": compile_counts["verified_claim_count"],
+            "spans_inserted": compile_counts["spans_inserted"],
+            "links_inserted": compile_counts["links_inserted"],
+            "summary_chars": compile_counts["summary_chars"],
+            "draft_id": compile_counts["draft_id"],
+        },
+        related_entity_type="task_masters",
+        related_entity_id=task_id,
+    )
+
+    audit_append(
+        conn,
+        chain_scope="task",
+        tenant_id=tenant_id, project_id=project_id, task_id=task_id, session_id=None,
+        event_type="task.final_gate_started",
+        actor_type="job", actor_id=consumer_name,
+        redacted_payload={"gate": "mvp0_gate_v1"},
+        related_entity_type="task_masters",
+        related_entity_id=task_id,
+    )
+    gate_outcome = run_final_answer_gate(
+        conn, tenant_id=tenant_id, project_id=project_id, task_id=task_id
+    )
+    audit_append(
+        conn,
+        chain_scope="task",
+        tenant_id=tenant_id, project_id=project_id, task_id=task_id, session_id=None,
+        event_type="task.final_gate_completed",
+        actor_type="job", actor_id=consumer_name,
+        redacted_payload={
+            "decision": gate_outcome["decision"],
+            "reason_code": gate_outcome["reason_code"],
+            "spans_total": gate_outcome["spans_total"],
+            "spans_verified": gate_outcome["spans_verified"],
+            "spans_unverified": gate_outcome["spans_unverified"],
+            "coverage_gaps_emitted": gate_outcome["coverage_gaps_emitted"],
+            "final_gate_report_id": gate_outcome["final_gate_report_id"],
+        },
+        related_entity_type="task_masters",
+        related_entity_id=task_id,
+    )
+
+    if gate_outcome["decision"] == "approved":
+        published_answer_id = gate_outcome["published_answer_id"] or ""
+        _advance_to_published(
+            conn,
+            task_id=task_id,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            consumer_name=consumer_name,
+            final_gate_report_id=str(gate_outcome["final_gate_report_id"]),
+            published_answer_id=str(published_answer_id),
+            reason_code=str(gate_outcome["reason_code"]),
+        )
+    elif gate_outcome["decision"] == "rejected":
+        _revert_to_analyzed_partial_with_held(
+            conn,
+            task_id=task_id,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            consumer_name=consumer_name,
+            final_gate_report_id=str(gate_outcome["final_gate_report_id"]),
+            reason_code=str(gate_outcome["reason_code"]),
+            coverage_gaps_emitted=int(gate_outcome["coverage_gaps_emitted"]),
+        )
+    else:
+        # 'no_draft' is defensive and not expected in 8.4: the compiler always
+        # produces a v1 draft. If we ever hit this, leave the task in 'compiling'
+        # for diagnosis on the next redelivery.
+        logger.warning(
+            "task_created.gate_decision_unexpected",
+            task_id=str(task_id),
+            decision=gate_outcome["decision"],
+            reason_code=gate_outcome["reason_code"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# top-level pipeline orchestrator (8.3 + 8.4)
+# ---------------------------------------------------------------------------
+def _run_pipeline_with_docs(
+    conn: Connection,
+    *,
+    task_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    project_id: uuid.UUID,
+    consumer_name: str,
+) -> None:
+    """Run the 8.3 stage (if needed) followed by the 8.4 stage."""
+    current_status = _fetch_task_status(conn, task_id)
+
+    # 8.3 stage runs from analyzing -> analyzed_partial.
+    if current_status == "analyzing":
+        _run_8_3_extract_and_verify(
+            conn,
+            task_id=task_id,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            consumer_name=consumer_name,
+        )
+        current_status = _fetch_task_status(conn, task_id)
+
+    # 8.4 stage starts from analyzed_partial or RESUMES from compiling.
+    if current_status in ("analyzed_partial", "compiling"):
+        existing_report = _fetch_existing_gate_report_for_task(conn, task_id)
+        if existing_report is None:
+            # No gate report yet: run (or resume) compiler + gate end-to-end.
+            _run_8_4_compile_and_gate(
+                conn,
+                task_id=task_id,
+                tenant_id=tenant_id,
+                project_id=project_id,
+                consumer_name=consumer_name,
+            )
+        else:
+            # A gate report already exists. Two sub-cases:
+            #   - status == 'analyzed_partial': caller-side terminality check
+            #     should have caught this before calling us. Defensive no-op.
+            #   - status == 'compiling': finalize the task using the existing
+            #     report (drive to 'published' or back to 'analyzed_partial'),
+            #     so we never leave it in 'compiling' without a coherent state.
+            if current_status == "compiling":
+                _finalize_from_existing_gate_report(
+                    conn,
+                    task_id=task_id,
+                    tenant_id=tenant_id,
+                    project_id=project_id,
+                    consumer_name=consumer_name,
+                    gate_report=existing_report,
+                )
+
+
+# ---------------------------------------------------------------------------
+# entry point
+# ---------------------------------------------------------------------------
 def handle_task_created(event: dict[str, Any], *, consumer_name: str) -> str:
     """Process a single task.created event.
 
@@ -303,6 +748,8 @@ def handle_task_created(event: dict[str, Any], *, consumer_name: str) -> str:
         return "failed"
 
     with transaction() as conn:
+        # FK-safety branch (8.1d-patch1): task must be visible BEFORE begin_processing
+        # is called with task_id != None.
         current_status_pre = _fetch_task_status(conn, task_id)
         if current_status_pre is None:
             record_id, status = begin_processing(
@@ -349,11 +796,26 @@ def handle_task_created(event: dict[str, Any], *, consumer_name: str) -> str:
             return "failed"
 
         try:
-            if current_status in ("blocked", "analyzed_partial"):
+            # ---- Terminality checks (Phase 8.4, FINAL) ----
+            if current_status in ("blocked", "published"):
                 mark_succeeded(conn, record_id=record_id)
                 return "skipped_terminal"
 
-            if current_status not in ("created", "analyzing"):
+            if current_status == "analyzed_partial":
+                if _fetch_existing_gate_report_for_task(conn, task_id) is not None:
+                    # Rejected scenario terminale: gate has already produced a
+                    # report and the task has been brought back to
+                    # analyzed_partial. We do NOT recompile.
+                    mark_succeeded(conn, record_id=record_id)
+                    return "skipped_terminal"
+                # else: not terminal, proceeds to compiling (handled below).
+
+            # 'compiling' is NEVER terminal on its own. We will resume or finalize
+            # via _run_pipeline_with_docs below. Even if a final_gate_report
+            # already exists, we MUST drive the status forward so we never
+            # mark_succeeded with the task stuck in 'compiling'.
+
+            if current_status not in ("created", "analyzing", "analyzed_partial", "compiling"):
                 mark_failed(
                     conn,
                     record_id=record_id,
@@ -364,6 +826,7 @@ def handle_task_created(event: dict[str, Any], *, consumer_name: str) -> str:
 
             has_docs = _has_documents(conn, task_id)
 
+            # 'created' -> 'analyzing' (audit included).
             if current_status == "created":
                 _advance_to_analyzing(
                     conn,
@@ -389,6 +852,23 @@ def handle_task_created(event: dict[str, Any], *, consumer_name: str) -> str:
                     project_id=project_id,
                     consumer_name=consumer_name,
                 )
+
+            # Final defensive check: if the pipeline left the task in 'compiling'
+            # without a final_gate_report (compiler crashed between INSERT and
+            # later steps in a previous attempt), do NOT mark_succeeded. Mark
+            # the EPR as failed so a redelivery can resume.
+            final_status = _fetch_task_status(conn, task_id)
+            if final_status == "compiling" and _fetch_existing_gate_report_for_task(conn, task_id) is None:
+                mark_failed(
+                    conn,
+                    record_id=record_id,
+                    error_code="WORKER_PIPELINE_INCOMPLETE",
+                    error_message=(
+                        f"Task {task_id} left in 'compiling' without a final_gate_report; "
+                        "redelivery will resume."
+                    ),
+                )
+                return "failed"
 
             mark_succeeded(conn, record_id=record_id)
             return "processed"
