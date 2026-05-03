@@ -1,37 +1,43 @@
 # Evidence-First Multi-AI Platform — MVP-0
 
-Piattaforma multi-AI **evidence-first** ed **evidence-gated**. Nessuna risposta finale può essere pubblicata se non è collegata a evidenze tracciabili.
+Piattaforma multi-AI **evidence-first** ed **evidence-gated**. Nessuna risposta finale può essere pubblicata se non è collegata a evidenze tracciabili, registrate nel Claim Ledger, verificate e approvate dal Final Answer Gate.
 
-Repository alla **Fase 8.3** (Sprint 2: Claim Ledger append-only e CVE-lite mock-driven).
+Repository alla **Fase 8.4** conclusa (Sprint 3: Answers compilation, Final Answer Gate, primo `published_answers`).
 
 Disponibile localmente:
 - Postgres 16, Redis 7
-- API HTTP (FastAPI) con `health`, `projects`, `tasks`, `audit`, `documents`, `claims`
-- Worker Redis Streams difensivo, FK-safe, con pipeline 8.3 (estrattore + CVE-lite)
+- API HTTP (FastAPI) con `health`, `projects`, `tasks`, `audit`, `documents`, `claims`, **`answers`**
+- Worker Redis Streams single-consumer, FK-safe, idempotente, resume-safe, con pipeline 8.4 end-to-end (estrattore + CVE-lite + compiler + Final Answer Gate)
 - Web Next.js minimale (home + `/diagnostic`)
 - Storage filesystem deduplicato content-addressed con upsert concorrenza-safe
-- Audit chain con payload normalizzato e verificabile end-to-end
+- Audit chain hash-linked, append-only, verificabile end-to-end
 
-La pipeline di **compilazione**, il **Final Answer Gate** e il primo `published_answers` **non sono ancora implementati**: sono il contenuto della Fase 8.4 (`0005_answers_gate.sql`). In 8.3 i task con documenti raggiungono lo stato `analyzed_partial` dopo aver verificato i claim con CVE-lite mock-driven.
+In 8.4 i task con documenti e claim verificati raggiungono lo stato terminale `published`, con un `published_answers` v1 e un `final_gate_reports` `approved`. I task con documenti ma senza claim verificati raggiungono lo stato terminale `analyzed_partial` con un `final_gate_reports` `rejected` e l'evento audit `task.publication_held`.
+
+**Renderer esterni Markdown/HTML/PDF/DOCX/JSON-LD restano fuori scope per MVP-0.** Il nucleo evidence-gated produce `draft_final_answers`, `final_answer_spans` e `published_answers` con `summary_text` testuale e `content_hash`, ma non emette artefatti esportabili in formati di rendering. Gli endpoint answers sono read-only e restituiscono JSON normalizzato.
 
 ---
 
 ## Scope MVP-0 (sintesi)
 
-Incluso (oggi, 8.3):
+Incluso (oggi, 8.4):
 - Closed Corpus, Postgres + Redis + filesystem locale.
 - Audit chain hash-linked (append-only, verificabile).
 - `event_processing_records` con idempotenza per consumer.
-- API: `health/projects/tasks/audit/documents/claims`.
+- API: `health/projects/tasks/audit/documents/claims/answers`.
 - Storage content-addressed deduplicato, refcount-based.
 - Document upload reale `.txt`/`.md` con chunking deterministico ed `evidence_spans` minimali.
 - **Claim Ledger append-only** con extractor mock-driven e CVE-lite mock-driven.
+- **Compiler mock-driven** che produce `draft_final_answers` v1 con `final_answer_spans` 1:1 sui claim `verified_fact`.
+- **Final Answer Gate mock-driven** che decide `approved`/`rejected`, scrive `final_gate_reports` (append-only) e, su approved, inserisce `published_answers` v1 con `status='published'`.
+- **Endpoint API read-only** per draft, gate report e published answer.
+- Coerenza referenziale stretta a livello DB tra task ↔ draft ↔ gate ↔ published via UNIQUE composite e FK composite.
 
 Escluso (rinviato a fasi successive):
-- Provider AI reali, MockProvider funzionante, Verified Web, Hybrid mode.
+- Provider AI reali, MockProvider funzionante con prompt template, Verified Web Mode, Hybrid Mode, consensus engine, contradiction detector avanzato, source quality evaluator, critical reviewer.
+- Renderer e/o export Markdown/HTML/PDF/DOCX/JSON-LD.
 - PDF/OCR, vector store cloud, S3/GCS/Azure.
-- Final Answer Gate, `published_answers`, renderer.
-- Lifecycle eventi pubblicazione, Source Loss propagator completo.
+- Lifecycle eventi pubblicazione (`published_answer_lifecycle_events`), `source_loss_events` con propagator.
 - Human Review UI completa, retention/eval/export jobs.
 
 ---
@@ -44,52 +50,79 @@ Escluso (rinviato a fasi successive):
 - **8.1d-patch1**: Makefile default goal corretto, worker FK-safe sul caso task non visibile.
 - **8.2**: storage reale, document upload reale, `task_documents`, worker `analyzed_partial` con documenti.
 - **8.2a-patch**: stabilizzazione pre-8.3. Test rerun-safe (hash unici per invocazione), dedup storage concorrenza-safe via `INSERT ... ON CONFLICT DO NOTHING`, validazione `document_ids` con `bindparam(expanding=True, type_=Uuid())`.
+- **8.3**: `0004_claim_ledger.sql`. Extractor mock-driven, CVE-lite mock-driven, ledger append-only stretto, supersede via `claim_lineage`.
 
 ---
 
-## Fase 8.3 — Claim Ledger e CVE-lite
+## Fase 8.4 — Compiler, Final Answer Gate, primo `published_answers`
 
-### Cosa cambia
+### Cosa cambia in 8.4
 
-- **Migration `0004_claim_ledger.sql` applicata.** Introduce `logical_claims`, `raw_claims`, `classified_claims`, `claim_ledger_entries` (append-only), `claim_lineage`, `claim_evidence_links`, `verification_records` e i placeholder `contradiction_records`, `claim_support_links`, `human_review_requests`, `publication_rules`. Nessuna modifica a `0001`, `0002`, `0003`.
-- **Append-only stretto su `claim_ledger_entries`.** Trigger `claim_ledger_entries_append_only` (basato sul comune `reject_modify_append_only`) rifiuta `UPDATE` e `DELETE` a livello DB. Nessuna riga del ledger viene mai mutata dopo l'INSERT, da nessun componente.
-- **Supersede via `claim_lineage`, mai via UPDATE.** Per rappresentare che una v2 supersede una v1 si fa: (1) `INSERT` di una nuova riga in `claim_ledger_entries` con `version_no = N+1` e lo stato finale; (2) `INSERT` in `claim_lineage` con `parent_entry_id = v1.id`, `child_entry_id = v2.id`, `relation_kind = 'supersedes'`. La v1 resta immutata. Non esiste alcuna colonna `superseded_by_id`.
-- **Estrattore mock-driven (`apps/worker/app/services/extractor.py`).** Deterministico, nessuna AI. Per ogni `document_chunks` attaccato al task: split frasi, filtra quelle contenenti cifre o citazioni, normalizza il testo, calcola `canonical_claim_hash`, upserta `logical_claims` (UNIQUE `(task_id, canonical_claim_hash)`), inserisce `raw_claims`, promuove a `classified_claims` (`claim_type='factual'`, `domain_tag='general'`), inserisce `claim_ledger_entries v1` con `state='candidate'` e collega l'evidence.
-- **CVE-lite mock-driven (`apps/worker/app/services/cve_lite.py`).** Per ogni v1: PASS se `evidence_spans.quote` è sottostringa di `document_chunks.inline_text` AND `sha256(quote)` corrisponde a `evidence_spans.quote_hash`; FAIL altrimenti. In entrambi i casi inserisce un `verification_records` (UNIQUE su `(claim_ledger_entry_id, check_kind, check_name)`), una `claim_ledger_entries v2` (`verified_fact` su PASS, `unverifiable` su FAIL), una riga di `claim_lineage` `supersedes`, e collega la v2 all'evidence span. **La v1 non viene mai aggiornata.**
-- **Worker pipeline 8.3 per task con documenti.** Sequenza audit emessa sulla chain del task:
-  1. `task.created` (dall'API)
-  2. `task.docs_attached` (dall'API se `document_ids` non vuoto)
-  3. `task.analyzing`
-  4. `task.docs_loaded`
-  5. `task.claims_extracted`
-  6. `task.claims_classified`
-  7. `task.claims_ledger_initialized`
-  8. `task.cve_lite_started`
-  9. `task.cve_lite_completed`
-  10. `task.analyzed_partial` con `reason='claims_verified_by_cve_lite_compilation_pending'`.
-- **Task senza documenti: comportamento invariato.** Sequenza: `task.created`, `task.analyzing`, `task.blocked`. Nessun ramo claim viene mai eseguito.
-- **Idempotenza completa.** Doppio delivery dello stesso `task.created` non duplica `raw_claims`, `classified_claims`, `logical_claims`, `claim_ledger_entries`, `claim_lineage`, `claim_evidence_links`, `verification_records`, né eventi audit. Tutti gli INSERT del worker usano `ON CONFLICT DO NOTHING` su vincoli UNIQUE espliciti dichiarati in `0004_claim_ledger.sql`.
+- **Migration `0005_answers_gate.sql` applicata.** Introduce `agent_runs`, `agent_outputs` (placeholder, vuota in 8.4), `truncation_events` (placeholder, vuota in 8.4), `continuation_attempts` (placeholder, vuota in 8.4), `coverage_gap_statements`, `draft_final_answers`, `final_answer_spans`, `final_answer_span_claim_links`, `final_gate_reports`, `published_answers`. Installa il trigger `lc_block_delete_if_published` (rinviato da 0004). Nessuna modifica a 0001, 0002, 0003, 0004.
+- **`task_masters.status` ricreato in modo difensivo.** 0005 esegue un `ALTER TABLE ... DROP CONSTRAINT task_masters_status_check` seguito da un `ADD CONSTRAINT` con lo stesso codominio già accettato in 0003: `created`, `ingesting`, `analyzing`, `verifying`, `compiling`, `published`, `blocked`, `failed`, `cancelled`, `archived`, `analyzed_partial`. **Non viene introdotto alcuno status `publication_held`**: gli stati `compiling` e `published` esistevano già nel CHECK precedente e restano invariati.
+- **Append-only stretto sui due livelli answers/gate.** Trigger `final_answer_spans_append_only` su `final_answer_spans` e trigger `final_gate_reports_append_only` su `final_gate_reports`, entrambi basati sul comune `reject_modify_append_only`. Nessuna riga di queste due tabelle viene mai mutata dopo l'INSERT.
+- **Coerenza referenziale stretta a livello DB.** `draft_final_answers` ha UNIQUE composito `(id, task_id)`. `final_gate_reports` ha UNIQUE composito `(id, task_id, draft_final_answer_id)` e FK composita `(draft_final_answer_id, task_id) → draft_final_answers(id, task_id)`. `published_answers` ha UNIQUE composito `(id, task_id)`, FK composita `(draft_final_answer_id, task_id) → draft_final_answers(id, task_id)` e FK composita `(final_gate_report_id, task_id, draft_final_answer_id) → final_gate_reports(id, task_id, draft_final_answer_id)`. Conseguenza: è impossibile a DB avere un gate report o un published answer il cui `task_id` non corrisponde al `task_id` del draft sottostante.
+- **Compiler mock-driven (`apps/worker/app/services/compiler.py`).** Deterministico, nessuna AI. `COMPILER_NAME="mvp0_compiler_v1"`, `COMPILER_VERSION="0.1.0"`. Per ogni task in `analyzed_partial` (o resuming da `compiling`) seleziona la **latest** `claim_ledger_entries` per ogni `claim_logical_id` filtrata a `state='verified_fact'`, ordinata per `(logical_claims.created_at, logical_claims.id)`. Costruisce `summary_text` deterministico concatenando `canonical_claim_text` con terminatore `\n`. Inserisce `draft_final_answers` v1, `final_answer_spans` 1:1 con i verified (offset coerenti), `final_answer_span_claim_links` con `link_role='primary_support'`. Tutti gli INSERT idempotenti via `ON CONFLICT DO NOTHING` sui vincoli UNIQUE dichiarati in 0005. `agent_outputs` non viene popolato in 8.4.
+- **Final Answer Gate mock-driven (`apps/worker/app/services/final_answer_gate.py`).** Deterministico, nessuna AI. `GATE_NAME="mvp0_gate_v1"`, `GATE_VERSION="0.1.0"`. Regola di verifica corretta:
+
+  > Uno span è verified-backed se e solo se esiste almeno un `final_answer_span_claim_links` tale che `link.claim_ledger_entry_id == latest_entry_id_for(claim_logical_id)` **e** `latest_entry_state_for(claim_logical_id) == 'verified_fact'`.
+
+  Non basta che l'ultima entry del claim sia `verified_fact`: il link deve puntare esattamente a quella entry. Un link a v1 candidate quando esiste v2 verified non è sufficiente. Tre branch decisionali:
+  - **Zero spans** (compiler non ha trovato `verified_fact`): `decision='rejected'`, `reason_code='no_verified_claims'`, una `coverage_gap_statements` con `kind='missing_evidence'`, `severity='block'`, `gap_key='no_verified_claims'`. Nessun `published_answers`.
+  - **Tutti gli spans verified-backed**: `decision='approved'`, `reason_code='all_spans_verified'`, `published_answers` v1 con `status='published'`, `content_hash = sha256(summary_text utf-8)`.
+  - **Spans non verified-backed presenti**: `decision='rejected'`, `reason_code='unverified_spans_present'`, una `coverage_gap_statements` per ciascuno span scoperto con `kind='unverified_claim'`, `severity='block'`, `gap_key='span:<final_answer_span_id>'`. Nessun `published_answers`.
+- **Worker single-consumer 8.4 (`apps/worker/app/consumers/task_created.py`).** La pipeline 8.3 (extractor + CVE-lite → `analyzed_partial`) è preservata. Dopo `task.analyzed_partial`, il consumer prosegue nello stesso evento verso compiler + gate. FK-safe sul caso task non visibile (preserva il comportamento 8.1d-patch1). Resume-safe: se entra con task in `compiling`, finalizza usando l'eventuale `final_gate_reports` preesistente; se non esiste, riesegue compiler + gate idempotentemente. Guardia finale `WORKER_PIPELINE_INCOMPLETE`: il consumer non chiama mai `mark_succeeded` lasciando un task in `compiling` senza `final_gate_reports`.
+- **Sequenza audit con documenti (approved scenario).** Sulla chain del task, 13 eventi worker-side dopo `task.created`/`task.docs_attached` emessi dall'API:
+  1. `task.analyzing`
+  2. `task.docs_loaded`
+  3. `task.claims_extracted`
+  4. `task.claims_classified`
+  5. `task.claims_ledger_initialized`
+  6. `task.cve_lite_started`
+  7. `task.cve_lite_completed`
+  8. `task.analyzed_partial`
+  9. `task.compiling`
+  10. `task.draft_compiled`
+  11. `task.final_gate_started`
+  12. `task.final_gate_completed`
+  13. `task.published`
+- **Sequenza audit con documenti (rejected zero-verified scenario).** Identica fino a `task.final_gate_completed`, poi:
+  - 13. `task.publication_held`
+
+  **`task.publication_held` è esclusivamente un evento audit, non uno stato di `task_masters.status`.** La task in DB resta `analyzed_partial` (nessuno status `publication_held` esiste a livello DB; il CHECK constraint non lo ammette).
+- **Task senza documenti: comportamento invariato.** Sequenza worker: `task.analyzing`, `task.blocked`. Nessun ramo claim né compiler né gate viene eseguito.
+- **Idempotenza completa.** Doppio delivery dello stesso `task.created` non duplica righe in nessuna delle nuove tabelle 8.4 (`agent_runs`, `draft_final_answers`, `final_answer_spans`, `final_answer_span_claim_links`, `final_gate_reports`, `coverage_gap_statements`, `published_answers`) né eventi audit. Tutti gli INSERT del worker usano `ON CONFLICT DO NOTHING` su vincoli UNIQUE espliciti dichiarati in 0005.
 - **Endpoint API read-only (nessun side effect).**
-  - `GET /api/v1/tasks/{task_id}/raw-claims`
-  - `GET /api/v1/tasks/{task_id}/classified-claims`
-  - `GET /api/v1/tasks/{task_id}/claims` — ultima `claim_ledger_entries` per ogni `claim_logical_id`
-  - `GET /api/v1/claims/{claim_logical_id}/history` — tutte le versioni del ledger
-  - `GET /api/v1/claims/{claim_logical_id}/evidence` — `latest_entry` + `evidence_links` + `verification_records`
-- **Schemi shared aggiornati**: `RawClaimRead`, `ClassifiedClaimRead`, `ClaimLedgerEntryRead`, `VerificationRecordRead`, `ClaimEvidenceLinkRead`, `ClaimEvidenceRead`.
+  - `GET /api/v1/tasks/{task_id}/draft` — ultima `draft_final_answers` per task con `final_answer_spans` ordinati per `span_index`.
+  - `GET /api/v1/tasks/{task_id}/final-gate-report` — ultimo `final_gate_reports` per task con `coverage_gap_statements` collegati al draft.
+  - `GET /api/v1/tasks/{task_id}/published-answer` — ultimo `published_answers` per task.
+  - `GET /api/v1/published-answers/{published_answer_id}` — single-row view per id.
 
-### Cosa NON cambia in 8.3
+  Errori normalizzati con envelope `{"error": {"code": "...", "message": "...", "details": {...}, ...}}`. `ErrorCode.NOT_PUBLISHED` **non esiste** in MVP-0: per il caso "task esiste ma non è ancora pubblicato" si restituisce `RESOURCE_NOT_FOUND` con `details.resource='published_answers'`. Per task inesistente si restituisce `RESOURCE_NOT_FOUND` con `details.resource='task_masters'`. Per draft/gate non ancora prodotti su task esistente si usa `details.resource='draft_final_answers'` o `'final_gate_reports'`.
+- **Schemi shared aggiornati.** `packages/shared/evidencefirst_shared/schemas.py` espone `AgentRunRead`, `FinalAnswerSpanRead`, `FinalAnswerSpanClaimLinkRead`, `CoverageGapStatementRead`, `DraftFinalAnswerRead`, `DraftFinalAnswerWithSpansRead`, `FinalGateReportRead`, `PublishedAnswerRead`.
 
-- Nessun **renderer**.
-- Nessun **`published_answers`**.
-- Nessun **`final_gate_reports`**.
-- Nessun **Final Answer Gate**.
-- Nessun **`draft_final_answers`** o **`final_answer_spans`**.
-- Nessun trigger `lc_block_delete_if_published` (verrà installato in 0005 insieme a `published_answers`).
-- Nessun provider AI esterno. **Costo API = 0.** `PROVIDERS_ENABLED=mock`.
+### Stati terminali del consumer in 8.4
 
-### Cosa arriva in 8.4
+Il consumer considera la task terminale (e chiama `mark_succeeded` sulla `event_processing_records`) nei seguenti casi:
+- `blocked` — task senza documenti, branch invariato.
+- `published` — approved scenario completato.
+- `analyzed_partial` **e** esiste già un `final_gate_reports` per il task — rejected scenario completato (zero verified oppure unverified spans). In questo caso una redelivery viene loggata come `skipped_terminal`.
 
-`0005_answers_gate.sql` introdurrà `agent_runs`, `agent_outputs`, `truncation_events`, `continuation_attempts`, `coverage_gap_statements`, `draft_final_answers`, `final_answer_spans`, `final_answer_span_claim_links`, `final_gate_reports` (append-only stretto), `published_answers` (con campi lifecycle minimi). Pipeline worker di compilazione mock-driven sopra il Claim Ledger. Gate finale che pubblica solo se ogni `final_answer_spans` è collegato a una `claim_ledger_entries` verificata oppure gestisce esplicitamente i coverage gap.
+Lo stato `analyzed_partial` **non è** terminale di per sé. Una task in `analyzed_partial` senza `final_gate_reports` è in attesa: il consumer la fa proseguire verso `compiling` su una redelivery o sulla prima delivery valida. Lo stato `compiling` **non è mai** terminale di propria iniziativa: la guardia `WORKER_PIPELINE_INCOMPLETE` blocca `mark_succeeded` se il pipeline lascia la task in `compiling` senza un `final_gate_reports`.
+
+### Cosa NON cambia in 8.4
+
+- Nessun **renderer** Markdown/HTML/PDF/DOCX/JSON-LD.
+- Nessun **export** verso filesystem o storage cloud.
+- Nessun **provider AI esterno**. **Costo API = 0.** `PROVIDERS_ENABLED=mock`.
+- Nessun **Verified Web Mode**, **Hybrid Mode**, **consensus engine**, **contradiction detector** avanzato, **source quality evaluator**, **critical reviewer**.
+- Nessun **`published_answer_lifecycle_events`**, nessun **`source_loss_events`** con propagator.
+- Nessun **stato `publication_held`** a livello DB. Solo evento audit `task.publication_held`.
+- Nessun **trigger di propagazione** su `published_answers` (la withdrawal/supersede di un published answer non è automatizzata in 8.4: i campi `withdrawn_at`, `superseded_at`, `superseded_by_id` esistono ma non sono guidati da pipeline).
+
+### Cosa arriva in 8.5 (pianificato, non implementato)
+
+`0006_lifecycle.sql` introdurrà `published_answer_lifecycle_events` (append-only) e `source_loss_events`, con il primo propagator che marca i claim impattati e le pubblicazioni dipendenti. Una prima retention pass minimale (cleanup blob orfani) potrà essere parte dello stesso sprint. Nessuna parte di 8.5 è già scritta.
 
 ---
 
@@ -116,17 +149,17 @@ make test
 | `make psql` / `make redis-cli` | shell |
 | `make clean` | distrugge i volumi |
 
-`make migrate` applica `0001`, `0002`, `0003`, `0004` in ordine. Idempotente: rieseguirla è no-op.
+`make migrate` applica `0001`, `0002`, `0003`, `0004`, `0005` in ordine. Idempotente: rieseguirla è no-op.
 
 ---
 
-## Smoke test 8.3
+## Smoke test 8.4 (approved scenario end-to-end)
 
 ````bash
 # 1) Crea progetto
 PID=$(curl -s -X POST localhost:8000/api/v1/projects \
   -H 'content-type: application/json' \
-  -d '{"name":"smoke-83-demo"}' | jq -r .id)
+  -d '{"name":"smoke-84-demo"}' | jq -r .id)
 
 # 2) Carica un documento .txt con frasi factual (cifre)
 DID=$(curl -s -X POST "localhost:8000/api/v1/projects/$PID/documents" \
@@ -136,77 +169,111 @@ DID=$(curl -s -X POST "localhost:8000/api/v1/projects/$PID/documents" \
 # 3) Crea il task con documento
 TID=$(curl -s -X POST localhost:8000/api/v1/tasks \
   -H 'content-type: application/json' \
-  -d "{\"project_id\":\"$PID\",\"objective\":\"smoke 8.3\",\"mode\":\"closed_corpus\",\"document_ids\":[\"$DID\"]}" \
+  -d "{\"project_id\":\"$PID\",\"objective\":\"smoke 8.4\",\"mode\":\"closed_corpus\",\"document_ids\":[\"$DID\"]}" \
   | jq -r .id)
 
-# 4) Polling fino a analyzed_partial
+# 4) Polling fino a stato terminale
 while true; do
   S=$(curl -s "localhost:8000/api/v1/tasks/$TID" | jq -r .status)
   echo "status=$S"
-  [ "$S" = "analyzed_partial" ] && break
+  case "$S" in
+    published|blocked) break ;;
+    analyzed_partial)
+      # Terminale solo se esiste un final_gate_reports per questo task.
+      HAS_REPORT=$(curl -s -o /dev/null -w "%{http_code}" "localhost:8000/api/v1/tasks/$TID/final-gate-report")
+      [ "$HAS_REPORT" = "200" ] && break
+      ;;
+  esac
   sleep 1
 done
 
-# 5) Audit chain (deve elencare 10 eventi: task.created ... task.analyzed_partial)
+# 5) Audit chain (approved: 13 eventi worker-side dopo task.created/task.docs_attached)
 curl -s "localhost:8000/api/v1/tasks/$TID/audit?limit=500" | jq '.items[].event_type'
 
-# 6) Vista latest del ledger
+# 6) Latest del ledger (claim verified visibili)
 curl -s "localhost:8000/api/v1/tasks/$TID/claims" | jq
 
-# 7) Storia di un claim
-LCID=$(curl -s "localhost:8000/api/v1/tasks/$TID/claims" | jq -r '.items[0].claim_logical_id')
-curl -s "localhost:8000/api/v1/claims/$LCID/history" | jq
-curl -s "localhost:8000/api/v1/claims/$LCID/evidence" | jq
+# 7) Endpoint answers 8.4
+curl -s "localhost:8000/api/v1/tasks/$TID/draft" | jq
+curl -s "localhost:8000/api/v1/tasks/$TID/final-gate-report" | jq
+curl -s "localhost:8000/api/v1/tasks/$TID/published-answer" | jq
+
+# 8) Single-row view del published answer
+PAID=$(curl -s "localhost:8000/api/v1/tasks/$TID/published-answer" | jq -r .id)
+curl -s "localhost:8000/api/v1/published-answers/$PAID" | jq
 ````
+
+Smoke test rejected zero-verified: come sopra ma con un documento privo di frasi che superino CVE-lite (oppure forzando `quote_hash` non corrispondente in test). Il task termina in `analyzed_partial`; `GET /final-gate-report` restituisce `decision='rejected'`, `reason_code='no_verified_claims'`, una `coverage_gap_statements` con `kind='missing_evidence'`, `gap_key='no_verified_claims'`; `GET /published-answer` restituisce `404 RESOURCE_NOT_FOUND` con `details.resource='published_answers'`.
 
 ---
 
 ## Architettura runtime (sintesi)
 
-````
-   ┌────────────┐  POST /tasks (commit-then-publish)
-   │    API     │ ──────────────────────────────► Postgres
-   │  (FastAPI) │                                  ▲
-   │            │ ──xadd──► Redis Stream events:   │
-   └────────────┘            task.created          │
-                                  │                │
-                                  ▼                │
-                           ┌──────────────┐        │
-                           │   Worker     │───────►┘
-                           │   FK-safe    │
-                           │  pipeline 8.3│
-                           └──────────────┘
-````
+┌────────────┐  POST /tasks (commit-then-publish)
+│    API     │ ──────────────────────────────► Postgres
+│  (FastAPI) │                                  ▲
+│            │ ──xadd──► Redis Stream events:   │
+└────────────┘            task.created          │
+                                │               │
+                                ▼               │
+                         ┌──────────────┐       │
+                         │   Worker     |──────►┘
+                         │ single-csmr  │
+                         │ FK-safe      │
+                         │ resume-safe  │
+                         │ pipeline 8.4 │
+                         └──────────────┘
 
-Pipeline 8.3 nel worker (con documenti):
+Pipeline 8.4 nel worker (con documenti, approved scenario):
+task.created event
+│
+▼
+begin_processing(idempotent, FK-safe)
+│
+▼
+created → analyzing                  audit task.analyzing
+│
+▼
+load chunks/spans                    audit task.docs_loaded
+│
+▼
+extractor mock-driven                audit task.claims_extracted
+audit task.claims_classified
+audit task.claims_ledger_initialized
+│
+▼
+CVE-lite mock-driven                 audit task.cve_lite_started
+audit task.cve_lite_completed
+│
+▼
+analyzing → analyzed_partial         audit task.analyzed_partial
+│
+▼
+analyzed_partial → compiling         audit task.compiling
+│
+▼
+compiler mock-driven                 audit task.draft_compiled
+│
+▼
+Final Answer Gate                    audit task.final_gate_started
+audit task.final_gate_completed
+│
+├── approved
+│     └─► compiling → published  audit task.published
+│         + published_answers v1
+│
+└── rejected
+└─► compiling → analyzed_partial  audit task.publication_held
++ final_gate_reports rejected
+(NO published_answers)
+│
+▼
+mark_succeeded   (solo se stato terminale coerente:
+blocked | published | analyzed_partial+gate_report)
 
-````
-  task.created event
-      │
-      ▼
-  begin_processing(idempotent)
-      │
-      ▼
-  created → analyzing                  audit task.analyzing
-      │
-      ▼
-  load chunks/spans                    audit task.docs_loaded
-      │
-      ▼
-  extractor mock-driven                audit task.claims_extracted
-                                       audit task.claims_classified
-                                       audit task.claims_ledger_initialized
-      │
-      ▼
-  CVE-lite mock-driven                 audit task.cve_lite_started
-                                       audit task.cve_lite_completed
-      │
-      ▼
-  analyzing → analyzed_partial         audit task.analyzed_partial
-      │
-      ▼
-  mark_succeeded
-````
+Resume scenario (consumer entra con task già in `compiling`):
+- se esiste `final_gate_reports`: finalizza usandolo (drive a `published` se approved, a `analyzed_partial` con `task.publication_held` se rejected).
+- se non esiste: riesegue compiler + gate idempotentemente; gli audit di stato già emessi (`task.compiling`) non vengono ri-emessi grazie alle guardie status-based degli `UPDATE` su `task_masters`.
 
 ---
 
@@ -219,3 +286,4 @@ Pipeline 8.3 nel worker (con documenti):
 ## Documenti
 
 - [`docs/migration_plan.md`](docs/migration_plan.md)
+- [`PROJECT_STATE.md`](PROJECT_STATE.md)
