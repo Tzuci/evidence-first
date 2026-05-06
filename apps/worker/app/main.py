@@ -100,7 +100,12 @@ def main() -> int:
                 eid = entry_id.decode("utf-8") if isinstance(entry_id, (bytes, bytearray)) else str(entry_id)
                 event = _decode_event(fields)
                 status = handle_task_created(event, consumer_name=consumer_name)
-                if status in ("processed", "skipped_already_succeeded", "skipped_in_flight"):
+                if status in (
+                    "processed",
+                    "skipped_already_succeeded",
+                    "skipped_in_flight",
+                    "skipped_terminal",
+                ):
                     try:
                         r.xack(settings.EVENTS_TASK_CREATED_STREAM, settings.CONSUMER_GROUP_NAME, eid)
                     except Exception:

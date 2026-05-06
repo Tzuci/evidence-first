@@ -7,6 +7,9 @@
     documented mechanism for IN-clause parameter expansion across drivers.
   - All UUID values entering the SQL parameters are already validated by Pydantic
     (TaskCreate.document_ids: list[uuid.UUID]). No string interpolation.
+
+8.4.x-patch:
+  - Redis XADD failure after DB commit is now logged instead of silently swallowed.
 """
 from __future__ import annotations
 
@@ -14,6 +17,7 @@ import json
 import uuid
 from typing import Any
 
+import structlog
 from fastapi import APIRouter, Depends, Header, Request
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection
@@ -27,6 +31,8 @@ from ..config import get_settings
 from ..db import get_conn, transaction
 from ..redis import get_redis
 
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["tasks"])
 
@@ -240,24 +246,30 @@ def create_task(
             used_idempotency_key = idempotency_key or str(task_id)
 
     if not replayed_existing and task_row is not None and tenant_id is not None and audit_id is not None:
+        task_id = uuid.UUID(str(task_row.id))
+        stream = get_settings().EVENTS_TASK_CREATED_STREAM
         try:
             r = get_redis()
             r.xadd(
-                get_settings().EVENTS_TASK_CREATED_STREAM,
+                stream,
                 {
                     "event_id": str(uuid.uuid4()),
                     "event_type": "task.created",
                     "tenant_id": str(tenant_id),
                     "project_id": str(body.project_id),
-                    "task_id": str(uuid.UUID(str(task_row.id))),
+                    "task_id": str(task_id),
                     "audit_record_id": str(audit_id),
-                    "idempotency_key": used_idempotency_key or str(task_row.id),
+                    "idempotency_key": used_idempotency_key or str(task_id),
                 },
                 maxlen=10000,
                 approximate=True,
             )
         except Exception:
-            pass
+            logger.exception(
+                "task_created_event_publish_failed",
+                task_id=str(task_id),
+                stream=stream,
+            )
 
     return _row_to_task(task_row)
 

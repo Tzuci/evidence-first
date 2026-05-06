@@ -94,10 +94,14 @@ def install_normalized_error_handler(app: Any) -> None:
     Response envelope:
         {"error": {"code": "...", "message": "...", "details": {...}, ...}}
 
-    This handles:
-      - application-raised NormalizedError;
-      - FastAPI/Pydantic RequestValidationError, so validation failures do not
-        leak FastAPI's default {"detail": [...]} shape.
+    Handlers registered (in precedence order, most specific first):
+      1. NormalizedError — application-raised errors with known codes.
+      2. RequestValidationError — FastAPI/Pydantic input validation failures.
+      3. Exception — catch-all for any unhandled exception; returns INTERNAL_ERROR.
+
+    The catch-all (3) is registered last so that NormalizedError instances raised
+    inside a route are still handled by handler (1) rather than (3). FastAPI
+    evaluates handlers in MRO order, so a more specific type always wins.
     """
     from fastapi import Request
     from fastapi.encoders import jsonable_encoder
@@ -130,4 +134,33 @@ def install_normalized_error_handler(app: Any) -> None:
         return JSONResponse(
             status_code=normalized.http_status,
             content=normalized.to_envelope(request_id=request_id),
+        )
+
+    @app.exception_handler(Exception)
+    async def _unhandled_exception_handler(
+        request: Request,
+        exc: Exception,
+    ) -> JSONResponse:
+        # NormalizedError is a subclass of Exception; FastAPI dispatches to the
+        # most-specific handler first, so NormalizedError instances will never
+        # reach this handler. This guard is defensive only.
+        if isinstance(exc, NormalizedError):
+            request_id = request.headers.get("x-request-id")
+            return JSONResponse(
+                status_code=exc.http_status,
+                content=exc.to_envelope(request_id=request_id),
+            )
+        request_id = request.headers.get("x-request-id")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "code": ErrorCode.INTERNAL_ERROR.value,
+                    "message": "Internal server error",
+                    "details": {"exception_type": exc.__class__.__name__},
+                    "request_id": request_id,
+                    "policy_version": None,
+                    "remediation_hint": None,
+                }
+            },
         )
