@@ -125,7 +125,7 @@ class AuditEventRead(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Claims (Fase 8.3, invariati)
+# Claims (Phase 8.3, unchanged)
 # ---------------------------------------------------------------------------
 class RawClaimRead(BaseModel):
     id: uuid.UUID
@@ -197,7 +197,7 @@ class ClaimEvidenceRead(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Answers / Gate / Published (Fase 8.4)
+# Answers / Gate / Published (Phase 8.4)
 # ---------------------------------------------------------------------------
 class AgentRunRead(BaseModel):
     id: uuid.UUID
@@ -283,3 +283,82 @@ class PublishedAnswerRead(BaseModel):
     withdrawn_at: _dt.datetime | None
     superseded_at: _dt.datetime | None
     superseded_by_id: uuid.UUID | None
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle / Source Loss (Phase 8.5 — Block 1)
+# ---------------------------------------------------------------------------
+class PublishedAnswerLifecycleEventRead(BaseModel):
+    """Single published_answer_lifecycle_events row.
+
+    Append-only by trigger. event_type is one of:
+      - 'published'
+      - 'withdrawal_requested'
+      - 'withdrawn'
+      - 'superseded'
+    """
+    id: uuid.UUID
+    published_answer_id: uuid.UUID
+    task_id: uuid.UUID
+    event_type: str
+    event_reason: str
+    event_payload: dict[str, Any]
+    requested_by: uuid.UUID | None
+    idempotency_key: str
+    created_at: _dt.datetime
+
+
+class SourceLossEventRead(BaseModel):
+    """Single source_loss_events row.
+
+    Append-only by trigger. The canonical propagation granularity is
+    evidence_span_id; document_chunk_id, document_version_id and document_id
+    are reporting context only.
+
+    loss_kind is one of:
+      - 'source_deleted'
+      - 'source_access_lost'
+      - 'quote_mismatch'
+      - 'document_replaced'
+      - 'policy_retraction'
+    """
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    project_id: uuid.UUID | None
+    task_id: uuid.UUID | None
+    evidence_span_id: uuid.UUID
+    document_chunk_id: uuid.UUID | None
+    document_version_id: uuid.UUID | None
+    document_id: uuid.UUID | None
+    loss_kind: str
+    loss_reason: str
+    detected_by: str
+    event_payload: dict[str, Any]
+    idempotency_key: str
+    created_at: _dt.datetime
+
+
+class SourceLossPropagationRecordRead(BaseModel):
+    """Single source_loss_propagation_records row.
+
+    Append-only by trigger. propagation_kind is one of:
+      - 'claim_marked_unverifiable'
+      - 'published_answer_impacted'
+      - 'no_claims_impacted'
+      - 'no_active_published_answers_impacted'
+
+    status is one of:
+      - 'recorded'
+      - 'skipped'
+      - 'failed'
+    """
+    id: uuid.UUID
+    source_loss_event_id: uuid.UUID
+    claim_logical_id: uuid.UUID | None
+    old_claim_ledger_entry_id: uuid.UUID | None
+    new_claim_ledger_entry_id: uuid.UUID | None
+    published_answer_id: uuid.UUID | None
+    propagation_kind: str
+    status: str
+    details: dict[str, Any]
+    created_at: _dt.datetime
