@@ -2,10 +2,33 @@
 
 Stream: app.events.task_created
 Group:  worker_default
+
+Phase 8.5 — Block 3D-1 integration:
+  The Redis loop now delegates event handling to
+  ``apps.worker.app.consumers.dispatch.handle_event`` instead of calling
+  ``handle_task_created`` directly. ``handle_event`` performs event-type
+  routing internally (task.created / task_created legacy alias /
+  published_answer.withdrawal_requested / source_loss.detected) and
+  returns the same status taxonomy used by the underlying handlers
+  (``processed``, ``skipped_already_succeeded``, ``skipped_terminal``,
+  ``failed``).
+
+  We pass the per-instance Redis consumer name as ``redis_consumer_name``
+  to preserve the historical behavior of this loop for ``task.created``:
+  the dispatcher forwards it ONLY to ``handle_task_created`` and
+  deliberately withholds it from the lifecycle / source-loss consumers
+  (their EPR UNIQUE (consumer_name, idempotency_key) must remain global
+  across worker instances). The invariant is enforced by the dispatcher
+  itself; this loop just supplies the value.
+
+  Scope of this block: single-stream integration only. We deliberately do
+  NOT add new Redis streams, new consumer groups, or any new
+  xreadgroup call. Routing is currently a no-op for non-task.created
+  event types unless they happen to land on this stream — multi-stream
+  fan-out is deferred to a later block.
 """
 from __future__ import annotations
 
-import json
 import os
 import signal
 import sys
@@ -16,7 +39,7 @@ import structlog
 from redis.exceptions import ResponseError
 
 from .config import get_settings
-from .consumers.task_created import handle_task_created
+from .consumers.dispatch import handle_event
 from .redis import get_redis
 
 
@@ -99,7 +122,13 @@ def main() -> int:
             for entry_id, fields in entries:
                 eid = entry_id.decode("utf-8") if isinstance(entry_id, (bytes, bytearray)) else str(entry_id)
                 event = _decode_event(fields)
-                status = handle_task_created(event, consumer_name=consumer_name)
+                # Route through the dispatcher. The per-instance worker
+                # name is forwarded as redis_consumer_name; the dispatcher
+                # decides which handlers receive it (task.created only)
+                # vs. which keep their stable logical consumer_name
+                # (withdrawal, source_loss). See dispatch.handle_event
+                # docstring for the full rationale.
+                status = handle_event(event, redis_consumer_name=consumer_name)
                 if status in (
                     "processed",
                     "skipped_already_succeeded",
