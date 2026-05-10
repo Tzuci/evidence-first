@@ -238,7 +238,7 @@ def main() -> int:
                         stream=stream_name,
                         entry_id=eid,
                         status=status,
-                        event=event,
+                        event_payload=event,
                     )
 
     logger.info("worker.exited")
