@@ -19,8 +19,20 @@ class Settings(BaseSettings):
     DEV_USER_EMAIL: str = "dev@local"
     DEV_PROJECT_NAME: str = "default"
 
-    # Redis stream where task lifecycle events are published.
+    # ------------------------------------------------------------------
+    # Redis Streams (event producers)
+    # ------------------------------------------------------------------
+    # task.created events (Phase 8.3 / 8.4 pipeline). Pre-existing.
     EVENTS_TASK_CREATED_STREAM: str = "app.events.task_created"
+
+    # published_answer.withdrawal_requested events (Phase 8.5 — Block 4A-1).
+    # The API publishes here when a client POSTs a withdrawal request; the
+    # worker (apps/worker/app/main.py) consumes from the same stream name.
+    # Default mirrors apps/worker/app/config.py to keep producer/consumer
+    # in lockstep without requiring env-var overrides in dev.
+    EVENTS_PUBLISHED_ANSWER_WITHDRAWAL_STREAM: str = (
+        "app.events.published_answer_withdrawal_requested"
+    )
 
 
 _settings: Settings | None = None
