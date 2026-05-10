@@ -34,6 +34,14 @@ class Settings(BaseSettings):
         "app.events.published_answer_withdrawal_requested"
     )
 
+    # source_loss.detected events (Phase 8.5 — Block 4B-1).
+    # The API publishes here when a client POSTs a source-loss event; the
+    # worker (apps/worker/app/main.py) reads from this same stream and
+    # routes the event to handle_source_loss via the dispatcher. Default
+    # mirrors apps/worker/app/config.py to keep producer/consumer in
+    # lockstep without requiring env-var overrides in dev.
+    EVENTS_SOURCE_LOSS_STREAM: str = "app.events.source_loss_detected"
+
 
 _settings: Settings | None = None
 
