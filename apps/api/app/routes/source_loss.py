@@ -1,7 +1,14 @@
-"""API routes for source-loss producer endpoint (Phase 8.5 — Block 4B-1).
+"""API routes for source-loss producer endpoint (Phase 8.5 — Block 4B-1)
+and source-loss event read endpoint (Phase 8.6 — Block 8.6B).
 
-Endpoint:
-  POST /api/v1/source-loss-events
+Endpoints exposed by this module:
+
+  POST /api/v1/source-loss-events                          (Phase 8.5)
+  GET  /api/v1/source-loss-events/{source_loss_event_id}   (Phase 8.6B)
+
+---------------------------------------------------------------------------
+POST /api/v1/source-loss-events  (Phase 8.5 — Block 4B-1)
+---------------------------------------------------------------------------
 
 This endpoint creates an append-only ``source_loss_events`` row and
 publishes a ``source_loss.detected`` event on the dedicated Redis stream
@@ -95,6 +102,44 @@ Error responses:
   - 500 INTERNAL_ERROR      — Redis XADD failure (the DB transaction has
                               already been rolled back; no row was
                               persisted).
+
+---------------------------------------------------------------------------
+GET /api/v1/source-loss-events/{source_loss_event_id}  (Phase 8.6 — 8.6B)
+---------------------------------------------------------------------------
+
+Strict invariants (Phase 8.6B — read-only observability):
+
+  - This endpoint is COMPLETELY read-only. It MUST NOT:
+      * INSERT / UPDATE / DELETE any row in any table;
+      * call ``propagate_source_loss`` or any other worker service;
+      * read or join ``source_loss_propagation_records``;
+      * resolve ``task_id`` via ``claim_evidence_links`` when the
+        column is NULL in the database — by design, the producer
+        leaves ``source_loss_events.task_id`` NULL because an
+        evidence_span can be referenced by claims belonging to
+        multiple tasks (see Phase 8.5 contract above);
+      * mutate ``claim_ledger_entries``, ``published_answers``, or any
+        other domain table;
+      * use Redis;
+      * trigger the worker in any way.
+
+  - The endpoint surfaces exactly the columns persisted in
+    ``source_loss_events`` for the given id, serialized via the shared
+    ``SourceLossEventRead`` schema. Nullable columns (project_id,
+    task_id, document_chunk_id, document_version_id, document_id) are
+    serialized as JSON ``null`` when the DB row has NULL, matching the
+    Pydantic field types declared in
+    ``packages/shared/evidencefirst_shared/schemas.py``.
+
+  - 404 RESOURCE_NOT_FOUND with details.resource="source_loss_events"
+    and details.id=<source_loss_event_id> is returned when no row
+    matches the supplied id. The error envelope mirrors the
+    convention used by the lifecycle events endpoint (8.6A) and the
+    answers endpoints (8.4).
+
+  - All JSONB columns (``event_payload``) are returned verbatim. MVP-0
+    does not yet apply RBAC redaction; this is acknowledged in
+    PHASE_8_6_PLAN.md §9 as a known debt.
 """
 from __future__ import annotations
 
@@ -103,16 +148,17 @@ import uuid
 from typing import Any, Literal
 
 import structlog
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import Connection
 
 from evidencefirst_shared.errors import ErrorCode, NormalizedError
+from evidencefirst_shared.schemas import SourceLossEventRead
 
 from ..config import get_settings
-from ..db import transaction
+from ..db import get_conn, transaction
 from ..redis import get_redis
 
 
@@ -154,7 +200,7 @@ LossKind = Literal[
 
 
 # ---------------------------------------------------------------------------
-# Pydantic models
+# Pydantic models (producer endpoint)
 # ---------------------------------------------------------------------------
 class SourceLossEventCreate(BaseModel):
     """Request body for POST /api/v1/source-loss-events.
@@ -208,7 +254,7 @@ class SourceLossEventQueued(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# DB helpers
+# DB helpers (producer endpoint)
 # ---------------------------------------------------------------------------
 def _resolve_evidence_span_scope(
     conn: Connection, *, evidence_span_id: uuid.UUID
@@ -333,7 +379,98 @@ def _insert_source_loss_event(
 
 
 # ---------------------------------------------------------------------------
-# endpoint
+# DB helpers (read endpoint — Phase 8.6B)
+# ---------------------------------------------------------------------------
+def _select_source_loss_event_by_id(
+    conn: Connection, source_loss_event_id: uuid.UUID
+) -> dict[str, Any] | None:
+    """Fetch a single ``source_loss_events`` row by primary key.
+
+    Returns a dict whose keys match the column names in
+    ``source_loss_events``, or ``None`` when no row matches.
+
+    Read-only: plain SELECT, no FOR UPDATE. The endpoint never mutates
+    DB state, so row-level locking would be wasteful.
+
+    JSONB ``event_payload`` is normalized to a dict if the driver
+    surfaces it as a string (psycopg 3 returns dicts natively, but the
+    fallback is defensive and matches the convention in
+    ``lifecycle_events.py``).
+    """
+    row = conn.execute(
+        text(
+            """
+            SELECT
+              id, tenant_id, project_id, task_id,
+              evidence_span_id, document_chunk_id,
+              document_version_id, document_id,
+              loss_kind, loss_reason, detected_by,
+              event_payload, idempotency_key, created_at
+            FROM source_loss_events
+            WHERE id = :id
+            """
+        ),
+        {"id": source_loss_event_id},
+    ).first()
+    if row is None:
+        return None
+
+    m = row._mapping
+
+    # event_payload normalization: accept either native dict (psycopg 3
+    # JSONB), JSON string (driver/pool edge case), or NULL (defensive —
+    # the column is NOT NULL DEFAULT '{}'::jsonb so this should not
+    # occur in practice).
+    raw_payload = m["event_payload"]
+    if raw_payload is None:
+        event_payload: dict[str, Any] = {}
+    elif isinstance(raw_payload, str):
+        event_payload = json.loads(raw_payload)
+    else:
+        event_payload = dict(raw_payload)
+
+    def _opt_uuid(value: Any) -> uuid.UUID | None:
+        return uuid.UUID(str(value)) if value is not None else None
+
+    return {
+        "id": uuid.UUID(str(m["id"])),
+        "tenant_id": uuid.UUID(str(m["tenant_id"])),
+        "project_id": _opt_uuid(m["project_id"]),
+        "task_id": _opt_uuid(m["task_id"]),
+        "evidence_span_id": uuid.UUID(str(m["evidence_span_id"])),
+        "document_chunk_id": _opt_uuid(m["document_chunk_id"]),
+        "document_version_id": _opt_uuid(m["document_version_id"]),
+        "document_id": _opt_uuid(m["document_id"]),
+        "loss_kind": str(m["loss_kind"]),
+        "loss_reason": str(m["loss_reason"]),
+        "detected_by": str(m["detected_by"]),
+        "event_payload": event_payload,
+        "idempotency_key": str(m["idempotency_key"]),
+        "created_at": m["created_at"],
+    }
+
+
+def _raise_source_loss_event_not_found(source_loss_event_id: uuid.UUID) -> None:
+    """Raise the normalized 404 envelope expected by callers.
+
+    Envelope shape mirrors the helper used in routes/lifecycle_events.py
+    and routes/answers.py so clients can rely on the same
+    ``details.resource``/``details.id`` contract across all
+    8.4/8.5/8.6 endpoints.
+    """
+    raise NormalizedError(
+        code=ErrorCode.RESOURCE_NOT_FOUND,
+        message="source_loss_events not found",
+        details={
+            "resource": "source_loss_events",
+            "id": str(source_loss_event_id),
+        },
+        http_status=404,
+    )
+
+
+# ---------------------------------------------------------------------------
+# producer endpoint (Phase 8.5 — Block 4B-1)
 # ---------------------------------------------------------------------------
 @router.post(
     "/api/v1/source-loss-events",
@@ -522,3 +659,50 @@ def create_source_loss_event(
         stream=stream,
         idempotency_key=idempotency_key,
     )
+
+
+# ---------------------------------------------------------------------------
+# read endpoint (Phase 8.6 — Block 8.6B)
+# ---------------------------------------------------------------------------
+@router.get(
+    "/api/v1/source-loss-events/{source_loss_event_id}",
+    response_model=SourceLossEventRead,
+    tags=["source_loss"],
+)
+def get_source_loss_event(
+    source_loss_event_id: uuid.UUID,
+    conn: Connection = Depends(get_conn),
+) -> SourceLossEventRead:
+    """Single-row read of a ``source_loss_events`` entity by id.
+
+    Read-only observability endpoint introduced in Phase 8.6B. See the
+    module-level docstring for the strict invariants this endpoint
+    honors. In particular:
+
+      - No DB mutation, no Redis, no worker import, no propagator call.
+      - ``task_id`` may be NULL in the database: the propagator
+        resolves task scope per impacted claim downstream; this
+        endpoint simply surfaces what the DB stores. A NULL ``task_id``
+        is serialized as JSON ``null`` in the response, matching the
+        ``task_id: uuid.UUID | None`` field on
+        ``SourceLossEventRead``.
+      - The endpoint does NOT join
+        ``source_loss_propagation_records``; that is the job of the
+        future 8.6C endpoint. A consumer that wants the propagation
+        outcome for a given source_loss event must call 8.6C
+        explicitly.
+
+    Errors:
+      - 404 RESOURCE_NOT_FOUND with
+        ``details.resource = "source_loss_events"`` and
+        ``details.id = <source_loss_event_id>`` when no row matches.
+    """
+    row = _select_source_loss_event_by_id(conn, source_loss_event_id)
+    if row is None:
+        _raise_source_loss_event_not_found(source_loss_event_id)
+        # _raise_source_loss_event_not_found never returns; the
+        # explicit ``raise`` keeps static analyzers happy without
+        # ``# type: ignore``.
+        raise AssertionError("unreachable")
+
+    return SourceLossEventRead(**row)
