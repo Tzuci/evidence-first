@@ -1,10 +1,12 @@
-"""API routes for source-loss producer endpoint (Phase 8.5 — Block 4B-1)
-and source-loss event read endpoint (Phase 8.6 — Block 8.6B).
+"""API routes for source-loss producer endpoint (Phase 8.5 — Block 4B-1),
+source-loss event read endpoint (Phase 8.6 — Block 8.6B), and source-loss
+propagation read endpoint (Phase 8.6 — Block 8.6C).
 
 Endpoints exposed by this module:
 
-  POST /api/v1/source-loss-events                          (Phase 8.5)
-  GET  /api/v1/source-loss-events/{source_loss_event_id}   (Phase 8.6B)
+  POST /api/v1/source-loss-events                                       (Phase 8.5)
+  GET  /api/v1/source-loss-events/{source_loss_event_id}                (Phase 8.6B)
+  GET  /api/v1/source-loss-events/{source_loss_event_id}/propagation    (Phase 8.6C)
 
 ---------------------------------------------------------------------------
 POST /api/v1/source-loss-events  (Phase 8.5 — Block 4B-1)
@@ -140,6 +142,59 @@ Strict invariants (Phase 8.6B — read-only observability):
   - All JSONB columns (``event_payload``) are returned verbatim. MVP-0
     does not yet apply RBAC redaction; this is acknowledged in
     PHASE_8_6_PLAN.md §9 as a known debt.
+
+---------------------------------------------------------------------------
+GET /api/v1/source-loss-events/{source_loss_event_id}/propagation
+                                                       (Phase 8.6 — 8.6C)
+---------------------------------------------------------------------------
+
+Strict invariants (Phase 8.6C — read-only observability):
+
+  - This endpoint is COMPLETELY read-only. It MUST NOT:
+      * INSERT / UPDATE / DELETE any row in any table;
+      * call ``propagate_source_loss`` or any other worker service;
+      * import worker code;
+      * use Redis;
+      * mutate ``source_loss_propagation_records``,
+        ``claim_ledger_entries``, ``claim_lineage``,
+        ``audit_records``, ``published_answers``, or
+        ``source_loss_events`` in any way.
+
+  - The endpoint first checks that the given ``source_loss_event_id``
+    exists in ``source_loss_events``. If not, it returns 404
+    ``RESOURCE_NOT_FOUND`` with ``details.resource =
+    "source_loss_events"`` and ``details.id = <source_loss_event_id>``.
+
+  - If the source_loss_event exists but has no propagation rows yet
+    (legitimate race window between
+    ``POST /api/v1/source-loss-events`` and the worker's propagator
+    processing the event), the endpoint returns 200 with
+    ``items = []``. This is by design: PHASE_8_6_PLAN.md §9 calls out
+    the race explicitly, and the contract is to surface DB state
+    truthfully without fabricating propagation history.
+
+  - Otherwise, the endpoint returns 200 with the list of matching rows
+    ordered ASC by (created_at, id), filtered by the optional
+    ``propagation_kind`` and ``status`` query parameters, and
+    truncated to ``limit`` rows. The wrapper shape is::
+
+        {"source_loss_event_id": "<uuid>", "items": [SourceLossPropagationRecordRead, ...]}
+
+  - This endpoint does NOT collapse or hide ``failed`` rows: a client
+    interested in propagation health needs to see them. The four
+    declared ``propagation_kind`` values and the three declared
+    ``status`` values are all admissible filter values.
+
+  - This endpoint does NOT evaluate source quality, source authority,
+    independence, primaryness or freshness. The presence of a
+    propagation row only means that a source was lost and the system
+    reacted; it does not mean the lost source was authoritative to
+    begin with. The Source Quality Evaluator is a future fase (see
+    PHASE_8_6_PLAN.md strategic note).
+
+  - All JSONB columns (``details``) are returned verbatim. MVP-0 does
+    not yet apply RBAC redaction; this is acknowledged in
+    PHASE_8_6_PLAN.md §9 as a known debt.
 """
 from __future__ import annotations
 
@@ -148,14 +203,17 @@ import uuid
 from typing import Any, Literal
 
 import structlog
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import Connection
 
 from evidencefirst_shared.errors import ErrorCode, NormalizedError
-from evidencefirst_shared.schemas import SourceLossEventRead
+from evidencefirst_shared.schemas import (
+    SourceLossEventRead,
+    SourceLossPropagationRecordRead,
+)
 
 from ..config import get_settings
 from ..db import get_conn, transaction
@@ -197,6 +255,19 @@ LossKind = Literal[
     "document_replaced",
     "policy_retraction",
 ]
+
+# Allowed propagation_kind values for the 8.6C filter, mirroring the
+# CHECK in 0006_lifecycle.sql on source_loss_propagation_records.
+PropagationKind = Literal[
+    "claim_marked_unverifiable",
+    "published_answer_impacted",
+    "no_claims_impacted",
+    "no_active_published_answers_impacted",
+]
+
+# Allowed status values for the 8.6C filter, mirroring the CHECK in
+# 0006_lifecycle.sql on source_loss_propagation_records.
+PropagationStatus = Literal["recorded", "skipped", "failed"]
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +528,10 @@ def _raise_source_loss_event_not_found(source_loss_event_id: uuid.UUID) -> None:
     and routes/answers.py so clients can rely on the same
     ``details.resource``/``details.id`` contract across all
     8.4/8.5/8.6 endpoints.
+
+    Reused by both the 8.6B and 8.6C endpoints: both surfaces resolve
+    the same underlying ``source_loss_events`` resource and present an
+    identical not-found contract to the client.
     """
     raise NormalizedError(
         code=ErrorCode.RESOURCE_NOT_FOUND,
@@ -467,6 +542,142 @@ def _raise_source_loss_event_not_found(source_loss_event_id: uuid.UUID) -> None:
         },
         http_status=404,
     )
+
+
+# ---------------------------------------------------------------------------
+# DB helpers (propagation read endpoint — Phase 8.6C)
+# ---------------------------------------------------------------------------
+def _source_loss_event_exists(
+    conn: Connection, source_loss_event_id: uuid.UUID
+) -> bool:
+    """Return True iff a ``source_loss_events`` row with the given id exists.
+
+    Read-only: plain ``SELECT 1 ... LIMIT 1``. We do NOT reuse
+    ``_select_source_loss_event_by_id`` here because we only need a
+    boolean and want to avoid materializing the full row, which would
+    include JSONB deserialization for a check that does not need it.
+
+    The 8.6C endpoint uses this helper to gate the 404 path before
+    issuing the propagation SELECT. When the row exists but no
+    propagation rows do, the endpoint returns 200 with ``items = []``
+    rather than 404 — that distinction is what makes this dedicated
+    helper worth its weight.
+    """
+    row = conn.execute(
+        text("SELECT 1 FROM source_loss_events WHERE id = :id LIMIT 1"),
+        {"id": source_loss_event_id},
+    ).first()
+    return row is not None
+
+
+def _row_to_source_loss_propagation_record(
+    row: Any,
+) -> SourceLossPropagationRecordRead:
+    """Map a SQLAlchemy row to the shared SourceLossPropagationRecordRead.
+
+    Field coercion notes:
+      - UUID columns may surface as ``uuid.UUID`` or as ``str``
+        depending on the driver/pool combination; we normalize via
+        ``uuid.UUID(str(...))`` defensively, mirroring the convention
+        adopted in ``lifecycle_events.py``.
+      - ``details`` is JSONB: psycopg 3 returns it as a native dict,
+        but we coerce a stray ``None`` (defensive — the column is
+        NOT NULL DEFAULT '{}'::jsonb so this should not occur in
+        practice) to an empty dict, and a stray string (some
+        driver/pool combinations) via ``json.loads``. This keeps the
+        Pydantic model happy under every realistic driver variant.
+      - All optional FK columns (``claim_logical_id``,
+        ``old_claim_ledger_entry_id``, ``new_claim_ledger_entry_id``,
+        ``published_answer_id``) may be NULL per the schema; we
+        surface them as ``None`` so the response carries JSON ``null``.
+    """
+    m = row._mapping
+
+    raw_details = m["details"]
+    if raw_details is None:
+        details: dict[str, Any] = {}
+    elif isinstance(raw_details, str):
+        details = json.loads(raw_details)
+    else:
+        details = dict(raw_details)
+
+    def _opt_uuid(value: Any) -> uuid.UUID | None:
+        return uuid.UUID(str(value)) if value is not None else None
+
+    return SourceLossPropagationRecordRead(
+        id=uuid.UUID(str(m["id"])),
+        source_loss_event_id=uuid.UUID(str(m["source_loss_event_id"])),
+        claim_logical_id=_opt_uuid(m["claim_logical_id"]),
+        old_claim_ledger_entry_id=_opt_uuid(m["old_claim_ledger_entry_id"]),
+        new_claim_ledger_entry_id=_opt_uuid(m["new_claim_ledger_entry_id"]),
+        published_answer_id=_opt_uuid(m["published_answer_id"]),
+        propagation_kind=str(m["propagation_kind"]),
+        status=str(m["status"]),
+        details=details,
+        created_at=m["created_at"],
+    )
+
+
+def _select_source_loss_propagation_records(
+    conn: Connection,
+    *,
+    source_loss_event_id: uuid.UUID,
+    limit: int,
+    propagation_kind: str | None,
+    status: str | None,
+) -> list[Any]:
+    """Fetch propagation rows for a given source_loss_event, filtered.
+
+    Ordering is ASC by ``(created_at, id)`` for replay-friendliness
+    and to keep the limit truncation deterministic.
+
+    Query construction notes:
+      - We use a single fixed SQL string with NULL-aware filter
+        predicates ``(:kind IS NULL OR propagation_kind = :kind)``
+        and the equivalent for ``:status``. This avoids any string
+        interpolation or concatenation of SQL fragments and keeps
+        every value strictly as a bound parameter. PostgreSQL's
+        planner short-circuits the ``IS NULL`` branch when the
+        parameter is NULL, so the absence of a filter has the same
+        plan as an unfiltered query.
+      - No f-string SQL anywhere.
+
+    The caller is expected to have already verified that the source
+    loss event exists (via ``_source_loss_event_exists``); this helper
+    returns an empty list both when no event exists AND when the event
+    exists but has no propagation rows. The 404/200-empty distinction
+    is the caller's job.
+    """
+    rows = conn.execute(
+        text(
+            """
+            SELECT
+              id,
+              source_loss_event_id,
+              claim_logical_id,
+              old_claim_ledger_entry_id,
+              new_claim_ledger_entry_id,
+              published_answer_id,
+              propagation_kind,
+              status,
+              details,
+              created_at
+            FROM source_loss_propagation_records
+            WHERE source_loss_event_id = :sle_id
+              AND (CAST(:kind   AS TEXT) IS NULL OR propagation_kind = CAST(:kind   AS TEXT))
+              AND (CAST(:status AS TEXT) IS NULL OR status           = CAST(:status AS TEXT))
+            ORDER BY created_at ASC, id ASC
+            LIMIT :limit
+            """
+        ),
+        {
+            "sle_id": source_loss_event_id,
+            "kind": propagation_kind,
+            "status": status,
+            "limit": limit,
+        },
+    ).fetchall()
+    return list(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -688,7 +899,7 @@ def get_source_loss_event(
         ``SourceLossEventRead``.
       - The endpoint does NOT join
         ``source_loss_propagation_records``; that is the job of the
-        future 8.6C endpoint. A consumer that wants the propagation
+        8.6C endpoint. A consumer that wants the propagation
         outcome for a given source_loss event must call 8.6C
         explicitly.
 
@@ -706,3 +917,75 @@ def get_source_loss_event(
         raise AssertionError("unreachable")
 
     return SourceLossEventRead(**row)
+
+
+# ---------------------------------------------------------------------------
+# propagation read endpoint (Phase 8.6 — Block 8.6C)
+# ---------------------------------------------------------------------------
+@router.get(
+    "/api/v1/source-loss-events/{source_loss_event_id}/propagation",
+    tags=["source_loss"],
+)
+def list_source_loss_propagation_records(
+    source_loss_event_id: uuid.UUID,
+    conn: Connection = Depends(get_conn),
+    limit: int = Query(default=500, ge=1, le=5000),
+    propagation_kind: PropagationKind | None = Query(default=None),
+    status: PropagationStatus | None = Query(default=None),
+) -> dict[str, Any]:
+    """List propagation rows for a source_loss_event (read-only).
+
+    Behavior:
+      - 404 RESOURCE_NOT_FOUND with details.resource="source_loss_events"
+        if the source_loss_event does not exist. The check is performed
+        BEFORE the propagation SELECT, so a client probing for a bogus
+        id receives an immediate not-found rather than a misleading
+        empty list.
+      - 200 with ``items=[]`` if the source_loss_event exists but has
+        no propagation rows (including the legitimate race window
+        between ``POST /api/v1/source-loss-events`` and the worker's
+        propagator processing the event; PHASE_8_6_PLAN.md §9 calls
+        this out explicitly).
+      - 200 with the list of matching rows, ordered ASC by
+        (created_at, id), filtered by ``propagation_kind`` and
+        ``status`` if provided, and truncated to ``limit`` rows.
+
+    The wrapper shape is inline ``{"source_loss_event_id": <uuid>,
+    "items": [SourceLossPropagationRecordRead, ...]}``. We do not bind
+    a Pydantic ``response_model`` here because the wrapper is purely a
+    response shape; the items themselves are serialized via the
+    shared ``SourceLossPropagationRecordRead`` model (mirrors the
+    pattern in ``lifecycle_events.py`` for 8.6A).
+
+    Strict scope reminder:
+      - This endpoint does NOT evaluate source quality, authority,
+        primaryness, freshness, or independence. The presence of a
+        propagation row only means the system tracked a reaction to a
+        source loss. The Source Quality Evaluator is a future fase
+        (see PHASE_8_6_PLAN.md strategic note).
+      - All JSONB ``details`` payloads are returned verbatim; RBAC
+        redaction is not applied in MVP-0 (PHASE_8_6_PLAN.md §9).
+    """
+    if not _source_loss_event_exists(conn, source_loss_event_id):
+        _raise_source_loss_event_not_found(source_loss_event_id)
+        # _raise_source_loss_event_not_found never returns; the
+        # explicit ``raise`` keeps static analyzers happy without
+        # ``# type: ignore``.
+        raise AssertionError("unreachable")
+
+    rows = _select_source_loss_propagation_records(
+        conn,
+        source_loss_event_id=source_loss_event_id,
+        limit=limit,
+        propagation_kind=propagation_kind,
+        status=status,
+    )
+    items = [
+        _row_to_source_loss_propagation_record(r).model_dump(mode="json")
+        for r in rows
+    ]
+
+    return {
+        "source_loss_event_id": str(source_loss_event_id),
+        "items": items,
+    }
