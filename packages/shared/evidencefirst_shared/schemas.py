@@ -362,3 +362,244 @@ class SourceLossPropagationRecordRead(BaseModel):
     status: str
     details: dict[str, Any]
     created_at: _dt.datetime
+
+
+# ---------------------------------------------------------------------------
+# Source Quality (Phase 8.7 — Block C, Shared schemas)
+# ---------------------------------------------------------------------------
+#
+# These types describe the source_quality_assessments table introduced by
+# migration 0007_source_quality.sql. The DB remains the source of truth for
+# every constraint (XOR target, partial UNIQUE indexes, CHECK enums,
+# append-only trigger, FK ON DELETE RESTRICT). The shared types below serve
+# two purposes:
+#
+#   1. The constants ``SOURCE_QUALITY_*_VALUES`` are tuples that future
+#      consumers (evaluator service in 8.7D, read API in 8.7F, frontend
+#      bindings) can import to enumerate the codomain of each quality
+#      dimension WITHOUT duplicating the strings. They mirror exactly the
+#      CHECK constraints in 0007_source_quality.sql; any change to the
+#      DB codomains MUST also be reflected here.
+#
+#   2. The ``SourceQuality*`` ``Literal`` aliases provide optional strict
+#      typing for those consumers that want it (e.g. a future
+#      SourceQualityAssessmentCreate in 8.7D). They are NOT used inside
+#      ``SourceQualityAssessmentRead``, which keeps ``str`` for the
+#      quality fields to remain consistent with all other Read models in
+#      this file (ClaimLedgerEntryRead.state, VerificationRecordRead.outcome,
+#      SourceLossEventRead.loss_kind, etc.). Forcing Literal on Read would
+#      cause Pydantic to reject otherwise-valid DB rows if a future block
+#      ever extends the codomain at DB level without first updating these
+#      types.
+#
+# Semantic invariants (see PHASE_8_7_PLAN.md §3):
+#   - source quality ≠ claim correctness
+#   - source quality ≠ evidence support
+#   - source quality ≠ verification outcome
+#   - source quality ≠ source loss
+#   - source quality ≠ final publication eligibility
+#
+# This is the FIRST shared schemas block for Source Quality. No Create
+# model is introduced here on purpose: the producer side (evaluator
+# service) does not yet exist, and the public API of 8.7F is read-only.
+# A future block may add SourceQualityAssessmentCreate when (and only
+# when) there is a real consumer for it.
+
+# --- Codomain constants ----------------------------------------------------
+# Mirror exactly the CHECK constraints in migrations/0007_source_quality.sql.
+# Order is documentation only; tuples are unordered semantically.
+
+SOURCE_QUALITY_SOURCE_TYPE_VALUES: tuple[str, ...] = (
+    "user_document",
+    "web_page",
+    "academic_paper",
+    "official_document",
+    "database_record",
+    "news_article",
+    "blog",
+    "forum",
+    "unknown",
+)
+
+SOURCE_QUALITY_SOURCE_ROLE_VALUES: tuple[str, ...] = (
+    "primary",
+    "secondary",
+    "tertiary",
+    "unclear",
+)
+
+SOURCE_QUALITY_AUTHORITY_LEVEL_VALUES: tuple[str, ...] = (
+    "high",
+    "medium",
+    "low",
+    "unknown",
+)
+
+SOURCE_QUALITY_INDEPENDENCE_LEVEL_VALUES: tuple[str, ...] = (
+    "independent",
+    "affiliated",
+    "self_reported",
+    "unknown",
+)
+
+SOURCE_QUALITY_FRESHNESS_VALUES: tuple[str, ...] = (
+    "current",
+    "recent",
+    "stale",
+    "undated",
+    "not_time_sensitive",
+)
+
+SOURCE_QUALITY_RELEVANCE_VALUES: tuple[str, ...] = (
+    "direct_support",
+    "contextual_support",
+    "weak_support",
+    "irrelevant",
+)
+
+SOURCE_QUALITY_EXTRACT_QUALITY_VALUES: tuple[str, ...] = (
+    "exact_quote_match",
+    "paraphrase_match",
+    "partial_match",
+    "quote_mismatch",
+)
+
+SOURCE_QUALITY_CONTRADICTION_STATUS_VALUES: tuple[str, ...] = (
+    "no_known_contradiction",
+    "contradicted_by_stronger_source",
+    "conflicting_sources",
+    "unchecked",
+)
+
+SOURCE_QUALITY_OVERALL_QUALITY_VALUES: tuple[str, ...] = (
+    "strong",
+    "adequate",
+    "weak",
+    "unsuitable",
+    "unknown",
+)
+
+
+# --- Literal type aliases (optional strict typing for future consumers) ----
+# NOT used inside SourceQualityAssessmentRead (which keeps ``str`` to remain
+# consistent with the rest of the Read models in this file). Provided for
+# future Create models, evaluator service signatures, and frontend bindings.
+
+SourceQualitySourceType = Literal[
+    "user_document",
+    "web_page",
+    "academic_paper",
+    "official_document",
+    "database_record",
+    "news_article",
+    "blog",
+    "forum",
+    "unknown",
+]
+
+SourceQualitySourceRole = Literal[
+    "primary",
+    "secondary",
+    "tertiary",
+    "unclear",
+]
+
+SourceQualityAuthorityLevel = Literal[
+    "high",
+    "medium",
+    "low",
+    "unknown",
+]
+
+SourceQualityIndependenceLevel = Literal[
+    "independent",
+    "affiliated",
+    "self_reported",
+    "unknown",
+]
+
+SourceQualityFreshness = Literal[
+    "current",
+    "recent",
+    "stale",
+    "undated",
+    "not_time_sensitive",
+]
+
+SourceQualityRelevance = Literal[
+    "direct_support",
+    "contextual_support",
+    "weak_support",
+    "irrelevant",
+]
+
+SourceQualityExtractQuality = Literal[
+    "exact_quote_match",
+    "paraphrase_match",
+    "partial_match",
+    "quote_mismatch",
+]
+
+SourceQualityContradictionStatus = Literal[
+    "no_known_contradiction",
+    "contradicted_by_stronger_source",
+    "conflicting_sources",
+    "unchecked",
+]
+
+SourceQualityOverallQuality = Literal[
+    "strong",
+    "adequate",
+    "weak",
+    "unsuitable",
+    "unknown",
+]
+
+
+# --- Read model ------------------------------------------------------------
+class SourceQualityAssessmentRead(BaseModel):
+    """Single source_quality_assessments row.
+
+    Append-only by trigger. Each row evaluates EXACTLY ONE of
+    (evidence_span_id, document_chunk_id, document_id); the other two
+    are NULL. This XOR is enforced at DB level by the CHECK
+    constraint sqa_target_xor.
+
+    The quality dimensions surface as ``str`` to remain consistent with
+    the rest of the Read models in this file. Their codomains are
+    enforced at DB level by CHECK constraints and exposed at the Python
+    level by the SOURCE_QUALITY_*_VALUES tuples above. Consumers that
+    want strict typing may use the SourceQuality* Literal aliases.
+
+    Semantic boundary (see PHASE_8_7_PLAN.md §3):
+      - This row records the QUALITY of a source, not the truth of a
+        claim, not the success of a CVE-lite verification, and not
+        a source loss event.
+      - confidence is an internal score in [0.0, 1.0] (or NULL); it is
+        NEVER intended as a single-number reputation score and MUST NOT
+        be consumed by the Final Answer Gate as a unique decision key.
+    """
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    project_id: uuid.UUID | None
+    evidence_span_id: uuid.UUID | None
+    document_chunk_id: uuid.UUID | None
+    document_id: uuid.UUID | None
+    version_no: int
+    source_type: str
+    source_role: str
+    authority_level: str
+    independence_level: str
+    freshness: str
+    relevance: str
+    extract_quality: str
+    contradiction_status: str
+    overall_quality: str
+    confidence: float | None
+    evaluator_name: str
+    evaluator_version: str
+    policy_name: str
+    policy_version: str
+    idempotency_key: str
+    payload: dict[str, Any]
+    created_at: _dt.datetime
