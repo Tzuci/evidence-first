@@ -8,35 +8,49 @@ Questo file non implica automaticamente scrittura di codice, test o migration: o
 
 ## 0. Stato corrente della Fase 8.6
 
-La Fase 8.6 è stata pianificata e avviata.
+La **Fase 8.6 minima è completata**.
 
-- Piano 8.6 creato al commit `4875698ad9c6129653d2f55de61313cefdcc2a0e` (`Add phase 8.6 plan`).
-- Primo blocco implementativo completato al commit `e2b54727fa8868360161fde797eed5685e90be27` (`Add published answer lifecycle events endpoint`).
-
-Blocco completato:
+Blocchi completati:
 
 - **8.6A — Lifecycle read endpoint + tests**
   - `GET /api/v1/published-answers/{published_answer_id}/lifecycle-events`
   - `apps/api/app/routes/lifecycle_events.py`
   - registrazione router in `apps/api/app/main.py`
   - `apps/api/tests/test_published_answer_lifecycle_events_endpoint.py`
-
-Blocchi ancora da completare per la 8.6 minima:
-
-- **8.6B — Source-loss event read endpoint**
+  - commit: `e2b5472` — `Add published answer lifecycle events endpoint`
+- **8.6B — Source-loss event read endpoint + tests**
   - `GET /api/v1/source-loss-events/{source_loss_event_id}`
-- **8.6C — Source-loss propagation read endpoint**
+  - estensione di `apps/api/app/routes/source_loss.py`
+  - `apps/api/tests/test_source_loss_events_read_endpoint.py`
+  - commit: `dedf0ac` — `Add source loss event read endpoint`
+- **8.6C — Source-loss propagation read endpoint + tests**
   - `GET /api/v1/source-loss-events/{source_loss_event_id}/propagation`
-- **8.6D — Task-level source-loss listing**
+  - estensione di `apps/api/app/routes/source_loss.py`
+  - `apps/api/tests/test_source_loss_propagation_endpoint.py`
+  - commit: `2da610c` — `Add source loss propagation read endpoint`
+- **8.6D — Task-level source-loss listing + tests**
   - `GET /api/v1/tasks/{task_id}/source-loss-events`
-- **8.6E — Realistic read flow tests + docs update**
+  - `apps/api/app/routes/task_source_loss.py`
+  - registrazione router in `apps/api/app/main.py`
+  - `apps/api/tests/test_task_source_loss_events_endpoint.py`
+  - commit: `cd26cb4` — `Add task source loss events endpoint`
+- **8.6E-1 — Realistic read flow test**
   - `tests/test_phase_8_6_read_flow.py`
-  - aggiornamento finale di `PROJECT_STATE.md`
+  - due scenari cross-component: withdrawal read flow + source-loss read flow
+  - commit: `7ee687b` — `Add realistic phase 8.6 read flow test`
 
-Stretch opzionale:
+Stretch opzionale non implementato:
 
 - **8.6 Stretch — Published-answer source-loss impact**
   - `GET /api/v1/published-answers/{published_answer_id}/source-loss-impact`
+  - resta opzionale, non implementato.
+
+Risultati di test riportati per la 8.6E-1:
+
+- `tests/test_phase_8_6_read_flow.py` → 2 passed.
+- `tests/` root → 70 passed.
+
+Risultati di `make test`, `make test-api`, `make test-worker`, `make test-shared`, `make test-db` come gate complessivo non sono dichiarati come passati in questo documento per la 8.6: non sono stati riportati in modo esplicito. La 8.6 minima resta completata sulla base dei test sopra e degli endpoint registrati.
 
 ---
 
@@ -46,7 +60,7 @@ La Fase 8.6 si limita a esporre via read API ciò che la pipeline 8.5 scrive sui
 
 Questa osservabilità è necessaria, ma non basta per completare la visione anti-allucinazione del progetto. Il progetto è evidence-first, ma **“fonte presente” non significa automaticamente “fonte attendibile”**. Una risposta può essere collegata a una fonte reale e tuttavia la fonte può essere debole, obsoleta, commerciale, non indipendente, secondaria, contraddetta da fonti migliori o non sufficientemente rilevante.
 
-La Fase 8.6 **NON** implementa ancora un modulo di valutazione della qualità delle fonti. Non assegna score di credibilità a documenti, chunk, evidence spans o claim. Non distingue tra fonte primaria e secondaria. Non valuta autorevolezza, indipendenza, freschezza, conflitti di interesse o coerenza con fonti esterne. Non introduce alcuna logica di Source Quality Evaluation.
+La Fase 8.6 **NON** implementa un modulo di valutazione della qualità delle fonti. Non assegna score di credibilità a documenti, chunk, evidence spans o claim. Non distingue tra fonte primaria e secondaria. Non valuta autorevolezza, indipendenza, freschezza, conflitti di interesse o coerenza con fonti esterne. Non introduce alcuna logica di Source Quality Evaluation.
 
 La necessità di integrare un modulo futuro di analisi dell’attendibilità delle fonti è quindi un punto strategico importante del progetto. Questo modulo dovrebbe diventare una fase dedicata successiva, ad esempio **8.7** o **9.0**, e dovrebbe permettere al sistema di passare da:
 
@@ -82,7 +96,7 @@ Il Final Answer Gate futuro dovrebbe poter distinguere tra:
 - claim supportato da fonti contraddittorie;
 - claim non sufficientemente supportato.
 
-Questa fase futura non deve essere confusa con 8.6: **8.6 rende osservabili lifecycle, source-loss e propagation; il Source Quality Evaluator renderà il sistema evidence-quality-aware**. È un prerequisito importante per avvicinare il progetto alla promessa anti-allucinazione completa.
+Questa fase futura non deve essere confusa con 8.6: **8.6 rende osservabili lifecycle, source-loss e propagation; il Source Quality Evaluator renderà il sistema evidence-quality-aware**. È un prerequisito importante per avvicinare il progetto alla promessa anti-allucinazione completa, ed è oggi il debito più rilevante sul piano evidence-quality del progetto.
 
 ---
 
@@ -90,7 +104,7 @@ Questa fase futura non deve essere confusa con 8.6: **8.6 rende osservabili life
 
 La **Fase 8.5 è completata tecnicamente e documentata**.
 
-Elementi già presenti nel progetto:
+Elementi già presenti nel progetto al momento dell'avvio della 8.6:
 
 - schema lifecycle e source-loss in `migrations/0006_lifecycle.sql`;
 - `published_answer_lifecycle_events`;
@@ -109,24 +123,27 @@ Elementi già presenti nel progetto:
 
 Commit rilevanti:
 
-- commit tecnico di completamento 8.5: `03c418693f4eb8ba7019c9785d149dbad83b87fe` (`Add realistic source loss flow test`);
-- commit documentale post-8.5: `5f7f4ce7646affed29dfcdcc3943f0669a7f7e5e` (`Update project state after phase 8.5`);
-- commit piano 8.6: `4875698ad9c6129653d2f55de61313cefdcc2a0e` (`Add phase 8.6 plan`);
-- commit implementazione 8.6A: `e2b54727fa8868360161fde797eed5685e90be27` (`Add published answer lifecycle events endpoint`).
+- commit tecnico di completamento 8.5: `03c4186` (`Add realistic source loss flow test`);
+- commit documentale post-8.5: `5f7f4ce` (`Update project state after phase 8.5`);
+- commit piano 8.6: `4875698` (`Add phase 8.6 plan`);
+- commit implementazione 8.6A: `e2b5472`;
+- commit implementazione 8.6B: `dedf0ac`;
+- commit implementazione 8.6C: `2da610c`;
+- commit implementazione 8.6D: `cd26cb4`;
+- commit realistic read flow 8.6E-1: `7ee687b`.
 
-Cosa manca e motiva il resto della 8.6:
+Cosa la 8.6 ha aggiunto rispetto a 8.5:
 
 - read API per una singola riga `source_loss_events`;
-- read API per `source_loss_propagation_records`;
-- listing task-level delle source loss collegate a un task;
-- realistic read flow test che verifichi via HTTP ciò che oggi i realistic flow osservano soprattutto via DB;
-- aggiornamento finale di `PROJECT_STATE.md`.
+- read API per `source_loss_propagation_records` di un dato source-loss event;
+- listing task-level delle source loss collegate a un task tramite l'unione S1 ∪ S2 (task scope ∪ claim_evidence_link);
+- realistic read flow test che verifica via HTTP gli effetti DB della pipeline 8.5.
 
 ---
 
 ## 2. Obiettivo 8.6
 
-Aggiungere endpoint API read-only che espongano lo stato scritto dalla pipeline 8.5, riusando gli schemi shared già definiti e mantenendo zero side-effect sul DB.
+Aggiungere endpoint API read-only che espongono lo stato scritto dalla pipeline 8.5, riusando gli schemi shared già definiti e mantenendo zero side-effect sul DB.
 
 Domini esposti:
 
@@ -134,9 +151,9 @@ Domini esposti:
 - source-loss event singolo, per id;
 - propagation records di un source-loss event;
 - source-loss events visibili da un task;
-- opzionale: impact set di source-loss su un singolo `published_answer`.
+- opzionale (non implementato): impact set di source-loss su un singolo `published_answer`.
 
-Risultato atteso: lo smoke test 8.5 diventa eseguibile interamente via HTTP, senza ricorrere a `psql`. Operatori e test di livello superiore possono osservare gli effetti del worker direttamente.
+Risultato raggiunto: lo smoke test 8.5 è ora eseguibile interamente via HTTP, senza ricorrere a `psql`. Operatori e test di livello superiore possono osservare gli effetti del worker direttamente.
 
 ---
 
@@ -164,11 +181,11 @@ La valutazione dell’attendibilità intrinseca delle fonti è una priorità str
 
 ---
 
-## 4. Endpoint read-only proposti
+## 4. Endpoint read-only
 
 ### 4.1 8.6A — `GET /api/v1/published-answers/{published_answer_id}/lifecycle-events`
 
-**Stato:** implementato al commit `e2b54727fa8868360161fde797eed5685e90be27`.
+**Stato:** implementato al commit `e2b5472`.
 
 Perché serve: permette di osservare la storia lifecycle di un `published_answer` senza interrogare manualmente il DB.
 
@@ -206,7 +223,7 @@ Query params:
 Errori:
 
 - 404 `RESOURCE_NOT_FOUND` con `details.resource="published_answers"`;
-- 400 `VALIDATION_ERROR` su query param non validi.
+- 400 / 422 `VALIDATION_ERROR` su query param non validi.
 
 Cosa non fa:
 
@@ -225,7 +242,7 @@ Test:
 
 ### 4.2 8.6B — `GET /api/v1/source-loss-events/{source_loss_event_id}`
 
-**Stato:** da implementare.
+**Stato:** implementato al commit `dedf0ac`.
 
 Perché serve: permette di leggere una singola riga `source_loss_events` dopo il `POST /api/v1/source-loss-events`.
 
@@ -235,33 +252,37 @@ Tabelle lette:
 
 Response shape:
 
-- `SourceLossEventRead`.
+- `SourceLossEventRead` (schema shared).
 
 Errori:
 
 - 404 `RESOURCE_NOT_FOUND` con `details.resource="source_loss_events"`.
 
-Cosa non deve fare:
+Cosa non fa:
 
-- non chiamare `propagate_source_loss`;
-- non leggere propagation records;
-- non risolvere `task_id` via claim graph se nel DB è `NULL`;
-- non modificare DB;
-- non usare Redis.
+- non chiama `propagate_source_loss`;
+- non legge propagation records;
+- non risolve `task_id` via claim graph se nel DB è `NULL` (per design: il campo è esposto verbatim);
+- non modifica DB;
+- non usa Redis.
 
-Test previsti:
+Test:
 
-- happy path;
-- 404;
-- `task_id=null`;
-- `event_payload={}`;
-- read-only invariant.
+- `apps/api/tests/test_source_loss_events_read_endpoint.py`.
+
+Casi coperti dai test:
+
+- happy path completo;
+- 404 con `details.resource="source_loss_events"`;
+- `event_payload={}` default surface come dict vuoto;
+- read-only invariant con snapshot pre/post sui count delle tabelle 8.4/8.5/audit;
+- nullable fields (`project_id`, `task_id`, `document_chunk_id`, `document_version_id`, `document_id`) serializzati come JSON `null`.
 
 ---
 
 ### 4.3 8.6C — `GET /api/v1/source-loss-events/{source_loss_event_id}/propagation`
 
-**Stato:** da implementare.
+**Stato:** implementato al commit `2da610c`.
 
 Perché serve: dato un source-loss event, espone ciò che il propagator ha registrato in `source_loss_propagation_records`.
 
@@ -273,37 +294,53 @@ Tabelle lette:
 Query params:
 
 - `limit`: default 500, min 1, max 5000;
-- `propagation_kind`: opzionale;
-- `status`: opzionale.
+- `propagation_kind`: opzionale, Literal sul codominio CHECK;
+- `status`: opzionale, Literal sul codominio CHECK.
 
 Errori:
 
 - 404 `RESOURCE_NOT_FOUND` con `details.resource="source_loss_events"`;
-- 400 `VALIDATION_ERROR` su query param non validi.
+- 400 / 422 `VALIDATION_ERROR` su query param non validi.
 
-Cosa non deve fare:
+Cosa non fa:
 
-- non chiamare `propagate_source_loss`;
-- non scrivere propagation records;
-- non collassare recorded/skipped/failed;
-- non escludere righe `failed`.
+- non chiama `propagate_source_loss`;
+- non scrive propagation records;
+- non collassa recorded/skipped/failed;
+- non esclude righe `failed` (sono parte della storia osservabile).
+
+Test:
+
+- `apps/api/tests/test_source_loss_propagation_endpoint.py`.
+
+Casi coperti dai test:
+
+- happy path `claim_marked_unverifiable`;
+- happy path `published_answer_impacted`;
+- evento esistente con zero propagation rows → 200 `items=[]` (race window producer → propagator);
+- 404 con `details.resource="source_loss_events"`;
+- filtro `propagation_kind`;
+- filtro `status=failed`;
+- truncation con `limit`;
+- query param invalidi rifiutati (400/422);
+- read-only invariant con snapshot pre/post.
 
 ---
 
 ### 4.4 8.6D — `GET /api/v1/tasks/{task_id}/source-loss-events`
 
-**Stato:** da implementare.
+**Stato:** implementato al commit `cd26cb4`.
 
-Perché serve: fornisce una vista task-centric delle source loss. Poiché `source_loss_events.task_id` può essere `NULL` by design, la query deve considerare due insiemi:
+Perché serve: fornisce una vista task-centric delle source loss. Poiché `source_loss_events.task_id` può essere `NULL` per design, la query considera due insiemi:
 
 - S1: source-loss events già task-scoped (`source_loss_events.task_id = :task_id`);
 - S2: source-loss events collegate al task tramite `claim_evidence_links → logical_claims.task_id`.
 
-L’endpoint ritorna `S1 ∪ S2`, distinct per `source_loss_events.id`.
+L’endpoint ritorna `S1 ∪ S2`, distinct per `source_loss_events.id`. Quando una stessa riga soddisfa entrambi gli insiemi, `impacted_via='task_scope'` ha precedenza su `claim_evidence_link`.
 
 Tabelle lette:
 
-- `task_masters`;
+- `task_masters` per check di esistenza;
 - `source_loss_events`;
 - `claim_evidence_links`;
 - `logical_claims`.
@@ -316,61 +353,77 @@ Errori:
 
 - 404 `RESOURCE_NOT_FOUND` con `details.resource="task_masters"`.
 
-Cosa non deve fare:
+Cosa non fa:
 
-- non chiamare il propagator;
-- non mutare claim ledger;
-- non camuffare `task_id=NULL` sulla SLE;
-- non cercare lo stato v(N+1) del claim.
+- non chiama il propagator;
+- non muta claim ledger;
+- non camuffa `task_id=NULL` sulla SLE (il campo `source_loss_event.task_id` resta `null` anche quando il match è S2);
+- non cerca lo stato v(N+1) del claim.
+
+Test:
+
+- `apps/api/tests/test_task_source_loss_events_endpoint.py`.
+
+Casi coperti dai test:
+
+- happy path solo S2 (`claim_evidence_link`);
+- happy path solo S1 (`task_scope`);
+- dedup precedence: stessa SLE in S1 e S2 → `impacted_via=task_scope`;
+- mix S1 + S2 con due SLE distinte;
+- task esistente senza eventi → 200 `items=[]`;
+- 404 con `details.resource="task_masters"`;
+- truncation con `limit`;
+- read-only invariant con snapshot pre/post.
 
 ---
 
 ### 4.5 8.6 Stretch — `GET /api/v1/published-answers/{published_answer_id}/source-loss-impact`
 
-**Stato:** opzionale.
+**Stato:** opzionale, **non implementato**.
 
-Perché serve: dato un `published_answer`, mostra i source-loss events che lo hanno impattato via propagation records `published_answer_impacted`.
+Perché servirebbe: dato un `published_answer`, mostrerebbe i source-loss events che lo hanno impattato via propagation records `published_answer_impacted`.
 
-Tabelle lette:
+Tabelle che leggerebbe:
 
 - `published_answers`;
 - `source_loss_propagation_records`;
 - `source_loss_events`.
 
-Cosa non deve fare:
+Cosa non dovrebbe fare:
 
 - non withdraw automatico;
 - non audit;
 - non chiamare `apply_withdrawal`;
 - non nascondere impatti storici su PA già withdrawn.
 
+Resta una direzione naturale ma non parte dei criteri di completamento della 8.6 minima.
+
 ---
 
-## 5. Schema response proposto
+## 5. Schema response
 
-Schemi shared esistenti da riusare invariati:
+Schemi shared esistenti riusati invariati:
 
 - `PublishedAnswerLifecycleEventRead`;
 - `SourceLossEventRead`;
 - `SourceLossPropagationRecordRead`.
 
-Wrapper locali preferiti:
+Wrapper locali ai route module:
 
-- lifecycle list wrapper;
-- propagation list wrapper;
-- task-level source-loss item con `impacted_via`;
-- stretch impact wrapper.
+- lifecycle list wrapper (`{"published_answer_id", "items"}`);
+- propagation list wrapper (`{"source_loss_event_id", "items"}`);
+- task-level source-loss item con `impacted_via` (`task_scope` | `claim_evidence_link`).
 
-Principio: non aggiungere nulla a `packages/shared/evidencefirst_shared/schemas.py` se non strettamente necessario.
+Principio: niente aggiunte a `packages/shared/evidencefirst_shared/schemas.py` durante la 8.6.
 
 ---
 
 ## 6. Error handling
 
-Pattern esistenti da riusare:
+Pattern esistenti riusati:
 
 - 404 `RESOURCE_NOT_FOUND`;
-- 400 `VALIDATION_ERROR`;
+- 400 / 422 `VALIDATION_ERROR`;
 - 500 `INTERNAL_ERROR` solo per eccezioni impreviste.
 
 Resource details:
@@ -379,106 +432,114 @@ Resource details:
 - `source_loss_events`;
 - `task_masters`.
 
-Nessun nuovo `ErrorCode` previsto in 8.6.
+Nessun nuovo `ErrorCode` introdotto in 8.6.
 
 ---
 
 ## 7. Test plan
 
-File di test API previsti o già presenti:
+File di test API presenti:
 
-- `apps/api/tests/test_published_answer_lifecycle_events_endpoint.py` — implementato con 8.6A;
-- `apps/api/tests/test_source_loss_events_read_endpoint.py`;
-- `apps/api/tests/test_source_loss_propagation_endpoint.py`;
-- `apps/api/tests/test_task_source_loss_events_endpoint.py`;
-- opzionale: `apps/api/tests/test_published_answer_source_loss_impact_endpoint.py`.
+- `apps/api/tests/test_published_answer_lifecycle_events_endpoint.py` — 8.6A;
+- `apps/api/tests/test_source_loss_events_read_endpoint.py` — 8.6B;
+- `apps/api/tests/test_source_loss_propagation_endpoint.py` — 8.6C;
+- `apps/api/tests/test_task_source_loss_events_endpoint.py` — 8.6D.
 
-Realistic read flow previsto:
+Realistic read flow:
 
-- `tests/test_phase_8_6_read_flow.py`.
+- `tests/test_phase_8_6_read_flow.py` — due scenari cross-component:
+  - withdrawal: API producer → FakeRedis → dispatcher → consumer → service → DB; poi GET 8.6A + GET single published_answer + verify_task_audit_chain;
+  - source-loss: API producer → FakeRedis → dispatcher → consumer → propagator → DB; poi GET 8.6B + GET 8.6C + GET 8.6D + verify_task_audit_chain + verifica della head del claim a `unverifiable / unsupported / source_lost`.
 
-Casi minimi per ogni endpoint:
+Casi minimi per ogni endpoint, ribaditi: happy path, 404, lista vuota dove applicabile, filtri validi, filtri invalidi, limit, read-only invariant con snapshot pre/post.
 
-- happy path;
-- 404;
-- lista vuota dove applicabile;
-- filtri validi;
-- filtri invalidi;
-- limit;
-- read-only invariant con snapshot pre/post.
+Risultati noti del realistic flow (riportati al commit `7ee687b`):
+
+- `tests/test_phase_8_6_read_flow.py` → 2 passed;
+- `tests/` root → 70 passed.
+
+Risultati di `make test`, `make test-api`, `make test-worker`, `make test-shared`, `make test-db` come gate complessivo dopo 8.6E non sono dichiarati come passati in questo documento perché non sono stati riportati in modo esplicito.
 
 ---
 
-## 8. Rollout a blocchi
+## 8. Rollout a blocchi — riepilogo
 
-- **8.6A — Lifecycle read endpoint + tests** — completato.
-- **8.6B — Source-loss event read endpoint + tests** — prossimo blocco consigliato.
-- **8.6C — Source-loss propagation read endpoint + tests**.
-- **8.6D — Task-level source-loss listing + tests**.
-- **8.6E — Realistic read flow tests + docs update**.
-- **8.6 Stretch — Published-answer source-loss impact** — opzionale.
+- **8.6A — Lifecycle read endpoint + tests** — completato (`e2b5472`).
+- **8.6B — Source-loss event read endpoint + tests** — completato (`dedf0ac`).
+- **8.6C — Source-loss propagation read endpoint + tests** — completato (`2da610c`).
+- **8.6D — Task-level source-loss listing + tests** — completato (`cd26cb4`).
+- **8.6E-1 — Realistic read flow test** — completato (`7ee687b`).
+- **8.6E-2 — Docs update finale** — blocco corrente.
+- **8.6 Stretch — Published-answer source-loss impact** — non implementato, opzionale.
 
-Ogni blocco deve essere autonomo, testato e committato separatamente.
+Ogni blocco è stato autonomo, testato e committato separatamente.
 
 ---
 
 ## 9. Rischi residui
 
-- `event_payload` e `details` JSONB esposti senza RBAC;
-- `source_loss_events.task_id` può essere `NULL`, quindi l’endpoint task-level richiede `S1 ∪ S2`;
-- race `POST /api/v1/source-loss-events` → `GET /propagation`: SLE presente ma propagation rows non ancora scritte;
-- niente cursor pagination;
-- tabelle 8.5 crescono senza retention `0007`;
-- `published_answer` creati prima di 8.5 possono non avere lifecycle event `published`;
-- realistic flow usa FakeRedis e dispatcher diretto;
-- worker loop reale non attraversato dai realistic flow;
-- 8.6 espone evidenze e propagazioni, ma non valuta ancora l’attendibilità delle fonti.
+Rischi reali al termine della 8.6 minima:
 
-Il rischio più importante sul piano anti-allucinazione è l’ultimo: un claim può essere tracciato a una fonte reale, ma 8.6 non stabilisce se quella fonte sia primaria, autorevole, indipendente, aggiornata o coerente con altre fonti. Questo resta un debito centrale da affrontare con un futuro Source Quality Evaluator.
+- **RBAC mancante.** Gli endpoint read 8.6 espongono `event_payload`, `details` (JSONB), e ogni colonna delle tabelle senza alcuna autorizzazione applicativa o redaction.
+- **JSONB esposti verbatim.** `event_payload` di `published_answer_lifecycle_events` e `source_loss_events`, `details` di `source_loss_propagation_records` sono restituiti nella loro forma persistita. Eventuali campi sensibili presenti nei payload arrivano al client.
+- **FakeRedis nei realistic flow.** `tests/test_phase_8_6_read_flow.py` installa una `FakeRedis` sui route module 8.5 e ricostruisce l'evento direttamente per il dispatcher. Non c'è interazione con un Redis reale.
+- **Worker main loop non attraversato nei realistic flow.** `XREADGROUP`, `XACK`, gestione PEL e signal handlers non vengono attraversati dai realistic flow 8.5 e 8.6. La copertura dello XREADGROUP/XACK resta limitata agli unit test in `apps/worker/tests/test_main_multistream.py` con FakeRedis interno.
+- **Nessuna retention `0007`.** Le tabelle 8.5 (`published_answer_lifecycle_events`, `source_loss_events`, `source_loss_propagation_records`) crescono senza politiche di pruning.
+- **Nessuna cursor pagination.** Solo `limit` su lifecycle (max 2000), propagation (max 5000), task source-loss (max 2000). Nessun cursore stabile per scorrere liste lunghe.
+- **Race producer → propagation read.** `POST /api/v1/source-loss-events` ritorna l'`id` immediatamente; le righe in `source_loss_propagation_records` arrivano solo dopo il consumer worker. L'endpoint 8.6C ritorna `200 items=[]` durante questa finestra: comportamento corretto ma da ricordare lato client.
+- **`source_loss_events.task_id` può essere NULL.** Il producer API non lo deriva (uno span può supportare claim di task diversi). 8.6D copre la cosa via `S1 ∪ S2` con `impacted_via`, ma 8.6B continua a esporre `task_id=null` verbatim.
+- **`published_answers` pre-8.5 senza lifecycle event `published`.** Nessun backfill è stato eseguito; 8.6A ritorna `items=[]` per quei published_answers, e questo è corretto rispetto allo stato DB.
+- **Stretch endpoint non implementato.** `GET /api/v1/published-answers/{id}/source-loss-impact` resta opzionale.
+- **Source Quality Evaluator futuro.** Il punto strategico più importante: 8.6 espone evidenze e propagazioni, ma non valuta ancora la qualità delle fonti.
 
 ---
 
-## 10. Criteri di completamento
+## 10. Criteri di completamento — verifica
 
 La Fase 8.6 minima è completa quando:
 
-1. 8.6A, 8.6B, 8.6C e 8.6D sono implementati e registrati in `apps/api/app/main.py`.
-2. I test API dedicati passano.
-3. Il realistic read flow `tests/test_phase_8_6_read_flow.py` passa.
-4. `make test-api`, `make test-db` e `make test` passano.
-5. Ogni endpoint è coperto da read-only invariant.
-6. `PROJECT_STATE.md` viene aggiornato a fine fase.
-7. Nessuna migration, nessun worker e nessun test 8.5 esistente viene modificato involontariamente.
-8. Gli endpoint restano read-only.
+1. 8.6A, 8.6B, 8.6C e 8.6D sono implementati e registrati in `apps/api/app/main.py` — **soddisfatto**.
+2. I test API dedicati passano — **soddisfatto sui file di test esistenti**; non si dichiara il pass dell'intero `make test-api` perché non si ha evidenza esplicita.
+3. Il realistic read flow `tests/test_phase_8_6_read_flow.py` passa — **soddisfatto**, 2 passed riportati al commit `7ee687b`; root `tests/` riportato a 70 passed.
+4. `make test-api`, `make test-db` e `make test` passano — **non dichiarato come passato in questo documento**: non vi è evidenza esplicita riportata per la 8.6E.
+5. Ogni endpoint è coperto da read-only invariant — **soddisfatto** (snapshot pre/post in ciascun file di test API e nelle assertion del realistic flow).
+6. `PROJECT_STATE.md` viene aggiornato a fine fase — **soddisfatto** dal blocco 8.6E-2 (questo aggiornamento documentale).
+7. Nessuna migration, nessun worker e nessun test 8.5 esistente è stato modificato — **soddisfatto** dalla revisione dei file 8.5 nel repo.
+8. Gli endpoint restano read-only — **soddisfatto**, verificato dai read-only invariant test.
+
+Per i punti 2 e 4 l'evidenza disponibile copre i singoli file di test eseguiti per il blocco 8.6E-1; un eventuale gate `make test` completo va eseguito separatamente come passo finale.
 
 ---
 
 ## 11. Decisione documentale
 
-- `PHASE_8_6_PLAN.md` resta il documento di piano/stato della fase 8.6.
-- `PROJECT_STATE.md` non va aggiornato per ogni blocco intermedio, salvo decisione esplicita.
-- `PROJECT_STATE.md` si aggiornerà in 8.6E, quando gli endpoint minimi saranno implementati e testati.
-- `README.md` si aggiornerà solo se si decide di includere uno smoke test HTTP leggibile dall’utente.
-- La nota sul Source Quality Evaluator resta strategica: non rappresenta una feature implementata.
+- `PHASE_8_6_PLAN.md` resta il documento di piano/stato della fase 8.6 e dichiara ora la **8.6 minima come completata**.
+- `PROJECT_STATE.md` viene aggiornato in 8.6E-2 al commit `7ee687b`, con la nuova lista di endpoint API e la sezione "cosa esiste oggi" estesa con i quattro GET 8.6 e il realistic read flow.
+- `README.md` non viene modificato in 8.6E-2: non contiene una sezione endpoint/stato 8.5/8.6 da correggere, `PROJECT_STATE.md` copre già lo stato corrente in dettaglio, e gonfiare README con dettagli interni andrebbe contro la decisione documentale di tenere i due file con responsabilità separate.
+- La nota sul Source Quality Evaluator resta strategica e centrale: 8.6 NON la implementa; resta priorità futura.
 
 ---
 
 FILE_COMPLETATI
 - PHASE_8_6_PLAN.md
+- PROJECT_STATE.md
 
 FILE_DA_NON_TOCCARE_ORA
-- codice applicativo non coinvolto dal blocco corrente
-- tests non coinvolti dal blocco corrente
+- codice applicativo
+- tests
 - migrations
-- PROJECT_STATE.md
-- README.md
+- README.md (non contiene una sezione 8.5/8.6 evidentemente obsoleta)
 
 RISCHI_RESIDUI
-- `event_payload` e `details` JSONB esposti senza RBAC.
-- `source_loss_events.task_id` può essere NULL.
-- Race tra source-loss producer e propagation read.
+- RBAC mancante sugli endpoint read 8.6.
+- `event_payload` e `details` JSONB esposti verbatim.
+- FakeRedis nei realistic flow; dispatcher invocato direttamente.
+- Worker main loop reale (XREADGROUP/XACK, PEL, signal handlers) non attraversato dai realistic flow.
+- Nessuna retention `0007`.
 - Niente cursor pagination.
-- Nessuna retention 0007.
-- Realistic flow con FakeRedis.
-- Worker loop reale non attraversato dai realistic flow.
-- Nessun Source Quality Evaluator implementato in 8.6.
+- Race producer → propagation read gestita come 200 items=[].
+- `source_loss_events.task_id` può essere NULL by design; 8.6D usa S1 ∪ S2.
+- Published answers pre-8.5 senza lifecycle event `published` (nessun backfill).
+- Stretch `/published-answers/{id}/source-loss-impact` non implementato.
+- Source Quality Evaluator: debito strategico futuro, non implementato.
+- `make test` / `make test-api` complessivi non dichiarati come passati dopo la 8.6E in questo documento: pass riportati limitatamente a `tests/test_phase_8_6_read_flow.py` (2 passed) e `tests/` root (70 passed).
