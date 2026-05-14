@@ -1,9 +1,10 @@
-"""task.created consumer (Phase 8.4, realigned).
+"""task.created consumer (Phase 8.4, realigned + Phase 8.7E source quality).
 
 Pipeline single-consumer. The 8.3 pipeline (extractor + CVE-lite -> analyzed_partial)
-is preserved. After 'task.analyzed_partial', the consumer continues in the same
-event loop with the 8.4 stage (compiler + final answer gate -> published or
-publication_held).
+is preserved. After 'task.analyzed_partial', a mock source quality assessment step
+(Phase 8.7E) is run, wrapped in a SAVEPOINT so its failure cannot block 8.4. Then
+the consumer continues in the same event loop with the 8.4 stage (compiler +
+final answer gate -> published or publication_held).
 
 Terminality (Phase 8.4, FINAL):
   - blocked                                                             -> terminal
@@ -28,6 +29,7 @@ Audit sequence (with documents, approved scenario):
   task.cve_lite_started
   task.cve_lite_completed
   task.analyzed_partial
+  task.source_quality_assessed
   task.compiling
   task.draft_compiled
   task.final_gate_started
@@ -42,12 +44,25 @@ Resume cases (NOT a fresh run): when the consumer enters with the task already
 in 'compiling' or 'analyzed_partial', the corresponding state-transition audit
 events are NOT re-emitted (they were emitted on the original run). The
 sub-pipeline functions are guarded by status conditions to keep audit history
-free of duplicates.
+free of duplicates. The 8.7E step lives inside _run_8_3_extract_and_verify
+(fresh-run path only), so task.source_quality_assessed is not re-emitted on
+resume either.
+
+Phase 8.7E invariants:
+  - The source quality step is invoked ONLY in the fresh-run path
+    (_run_8_3_extract_and_verify, AFTER the 'analyzed_partial' transition audit).
+  - Its failure is NEVER allowed to break the 8.4 pipeline: the call is wrapped
+    in conn.begin_nested() so DB exceptions roll back the savepoint and leave the
+    outer transaction usable. The aggregated audit event
+    task.source_quality_assessed is emitted with status='completed' on success
+    and status='failed' on failure.
+  - No new Redis stream, no new consumer, no new dispatcher entry, no change to
+    main.py, no change to Final Answer Gate, no change to Claim Ledger.
 
 FK-safety (8.1d-patch1) and post-commit publish (8.1d) preserved.
 Idempotent under redelivery: every state transition is guarded by the current
 status; every INSERT in services uses ON CONFLICT DO NOTHING on UNIQUE
-constraints declared in 0004 / 0005.
+constraints declared in 0004 / 0005 / 0007.
 """
 from __future__ import annotations
 
@@ -66,6 +81,13 @@ from ..services.compiler import run_compilation
 from ..services.cve_lite import run_cve_lite
 from ..services.extractor import run_extraction
 from ..services.final_answer_gate import run_final_answer_gate
+from ..services.source_quality_evaluator import (
+    DEFAULT_POLICY_NAME as SOURCE_QUALITY_POLICY_NAME,
+    DEFAULT_POLICY_VERSION as SOURCE_QUALITY_POLICY_VERSION,
+    SERVICE_NAME as SOURCE_QUALITY_SERVICE_NAME,
+    SERVICE_VERSION as SOURCE_QUALITY_SERVICE_VERSION,
+)
+from ..services.source_quality_orchestrator import run_source_quality_assessment
 
 
 logger = structlog.get_logger(__name__)
@@ -239,6 +261,145 @@ def _advance_to_blocked_no_docs(
 
 
 # ---------------------------------------------------------------------------
+# Phase 8.7E — source quality step (savepoint-wrapped)
+# ---------------------------------------------------------------------------
+def _run_8_7_source_quality(
+    conn: Connection,
+    *,
+    task_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    project_id: uuid.UUID,
+    consumer_name: str,
+) -> None:
+    """Run the mock source quality assessment step for the task.
+
+    Phase 8.7E (Block E) integration. The orchestrator call is wrapped
+    in a SAVEPOINT (``conn.begin_nested()``) so that any exception
+    raised inside the orchestrator or by the underlying evaluator does
+    NOT abort the caller's outer transaction and does NOT break the
+    8.4 pipeline that runs after this step.
+
+    Try/except scoping (Correction 2 of 8.7E micro-fix):
+      The ``try`` covers ONLY the savepoint-wrapped call to
+      ``run_source_quality_assessment``. The success ``audit_append``
+      is emitted OUTSIDE the try: a failure there is a separate fault
+      and must NOT be reclassified as a source-quality failure audit.
+      If the success audit itself raises, the exception propagates to
+      the caller of this function (handle_task_created), which already
+      classifies any pipeline exception as ``WORKER_TASK_CREATED_FAIL``
+      on the EPR row.
+
+    Side effects:
+      - On success: at most one INSERT per evidence_span_id linked to
+        the task via claim_evidence_links into
+        ``source_quality_assessments`` (idempotent across redelivery),
+        plus exactly one ``task.source_quality_assessed`` audit event
+        on the task's audit chain with ``status='completed'`` and
+        aggregated counts.
+      - On orchestrator failure: the SAVEPOINT is rolled back, so any
+        partial INSERT in ``source_quality_assessments`` from this
+        call is discarded. The outer transaction is left usable, and
+        exactly one ``task.source_quality_assessed`` audit event is
+        emitted with ``status='failed'``. The exception is NOT
+        re-raised; the pipeline continues to 8.4.
+
+    Invariants:
+      - This function does NOT mutate ``task_masters.status``,
+        ``claim_ledger_entries``, ``final_gate_reports``,
+        ``published_answers``, ``source_loss_*``, or any other domain
+        table outside of ``source_quality_assessments`` (via the
+        orchestrator).
+      - The audit payload exposes counts, NOT individual scores or
+        per-span identifiers. Detailed inspection is via the (future)
+        8.7F read API.
+      - Stack traces are NEVER included in the audit payload on
+        failure: only ``error_type`` (the exception class name) is
+        recorded. Full diagnostics live in the structured log.
+    """
+    try:
+        with conn.begin_nested():
+            counts = run_source_quality_assessment(conn, task_id=task_id)
+    except Exception as exc:
+        # SAVEPOINT auto-rolled-back by the context manager: any partial
+        # source_quality_assessments INSERT from this call is gone, and
+        # the outer transaction is usable again. We log the failure with
+        # full stack trace, then emit a structured 'failed' audit so
+        # the operator can observe the incident via the audit chain.
+        #
+        # We deliberately catch BLE001 (broad except): the savepoint is
+        # precisely the mechanism that lets us safely absorb ANY
+        # exception here without poisoning the pipeline.
+        logger.exception(
+            "task_created.source_quality_failed",
+            task_id=str(task_id),
+            error_type=type(exc).__name__,
+        )
+        audit_append(
+            conn,
+            chain_scope="task",
+            tenant_id=tenant_id,
+            project_id=project_id,
+            task_id=task_id,
+            session_id=None,
+            event_type="task.source_quality_assessed",
+            actor_type="job",
+            actor_id=consumer_name,
+            redacted_payload={
+                "service_name": SOURCE_QUALITY_SERVICE_NAME,
+                "service_version": SOURCE_QUALITY_SERVICE_VERSION,
+                "policy_name": SOURCE_QUALITY_POLICY_NAME,
+                "policy_version": SOURCE_QUALITY_POLICY_VERSION,
+                "evaluated_target_kind": "evidence_span",
+                "status": "failed",
+                "error_type": type(exc).__name__,
+                "counts": {
+                    "status": "failed",
+                    "spans_total": 0,
+                    "assessed_count": 0,
+                    "already_assessed_count": 0,
+                    "not_found_count": 0,
+                    "invalid_target_count": 0,
+                    "error_count": 1,
+                },
+            },
+            related_entity_type="task_masters",
+            related_entity_id=task_id,
+        )
+        # Do NOT re-raise: the savepoint + audit pair exists precisely
+        # to keep 8.4 running even if 8.7E fails. The pipeline
+        # continues from the caller's site.
+        return
+
+    # Success path: emit the aggregated audit OUTSIDE the try/except.
+    # A failure here is NOT a source-quality failure (the orchestrator
+    # already completed), so we deliberately let it propagate to
+    # handle_task_created, which will classify it as
+    # WORKER_TASK_CREATED_FAIL on the EPR row.
+    audit_append(
+        conn,
+        chain_scope="task",
+        tenant_id=tenant_id,
+        project_id=project_id,
+        task_id=task_id,
+        session_id=None,
+        event_type="task.source_quality_assessed",
+        actor_type="job",
+        actor_id=consumer_name,
+        redacted_payload={
+            "service_name": SOURCE_QUALITY_SERVICE_NAME,
+            "service_version": SOURCE_QUALITY_SERVICE_VERSION,
+            "policy_name": SOURCE_QUALITY_POLICY_NAME,
+            "policy_version": SOURCE_QUALITY_POLICY_VERSION,
+            "evaluated_target_kind": "evidence_span",
+            "status": "completed",
+            "counts": counts,
+        },
+        related_entity_type="task_masters",
+        related_entity_id=task_id,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 8.3 sub-pipeline (extract + cve_lite + analyzed_partial)
 # ---------------------------------------------------------------------------
 def _run_8_3_extract_and_verify(
@@ -343,6 +504,10 @@ def _run_8_3_extract_and_verify(
         {"id": task_id},
     ).first()
     if r is None:
+        # The 'analyzing -> analyzed_partial' transition did not happen
+        # on this call (concurrent execution / unexpected state). Do NOT
+        # emit the analyzed_partial audit and do NOT run the 8.7E step:
+        # both belong to the fresh run that produced the transition.
         return
     audit_append(
         conn,
@@ -366,6 +531,27 @@ def _run_8_3_extract_and_verify(
         },
         related_entity_type="task_masters",
         related_entity_id=task_id,
+    )
+
+    # Phase 8.7E: mock source quality assessment, AFTER task.analyzed_partial
+    # and BEFORE the 8.4 stage (which is invoked by the orchestrator
+    # _run_pipeline_with_docs after this function returns). The call is
+    # SAVEPOINT-wrapped so its failure does not abort the outer
+    # transaction; the aggregated task.source_quality_assessed audit is
+    # emitted either way.
+    #
+    # Resume safety: this point is reached ONLY when the
+    # 'analyzing -> analyzed_partial' transition succeeded on THIS call
+    # (the early return above guards against everything else). A resume
+    # from an already-analyzed_partial or compiling task does NOT enter
+    # _run_8_3_extract_and_verify (see _run_pipeline_with_docs), so the
+    # 8.7E audit is never re-emitted on redelivery.
+    _run_8_7_source_quality(
+        conn,
+        task_id=task_id,
+        tenant_id=tenant_id,
+        project_id=project_id,
+        consumer_name=consumer_name,
     )
 
 
@@ -687,7 +873,9 @@ def _run_pipeline_with_docs(
     """Run the 8.3 stage (if needed) followed by the 8.4 stage."""
     current_status = _fetch_task_status(conn, task_id)
 
-    # 8.3 stage runs from analyzing -> analyzed_partial.
+    # 8.3 stage runs from analyzing -> analyzed_partial. It also runs
+    # the 8.7E source quality step internally, AFTER task.analyzed_partial
+    # and BEFORE returning here.
     if current_status == "analyzing":
         _run_8_3_extract_and_verify(
             conn,
@@ -699,6 +887,9 @@ def _run_pipeline_with_docs(
         current_status = _fetch_task_status(conn, task_id)
 
     # 8.4 stage starts from analyzed_partial or RESUMES from compiling.
+    # Resume runs do NOT enter _run_8_3_extract_and_verify above, so the
+    # 8.7E source quality audit is emitted exactly once per task lifetime
+    # in the fresh-run path.
     if current_status in ("analyzed_partial", "compiling"):
         existing_report = _fetch_existing_gate_report_for_task(conn, task_id)
         if existing_report is None:

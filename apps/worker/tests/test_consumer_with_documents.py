@@ -1,15 +1,15 @@
-"""Worker consumer tests for the with-docs branch (Phase 8.4).
+"""Worker consumer tests for the with-docs branch (Phase 8.4 + Phase 8.7E).
 
 Coverage:
   - With-docs full pipeline (approved): task ends in status='published',
-    audit chain has the 13 worker events of the 8.4 approved sequence.
+    audit chain has the 14 worker events of the 8.7E approved sequence.
   - With-docs rejected zero-verified: task ends in status='analyzed_partial'
     with a final_gate_reports row, audit chain ends with task.publication_held.
   - No-docs branch invariato: task ends in status='blocked'.
   - Redelivery with fresh idempotency_key after the approved/rejected run
     completes returns 'skipped_terminal' and does not append any audit row.
 
-Phase 8.4 worker audit sequence (approved with-docs):
+Phase 8.7E worker audit sequence (approved with-docs):
   1  task.analyzing
   2  task.docs_loaded
   3  task.claims_extracted
@@ -18,15 +18,28 @@ Phase 8.4 worker audit sequence (approved with-docs):
   6  task.cve_lite_started
   7  task.cve_lite_completed
   8  task.analyzed_partial
-  9  task.compiling
-  10 task.draft_compiled
-  11 task.final_gate_started
-  12 task.final_gate_completed
-  13 task.published
+  9  task.source_quality_assessed
+  10 task.compiling
+  11 task.draft_compiled
+  12 task.final_gate_started
+  13 task.final_gate_completed
+  14 task.published
 
-Phase 8.4 worker audit sequence (rejected zero-verified with-docs):
-  ... up to task.final_gate_completed, then:
-  13 task.publication_held
+Phase 8.7E worker audit sequence (rejected zero-verified with-docs):
+  1  task.analyzing
+  2  task.docs_loaded
+  3  task.claims_extracted
+  4  task.claims_classified
+  5  task.claims_ledger_initialized
+  6  task.cve_lite_started
+  7  task.cve_lite_completed
+  8  task.analyzed_partial
+  9  task.source_quality_assessed
+  10 task.compiling
+  11 task.draft_compiled
+  12 task.final_gate_started
+  13 task.final_gate_completed
+  14 task.publication_held
 
 No-docs branch (invariato):
   1  task.analyzing
@@ -37,6 +50,7 @@ Notes:
     the call in `with get_engine().connect() as conn: ...` before invoking it.
   - All tests are rerun-safe (UUID/hash/marker unique per invocation).
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -66,6 +80,7 @@ EXPECTED_PIPELINE_EVENTS_8_4_APPROVED: list[str] = [
     "task.cve_lite_started",
     "task.cve_lite_completed",
     "task.analyzed_partial",
+    "task.source_quality_assessed",
     "task.compiling",
     "task.draft_compiled",
     "task.final_gate_started",
@@ -82,6 +97,7 @@ EXPECTED_PIPELINE_EVENTS_8_4_REJECTED: list[str] = [
     "task.cve_lite_started",
     "task.cve_lite_completed",
     "task.analyzed_partial",
+    "task.source_quality_assessed",
     "task.compiling",
     "task.draft_compiled",
     "task.final_gate_started",
