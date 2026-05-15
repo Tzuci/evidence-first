@@ -1,14 +1,16 @@
 # PROJECT_STATE — Evidence-First MVP-0
 
-Documento di onboarding tecnico, una pagina, leggibile dal collaboratore al primo accesso senza dover leggere il codice. Riflette lo stato del repo al commit **Fase 8.6 minima**: `7ee687b4d47d81b736c0bc0587acaa5c12bc3a24` ("Add realistic phase 8.6 read flow test").
+Documento di onboarding tecnico, una pagina, leggibile dal collaboratore al primo accesso senza dover leggere il codice. Riflette lo stato del repo al commit **Fase 8.7F**: `91397ae6f02abd429cff29b6e0248cf9a7c16317` ("Add source quality read endpoints").
 
 ---
 
 ## Cosa è il progetto
 
-Piattaforma multi-AI **evidence-first** ed **evidence-gated**. Nessun claim fattuale può finire nella risposta finale se non è collegato a evidenze tracciabili, registrate nel Claim Ledger, verificate e approvate dal Final Answer Gate. La verità non è ciò che dice un modello AI: è ciò che le evidenze recuperate, archiviate, tracciate e verificate dal sistema supportano.
+Piattaforma multi-AI **evidence-first** ed **evidence-gated**.
 
-In MVP-0 il nucleo evidence-gated è costruito **prima** della visione multi-AI. Provider AI reali, Verified Web Mode, Hybrid Mode, consensus engine, contradiction detector avanzato, source quality evaluator e critical reviewer sono fasi future. Il claim "evidence-gated" qui significa: esiste una base append-only verificabile end-to-end per draft/gate/published, più una propagazione lifecycle e source-loss minimale per MVP-0, e una superficie di osservabilità HTTP read-only sopra di essa. Non è una soluzione completa al problema delle allucinazioni.
+Il sistema è progettato per impedire che claim fattuali non supportati, contraddetti o basati su fonti inadeguate vengano pubblicati come affidabili. Non promette di eliminare le allucinazioni: promette evidenze tracciabili, registrate nel Claim Ledger, verificate dal CVE-lite, valutate sul piano della qualità delle fonti, propagate via lifecycle e source-loss, e approvate dal Final Answer Gate prima di qualunque pubblicazione.
+
+In MVP-0 il nucleo evidence-gated è costruito **prima** della visione multi-AI. Provider AI reali, Verified Web Mode, Hybrid Mode, consensus engine, contradiction detector avanzato e critical reviewer sono fasi future. Il claim "evidence-gated" qui significa: esiste una base append-only verificabile end-to-end per draft/gate/published, una propagazione lifecycle e source-loss minimale per MVP-0, una superficie di osservabilità HTTP read-only sopra di essa, e un primo Source Quality Evaluator deterministico mock (8.7) che scrive assessment append-only sulle fonti che supportano i claim. Non è una soluzione completa al problema delle allucinazioni.
 
 ---
 
@@ -22,11 +24,14 @@ In MVP-0 il nucleo evidence-gated è costruito **prima** della visione multi-AI.
 | `0004_claim_ledger.sql` | applicata, immutabile |
 | `0005_answers_gate.sql` | applicata, immutabile |
 | `0006_lifecycle.sql` | applicata (Fase 8.5), immutabile |
-| `0007_evaluation_retention.sql` | da scrivere |
+| `0007_source_quality.sql` | applicata (Fase 8.7B), immutabile |
+| `0008_*` retention futura | numero da assegnare; retention reale distruttiva ancora non scritta |
+
+Nota: la voce `0007_evaluation_retention.sql` indicata nei documenti precedenti è stata superata. Il numero `0007` è ora occupato da `source_quality`; la retention futura prenderà un numero successivo (provvisoriamente `0008_*`).
 
 ---
 
-## Cosa esiste oggi (Fasi 8.4 + 8.5 + 8.6 minima)
+## Cosa esiste oggi (Fasi 8.4 + 8.5 + 8.6 minima + 8.7A–F)
 
 ### Base 8.4 (invariata)
 
@@ -39,7 +44,7 @@ In MVP-0 il nucleo evidence-gated è costruito **prima** della visione multi-AI.
 - **Worker single-consumer 8.4** per `task.created`, FK-safe, resume-safe, idempotente.
 - **Coerenza referenziale stretta a DB** tra `task_masters` ↔ `draft_final_answers` ↔ `final_gate_reports` ↔ `published_answers` via UNIQUE composite e FK composite.
 
-### Fase 8.5 (invariata rispetto al commit `03c4186`)
+### Fase 8.5 (invariata)
 
 **Schema (migration `0006_lifecycle.sql`).** Tre tabelle append-only:
 
@@ -49,63 +54,100 @@ In MVP-0 il nucleo evidence-gated è costruito **prima** della visione multi-AI.
 
 **Servizi worker.**
 
-- `published_answer_lifecycle.apply_withdrawal`: unico scrittore autorizzato dei campi lifecycle di `published_answers` per il path di withdrawal. Lock `FOR UPDATE`, INSERT idempotenti dei lifecycle event, UPDATE status-guarded `WHERE status='published'`, audit `published_answer.withdrawn` solo se l'UPDATE muta una riga.
-- `source_loss_propagator.propagate_source_loss`: risolve l'impact set da `evidence_span_id`, append `v(N+1)` `unverifiable / unsupported / source_lost` con lineage `supersedes`, registra `source_loss_propagation_records` con audit `source_loss.propagated_to_claim` e `source_loss.propagated_to_published_answer`, gestisce `no_claims_impacted` e `no_active_published_answers_impacted`.
+- `published_answer_lifecycle.apply_withdrawal`: unico scrittore autorizzato dei campi lifecycle di `published_answers` per il path di withdrawal.
+- `source_loss_propagator.propagate_source_loss`: risolve l'impact set da `evidence_span_id`, append `v(N+1)` `unverifiable / unsupported / source_lost` con lineage `supersedes`, registra `source_loss_propagation_records`.
 
-**Consumer e dispatcher.**
+**Consumer e dispatcher.** `consumers/published_answer_withdrawal.py`, `consumers/source_loss.py`, `consumers/dispatch.py`. Worker multi-stream con gruppo `worker_default`.
 
-- `consumers/published_answer_withdrawal.py`: consumer_name stabile, EPR consumer-level, branch FK-safe.
-- `consumers/source_loss.py`: consumer_name stabile, scope risolto via LEFT JOIN con `task_masters` (task_id può restare NULL), EPR consumer-level.
-- `consumers/dispatch.py`: routing per `task.created`/`task_created`, `published_answer.withdrawal_requested`, `source_loss.detected`; `redis_consumer_name` NON forwardato ai due nuovi consumer (la UNIQUE EPR resta globale).
-- `worker/app/main.py`: `xreadgroup` multi-stream su tre stream con gruppo `worker_default`, ACK sullo stream concreto, `_ACK_STATUSES = {processed, skipped_already_succeeded, skipped_in_flight, skipped_terminal}`, `failed` lascia pending.
+**API producer 8.5.** `POST /api/v1/published-answers/{published_answer_id}/withdrawal-requests`, `POST /api/v1/source-loss-events`.
 
-**API producer 8.5.**
+### Fase 8.6 minima (invariata)
 
-- `POST /api/v1/published-answers/{published_answer_id}/withdrawal-requests`: read-only DB lato API, XADD su `app.events.published_answer_withdrawal_requested`, ritorna 202 con envelope.
-- `POST /api/v1/source-loss-events`: INSERT in `source_loss_events` + XADD su `app.events.source_loss_detected` nella stessa transazione (rollback DB se XADD fallisce), 404/409/500 normalizzati.
+Quattro endpoint GET read-only di osservabilità su lifecycle e source-loss:
 
-### Fase 8.6 minima (nuovo rispetto a 8.5)
+- `GET /api/v1/published-answers/{published_answer_id}/lifecycle-events` (8.6A)
+- `GET /api/v1/source-loss-events/{source_loss_event_id}` (8.6B)
+- `GET /api/v1/source-loss-events/{source_loss_event_id}/propagation` (8.6C)
+- `GET /api/v1/tasks/{task_id}/source-loss-events` (8.6D)
 
-Tutto quanto segue è nel repo al commit `7ee687b4d47d81b736c0bc0587acaa5c12bc3a24` ed è verificabile leggendo i file indicati. Endpoint API read-only di osservabilità sui domini lifecycle e source-loss introdotti in 8.5.
+Tutti read-only end-to-end, verificati da snapshot pre/post sui count.
 
-**Quattro endpoint GET read-only.**
+### Fase 8.7 — Source Quality
 
-- `GET /api/v1/published-answers/{published_answer_id}/lifecycle-events` — `apps/api/app/routes/lifecycle_events.py`. Lista eventi lifecycle ordinati ASC per (created_at, id), filtro opzionale per `event_type`, `limit` 1–2000 default 200. 404 con `details.resource="published_answers"`. Commit `e2b5472`.
-- `GET /api/v1/source-loss-events/{source_loss_event_id}` — `apps/api/app/routes/source_loss.py`. Single-row read tramite `SourceLossEventRead`. 404 con `details.resource="source_loss_events"`. Surface `task_id=null` verbatim. Commit `dedf0ac`.
-- `GET /api/v1/source-loss-events/{source_loss_event_id}/propagation` — `apps/api/app/routes/source_loss.py`. Lista propagation records ordinati ASC per (created_at, id), filtri opzionali `propagation_kind` e `status`, `limit` 1–5000 default 500. Non collassa `failed`. 404 con `details.resource="source_loss_events"`. Commit `2da610c`.
-- `GET /api/v1/tasks/{task_id}/source-loss-events` — `apps/api/app/routes/task_source_loss.py`. Lista task-centric tramite union S1 ∪ S2: S1 = `source_loss_events.task_id = :task_id`, S2 = `source_loss_events.evidence_span_id` collegato a `logical_claims.task_id` via `claim_evidence_links`. Distinct per `source_loss_events.id` con precedence `task_scope` > `claim_evidence_link`. `task_id` sulla SLE resta esposto verbatim (NULL non viene camuffato). 404 con `details.resource="task_masters"`. Commit `cd26cb4`.
+Stato post-8.7F: lo strato di valutazione qualità delle fonti esiste come capability append-only e osservabile via HTTP, ma **non è ancora consumato dal Final Answer Gate**.
 
-**Wrapper di risposta.** Locali ai route module (non aggiunti a `packages/shared/evidencefirst_shared/schemas.py`):
+**8.7B — Schema (`migrations/0007_source_quality.sql`).**
 
-- lifecycle list wrapper `{published_answer_id, items}`;
-- propagation list wrapper `{source_loss_event_id, items}`;
-- task source-loss item con `impacted_via ∈ {task_scope, claim_evidence_link}`.
+- Tabella `source_quality_assessments` append-only (trigger `source_quality_assessments_append_only` su `reject_modify_append_only`).
+- CHECK `sqa_target_xor`: esattamente UNO tra `evidence_span_id`, `document_chunk_id`, `document_id` non-null per riga.
+- Nove CHECK enum sui codomini: `source_type`, `source_role`, `authority_level`, `independence_level`, `freshness`, `relevance`, `extract_quality`, `contradiction_status`, `overall_quality`.
+- `confidence` `DOUBLE PRECISION` in `[0.0, 1.0]` o NULL.
+- Sei partial unique indexes (tre versioning + tre idempotency, uno per target kind): `sqa_evidence_version_uq`, `sqa_chunk_version_uq`, `sqa_document_version_uq`, `sqa_evidence_idem_uq`, `sqa_chunk_idem_uq`, `sqa_document_idem_uq`.
+- FK con `ON DELETE RESTRICT`.
+- `policy_name` e `policy_version` come stringhe opache (nessun FK a `policy_versions`).
+- Indici di lookup su `tenant_id`, `project_id`, target per granularità, `overall_quality`, `source_role`, `freshness`.
 
-Gli item interni riutilizzano gli schemi shared già esistenti dal 8.5 (`PublishedAnswerLifecycleEventRead`, `SourceLossEventRead`, `SourceLossPropagationRecordRead`).
+**8.7C — Codomini shared (`packages/shared/evidencefirst_shared/schemas.py`).**
 
-**Test API dedicati.**
+- Nove tuple `SOURCE_QUALITY_*_VALUES` che rispecchiano esattamente i CHECK enum di 0007.
+- Nove `Literal` alias (`SourceQualitySourceType`, `SourceQualitySourceRole`, …) per consumer che vogliono tipizzazione stretta.
+- `SourceQualityAssessmentRead` con campi quality come `str` per coerenza con gli altri Read model (l'enforcement resta a DB level).
 
-- `apps/api/tests/test_published_answer_lifecycle_events_endpoint.py` — 7 scenari.
-- `apps/api/tests/test_source_loss_events_read_endpoint.py` — 5 scenari.
-- `apps/api/tests/test_source_loss_propagation_endpoint.py` — 9 scenari.
-- `apps/api/tests/test_task_source_loss_events_endpoint.py` — 8 scenari.
+**8.7D — Mock Source Quality Evaluator (`apps/worker/app/services/source_quality_evaluator.py`).**
 
-Ogni file include un test di read-only invariant con snapshot pre/post sui count delle tabelle `published_answer_lifecycle_events`, `source_loss_events`, `source_loss_propagation_records`, `published_answers`, `claim_ledger_entries`, `claim_lineage`, `audit_records`.
+- Deterministico, mock-driven. Nessun provider AI, nessuna web search, nessuna euristica reale.
+- Identità: `SERVICE_NAME="mock_source_quality_evaluator"`, `SERVICE_VERSION="0.1.0"`, `DEFAULT_POLICY_NAME="mvp0_mock_source_quality"`, `DEFAULT_POLICY_VERSION="0.1.0"`.
+- Politica mock fissa:
+  - `source_type='user_document'`, `source_role='unclear'`, `authority_level='unknown'`, `independence_level='unknown'`, `freshness='undated'`, `contradiction_status='unchecked'`, `overall_quality='unknown'`, `confidence=0.5`.
+  - per `evidence_span`: `relevance='direct_support'`, `extract_quality='exact_quote_match'`.
+  - per `document_chunk` / `document`: `relevance='contextual_support'`, `extract_quality='partial_match'`.
+- Validazione codomini al module-load (assert su appartenenza alle tuple shared).
+- Target XOR validato a livello applicativo prima di toccare il DB.
+- Lock `FOR UPDATE` sul target parent row per serializzare il calcolo del prossimo `version_no`.
+- Idempotenza per `(target_kind, target_id, idempotency_key)` con short-circuit `STATUS_ALREADY_ASSESSED`; doppia protezione via SAVEPOINT su `IntegrityError` (race) con recovery SELECT.
+- Canonical scope: l'INSERT scrive `tenant_id`/`project_id` letti dal target row, non quelli passati dal caller (un caller scorretto non può inquinare la tabella).
+- Payload JSONB include `mock=true`, `semantic_warning="source_quality_does_not_mean_claim_truth"`, e `input_payload` opzionale verbatim.
+- Status di ritorno: `assessed`, `already_assessed`, `invalid_target`, `not_found`.
+- Non emette mai `audit_records`. Non muta `claim_ledger_entries`, `claim_lineage`, `claim_evidence_links`, `verification_records`, `final_gate_reports`, `published_answers`, `source_loss_*`, `published_answer_lifecycle_events`.
 
-**Realistic read flow test (root tests/).**
+**8.7E — Worker integration (`apps/worker/app/services/source_quality_orchestrator.py` + integrazione in `apps/worker/app/consumers/task_created.py`).**
 
-- `tests/test_phase_8_6_read_flow.py` — due scenari cross-component:
-  - withdrawal: API producer 8.5 → FakeRedis (installato sul route module) → `dispatch.handle_event(event)` → withdrawal consumer → lifecycle service → DB; poi GET 8.6A + GET single published_answer (status='withdrawn') + verify_task_audit_chain ok=True;
-  - source-loss: API producer 8.5 → FakeRedis → `dispatch.handle_event(event)` → source_loss consumer → propagator → DB; poi GET 8.6B + GET 8.6C + GET 8.6D + verify_task_audit_chain ok=True + head del claim a `unverifiable / unsupported / source_lost`.
+- Orchestrator `run_source_quality_assessment(conn, task_id)`:
+  - risolve `(tenant_id, project_id)` da `task_masters`;
+  - calcola DISTINCT `evidence_span_id` linkati ai claim del task via `claim_evidence_links` JOIN `logical_claims` (filtro `evidence_span_id IS NOT NULL`, ordinati ASC per determinismo);
+  - per ogni span chiama `assess_source_quality` con idempotency key deterministica `task:{task_id}:span:{evidence_span_id}:v1`;
+  - aggrega contatori `{spans_total, assessed_count, already_assessed_count, not_found_count, invalid_target_count, error_count}`;
+  - ritorna `status='not_found'` se il task non esiste, `status='completed'` altrimenti (anche con `spans_total=0`).
+- Integrazione nel consumer `task_created`:
+  - Lo step viene eseguito **solo nel fresh-run path**, dentro `_run_8_3_extract_and_verify`, **dopo `task.analyzed_partial`** e **prima di `task.compiling`**.
+  - La chiamata è incapsulata in `conn.begin_nested()` (SAVEPOINT): un fallimento dell'orchestrator NON aborta la transazione esterna e NON blocca la pipeline 8.4.
+  - Un singolo audit aggregato `task.source_quality_assessed` viene emesso con `status='completed'` (success) o `status='failed'` (rollback savepoint + audit). Sul ramo failed il payload include `error_type` (nome classe eccezione, **mai stack trace**) e `counts` con `error_count=1`.
+  - Sui resume da `compiling` o `analyzed_partial` lo step **non** viene re-eseguito (il path entra direttamente in `_run_8_4_compile_and_gate`). L'audit `task.source_quality_assessed` resta unico per task lifetime.
+  - Nessun nuovo stream Redis, nessun nuovo consumer, nessuna modifica al dispatcher.
 
-Il file carica il package worker via `importlib.util` sotto alias `_wapp` per evitare la collisione di nome con il package `app` dell'API, stessa convenzione dei realistic flow 8.5.
+**8.7F — Read API (`apps/api/app/routes/source_quality.py`).**
 
-Risultati riportati al commit `7ee687b`:
+Due endpoint GET read-only, registrati in `apps/api/app/main.py`:
 
-- `tests/test_phase_8_6_read_flow.py` → 2 passed;
-- `tests/` root → 70 passed.
+- `GET /api/v1/evidence-spans/{evidence_span_id}/source-quality`
+  - 404 `RESOURCE_NOT_FOUND` con `details.resource="evidence_spans"` se lo span non esiste;
+  - 200 con `items=[]` e `latest_assessment=null` se lo span esiste senza assessment;
+  - 200 con `items` ordinati ASC per `(version_no, created_at, id)`, `limit` 1–5000 default 100;
+  - wrapper `{evidence_span_id, latest_assessment, items}`; `latest_assessment` è l'ultimo elemento dello slice ritornato.
+- `GET /api/v1/tasks/{task_id}/source-quality`
+  - 404 `RESOURCE_NOT_FOUND` con `details.resource="task_masters"` se il task non esiste;
+  - 200 con un item per evidence_span linkato al task; span senza assessment esposti con `latest_assessment=null` e `items=[]` (no occultamento);
+  - `summary` con `evidence_spans_total`, `spans_with_assessment`, `spans_without_assessment`, `latest_overall_quality_counts` su tutto il codominio di `overall_quality` (`{strong, adequate, weak, unsuitable, unknown}`), inizializzato a zero;
+  - i counts del summary contano solo l'`latest_assessment` per span;
+  - `limit_per_span` 1–5000 default 100.
 
-Non si dichiara qui che `make test`, `make test-api`, `make test-worker`, `make test-shared` o `make test-db` siano stati eseguiti come gate complessivo dopo la 8.6E: vanno eseguiti separatamente.
+Invarianti comuni:
+- Read-only end-to-end (nessun INSERT/UPDATE/DELETE, nessuna chiamata a `assess_source_quality` o `run_source_quality_assessment`, nessun import di codice worker).
+- JSONB `payload` esposto verbatim (nessuna RBAC redaction in MVP-0).
+- Pagination via `limit` (no cursor).
+- N+1 query per il task endpoint (loop su span_id) accettato per MVP-0; documentato come debito.
+
+Test riportati dall'utente dopo 8.7F: test source quality read endpoint passati, API suite passata, root tests passati, worker suite già passata dopo 8.7E.
 
 ---
 
@@ -139,15 +181,17 @@ Non si dichiara qui che `make test`, `make test-api`, `make test-worker`, `make 
 | `GET /api/v1/source-loss-events/{source_loss_event_id}` | Read single source_loss_event | 8.6B |
 | `GET /api/v1/source-loss-events/{source_loss_event_id}/propagation` | Read propagation records di un source_loss_event | 8.6C |
 | `GET /api/v1/tasks/{task_id}/source-loss-events` | Read task-level source-loss listing (S1 ∪ S2) | 8.6D |
+| `GET /api/v1/evidence-spans/{evidence_span_id}/source-quality` | Read source quality assessments per evidence_span | 8.7F |
+| `GET /api/v1/tasks/{task_id}/source-quality` | Read task-level source quality summary | 8.7F |
 | `GET /health/live` / `/health/db` / `/health/queue` / `/health/storage` / `/health/ready` | Health checks | 8.1+ |
 
 ---
 
-## Pipeline 8.4 (sintesi, invariata)
+## Pipeline 8.4 / 8.7 (sintesi aggiornata)
 
 ### Task con documenti, approved scenario
 
-`task.created` → `task.docs_attached` (API) → `task.analyzing` → `task.docs_loaded` → `task.claims_extracted` → `task.claims_classified` → `task.claims_ledger_initialized` → `task.cve_lite_started` → `task.cve_lite_completed` → `task.analyzed_partial` → `task.compiling` → `task.draft_compiled` → `task.final_gate_started` → `task.final_gate_completed` → `task.published`.
+`task.created` → `task.docs_attached` (API) → `task.analyzing` → `task.docs_loaded` → `task.claims_extracted` → `task.claims_classified` → `task.claims_ledger_initialized` → `task.cve_lite_started` → `task.cve_lite_completed` → `task.analyzed_partial` → **`task.source_quality_assessed`** → `task.compiling` → `task.draft_compiled` → `task.final_gate_started` → `task.final_gate_completed` → `task.published`.
 
 ### Task con documenti, rejected zero-verified
 
@@ -155,50 +199,48 @@ Sequenza identica fino a `task.final_gate_completed`, poi `task.publication_held
 
 ### Task senza documenti
 
-`task.created` (API) → `task.analyzing` → `task.blocked`.
+`task.created` (API) → `task.analyzing` → `task.blocked`. Lo step source quality NON viene eseguito (non c'è il path `_run_8_3_extract_and_verify`).
+
+**Nota su `task.source_quality_assessed`.** Evento audit unico per task lifetime, emesso nel fresh-run path tra `task.analyzed_partial` e `task.compiling`. Sui resume non viene re-emesso. Sul fallimento dell'orchestrator viene comunque emesso con `status='failed'` e il SAVEPOINT viene rollback-ato, lasciando 8.4 in grado di proseguire.
 
 ---
 
-## Semantica lifecycle e source loss (Fase 8.5)
+## Semantica lifecycle e source loss (Fase 8.5, invariata)
 
-**Withdrawal è asincrona.** L'API pubblica un evento `published_answer.withdrawal_requested` su Redis e ritorna 202. Il consumer worker `published_answer_withdrawal` delega ad `apply_withdrawal`, unica entità che muta `published_answers.status` da `published` a `withdrawn`. L'API non scrive `published_answer_lifecycle_events`; lo fa il servizio nella stessa transazione del consumer.
+**Withdrawal è asincrona.** L'API pubblica un evento `published_answer.withdrawal_requested` su Redis e ritorna 202. Il consumer `published_answer_withdrawal` delega ad `apply_withdrawal`, unica entità che muta `published_answers.status` da `published` a `withdrawn`.
 
-**Source loss è asincrona ma con INSERT immediato lato API.** `POST /api/v1/source-loss-events` inserisce la riga `source_loss_events` e pubblica `source_loss.detected` nella stessa transazione DB. Il consumer worker `source_loss` delega al propagator, che registra `source_loss_propagation_records` e gli effetti sul Claim Ledger.
+**Source loss è asincrona ma con INSERT immediato lato API.** `POST /api/v1/source-loss-events` inserisce la riga `source_loss_events` e pubblica `source_loss.detected` nella stessa transazione DB.
 
-**Source loss NON ritira automaticamente published_answers.** Scelta esplicita di cascade soft: la lista delle PA impattate è tracciata in `source_loss_propagation_records` con `propagation_kind='published_answer_impacted'`, ma `status` della PA non viene cambiato. La withdrawal resta operazione separata.
+**Source loss NON ritira automaticamente published_answers.** Cascade soft via `source_loss_propagation_records`; la withdrawal resta operazione separata.
 
-**`task_masters.status` non viene esteso e non viene usato per withdrawal/source loss.** Il lifecycle vive su `published_answers.status` e nello storico append-only `published_answer_lifecycle_events`. La source loss propagation usa `claim_ledger_entries` append-only e `source_loss_propagation_records`.
+**`task_masters.status` non viene esteso** per withdrawal/source loss/source quality. Il lifecycle vive su `published_answers.status`, la propagazione su `claim_ledger_entries`/`source_loss_propagation_records`, gli assessment su `source_quality_assessments`.
 
-**Audit chain resta verificabile.** `published_answer.withdrawn`, `source_loss.propagated_to_claim`, `source_loss.propagated_to_published_answer` sono emessi su `chain_scope='task'` via `audit_append`. `verify_task_audit_chain` ritorna `ok=True` dopo le transizioni 8.5; questa proprietà è verificata anche dai realistic flow 8.6 (sia per il withdrawal che per il source-loss).
-
-**Idempotenza** stratificata su due livelli:
-
-- **Consumer-level**: `event_processing_records` UNIQUE `(consumer_name, idempotency_key)`. I due nuovi consumer usano `consumer_name` stabile (`published_answer_withdrawal`, `source_loss`), mai la consumer name per-istanza del worker.
-- **Domain-level**: UNIQUE su `published_answer_lifecycle_events`, `source_loss_events`, e partial unique indexes su `source_loss_propagation_records`. `published_answers` ha UPDATE status-guarded `WHERE status='published'`. `claim_ledger_entries` append-only stretto via `cle_logical_version_uq` con lock `FOR UPDATE` su `logical_claims`.
+**Audit chain resta verificabile.** `verify_task_audit_chain` ritorna `ok=True` dopo le transizioni 8.5 e dopo lo step 8.7E (success o failed).
 
 ---
 
-## Semantica read API (Fase 8.6 minima)
+## Semantica Source Quality (Fase 8.7)
 
-**Tutti gli endpoint 8.6 sono read-only end-to-end.**
+Distinzioni fondative, valide per chiunque legga o consumi `source_quality_assessments`:
 
-- nessun INSERT/UPDATE/DELETE in alcuna tabella;
-- nessuna chiamata a `apply_withdrawal` o `propagate_source_loss`;
-- nessun uso di Redis;
-- nessun import di codice worker dai route module;
-- nessuna mutazione di `published_answers`, `task_masters.status`, `claim_ledger_entries`, `audit_records`, `published_answer_lifecycle_events`, `source_loss_events`, `source_loss_propagation_records`.
+- **source quality ≠ claim correctness.** Un claim può essere falso anche se la fonte è autorevole; un claim può essere corretto anche se la fonte è debole.
+- **source quality ≠ evidence support.** Un legame `claim_evidence_links` ben formato non implica qualità della fonte.
+- **source quality ≠ verification outcome.** `verification_records.outcome='pass'` significa "CVE-lite passato", non "fonte affidabile".
+- **source quality ≠ source loss.** La perdita di fonte (8.5) è un evento; la qualità (8.7) è un giudizio strutturale sulla fonte presente.
+- **source quality ≠ publication eligibility.** L'eligibility è composta da correctness, evidence support, source quality e policy gate: quattro assi separati.
 
-L'invariante è verificato programmaticamente: ogni file di test API include uno scenario che fa snapshot dei COUNT(*) prima e dopo le GET su un set whitelisted di tabelle 8.4/8.5/audit e fallisce su drift.
+Stato corrente dell'evaluator:
 
-**Lista vuota vs 404.**
+- L'evaluator è un **mock deterministico** (`mock_source_quality_evaluator` v0.1.0, policy `mvp0_mock_source_quality` v0.1.0).
+- Tutte le righe scritte oggi hanno `overall_quality='unknown'` e `confidence=0.5`. Le altre dimensioni sono fissate dalla policy mock (vedi §8.7D sopra).
+- Gli endpoint read 8.7F espongono il payload JSONB **verbatim**, senza RBAC e senza redaction.
+- Il valore `unknown` NON deve essere interpretato come approvazione forte: significa letteralmente "il sistema oggi non sa, e non finge di sapere".
 
-- 8.6A: published_answer esistente senza lifecycle events → 200 `items=[]`. Nessun backfill di `published`.
-- 8.6C: source_loss_event esistente senza propagation rows → 200 `items=[]`. Race window producer → propagator coperta da questo contratto.
-- 8.6D: task esistente senza source-loss events visibili → 200 `items=[]`.
+Stato corrente del Final Answer Gate:
 
-**JSONB esposti verbatim.** `event_payload` e `details` sono ritornati senza redaction. RBAC non è implementato in MVP-0; questo è il debito chiaramente registrato sui rischi residui.
-
-**`source_loss_events.task_id` può restare NULL.** Il producer 8.5 lo lascia NULL by design (uno span può supportare claim di task diversi). 8.6B espone `task_id=null` verbatim. 8.6D risolve la vista task-centric via S1 ∪ S2 con campo `impacted_via`, ma NON camuffa il valore NULL sulla SLE stessa: il client riceve `source_loss_event.task_id=null` con `impacted_via="claim_evidence_link"`.
+- **Source Quality non è ancora consumata dal Final Answer Gate.**
+- Il gate continua a usare la regola "verified-backed" definita in 8.4: uno span è verified-backed sse esiste `final_answer_span_claim_links` tale che `link.claim_ledger_entry_id == latest_entry_id_for(claim_logical_id)` AND `latest_entry_state_for(claim_logical_id) == 'verified_fact'`.
+- L'integrazione decisionale tra Source Quality e Gate è prevista per il blocco **8.7G**.
 
 ---
 
@@ -221,26 +263,40 @@ Branch decisionali:
 
 ### Convenzione errori
 
-`ErrorCode.NOT_PUBLISHED` non esiste in MVP-0. Per le GET su task esistente non ancora pubblicato si restituisce `RESOURCE_NOT_FOUND` con `details.resource='published_answers'`. Per task inesistente: `details.resource='task_masters'`. Per draft/gate non ancora prodotti: `details.resource='draft_final_answers'` o `'final_gate_reports'`. In 8.5/8.6 si usa `details.resource='evidence_spans'` per il 404 del POST `source-loss-events`, `details.resource='source_loss_events'` per il 409 di conflitto idempotency e per i 404 di 8.6B/8.6C, `details.resource='published_answers'` per 8.6A, `details.resource='task_masters'` per 8.6D.
+`ErrorCode.NOT_PUBLISHED` non esiste in MVP-0. Per le GET su task esistente non ancora pubblicato si restituisce `RESOURCE_NOT_FOUND` con `details.resource='published_answers'`. Per task inesistente: `details.resource='task_masters'`. In 8.5/8.6/8.7 si usa la stessa convenzione (`details.resource='evidence_spans'`, `'source_loss_events'`, `'task_masters'`, `'published_answers'` a seconda dell'endpoint).
 
 ---
 
-## Cosa è ancora rinviato (non implementato)
+## Cosa è ancora rinviato (non implementato) — debiti tecnici e roadmap
 
-- **Provider AI reali** (Claude, ChatGPT, Gemini o equivalenti). MVP-0 gira con `PROVIDERS_ENABLED=mock` e `MAX_COST_PER_TASK=0`.
-- **Web retrieval, Verified Web Mode, Hybrid Mode.**
-- **Consensus engine**, **contradiction detector** avanzato, **critical reviewer**.
-- **Source Quality Evaluator** — debito strategico futuro. La 8.6 espone eventi e propagazioni, ma non valuta autorevolezza, indipendenza, primaryness, freschezza o coerenza delle fonti. Resta il debito più rilevante sul piano evidence-quality.
+### Anti-Hallucination roadmap (proposta)
+
+- **8.7G — Source Quality Gate.** Integrazione decisionale di `source_quality_assessments` nel Final Answer Gate (es. policy P1 blocking + P5 disclosure, da decidere nel blocco 8.7G-PRE).
+- **8.7H — Realistic flow + documentazione finale.** Test realistico end-to-end task → published con metadati di qualità, aggiornamento finale di PROJECT_STATE.
+- **8.8A — Claim Entailment Checker.** Verifica che l'evidence quote effettivamente implichi (o sia compatibile con) il claim, non solo che sia testualmente presente.
+- **8.8B — Citation-to-Claim Validator.** Verifica che il claim citi le evidenze giuste, non evidenze "vicine" che non lo supportano.
+- **8.8C — Contradiction Detector.** Detector reale di contraddizioni tra claim o tra fonti (oggi `contradiction_records` placeholder, `contradiction_status='unchecked'` per costruzione).
+- **8.8D — Final Answer Sentence Gate.** Gate a livello frase nel published_answer, non solo a livello span verified-backed.
+- **8.8E — Anti-Hallucination Report API.** Endpoint aggregato che riporta su un singolo published_answer tutti gli assi (entailment, citation, contradiction, source quality).
+- **8.9 — External Verification / Web-RAG controllato.** Verifica esterna su fonti web in modalità controllata (Verified Web Mode), non più solo closed corpus.
+- **9.0 — Multi-agent consensus + adversarial review reale.** Provider AI reali, consensus engine, critical reviewer adversariale.
+
+### Altri debiti tecnici
+
+- **Backfill source quality per task pre-8.7E.** I task processati prima dell'integrazione 8.7E non hanno righe in `source_quality_assessments`. Nessuno script di backfill è in atto: gli endpoint 8.7F ritornano `items=[]` per quei task, coerentemente con lo stato DB.
+- **Retention reale distruttiva** (`0008_*` da scrivere). Le tabelle 8.5/8.7 crescono senza pruning.
+- **RBAC / redaction** sui payload JSONB esposti dagli endpoint read 8.6/8.7F.
+- **Provider AI reali, Verified Web Mode, Hybrid Mode.** MVP-0 gira con `PROVIDERS_ENABLED=mock` e `MAX_COST_PER_TASK=0`.
 - **Renderer ed export** Markdown/HTML/PDF/DOCX/JSON-LD.
-- **Auth e RBAC reali.** Gli endpoint read 8.6 espongono JSONB verbatim senza autorizzazione.
-- **Retention reale distruttiva.** `0007_evaluation_retention.sql` non esiste ancora. Le tabelle 8.5 crescono senza pruning.
-- **DLQ esplicita per il worker.** Le entry il cui handler ritorna `failed` restano pending nel PEL; nessun destination stream per dead-lettering.
-- **UI completa.** Esiste solo un'app web minimale già nota da 8.1.
+- **Auth reale.** Gli endpoint espongono JSONB verbatim senza autorizzazione.
+- **DLQ esplicita per il worker.** Le entry il cui handler ritorna `failed` restano pending nel PEL.
+- **UI completa.** Esiste solo un'app web minimale.
 - **OCR / parsing PDF, vector store cloud, storage S3 / GCS / Azure operativo.**
-- **Cursor pagination** sugli endpoint read 8.6 (solo `limit` con tetto).
+- **Cursor pagination** sugli endpoint read 8.6/8.7F (solo `limit` con tetto).
 - **Stretch 8.6** `GET /api/v1/published-answers/{id}/source-loss-impact` — opzionale, non implementato.
-- **Backfill `published` lifecycle events** per pubblicazioni create in 8.4: nessuno script di backfill è eseguito. 8.6A ritorna `items=[]` per quei published_answer, coerente con lo stato DB.
-- **Worker main loop reale negli end-to-end test.** I realistic flow 8.5 e 8.6 usano FakeRedis e invocano `dispatch.handle_event` direttamente; `XREADGROUP`/`XACK`/PEL/signal handlers non vengono attraversati. Copertura `XREADGROUP`/`XACK` resta su `apps/worker/tests/test_main_multistream.py` con FakeRedis interno.
+- **Backfill `published` lifecycle events** per pubblicazioni create in 8.4: nessuno script, 8.6A ritorna `items=[]` per quei published_answer.
+- **Worker main loop reale negli end-to-end test.** I realistic flow 8.5/8.6 usano FakeRedis e invocano `dispatch.handle_event` direttamente.
+- **N+1 nel task endpoint 8.7F** (loop su evidence_span_id): accettato per MVP-0, batchabile in futuro.
 
 ---
 
@@ -250,22 +306,22 @@ Branch decisionali:
 - `PROVIDERS_ENABLED=mock`, `MAX_COST_PER_TASK=0`.
 - Closed Corpus only.
 - SQLAlchemy 2.0 Core: `Connection`, non `Engine.execute`.
-- Migration applicate (0001–0006) sono immutabili. Modifiche schema solo via nuove migration.
+- Migration applicate (0001–0007) sono immutabili. Modifiche schema solo via nuove migration.
 - Test rerun-safe con UUID/hash/marker unici per invocazione.
-- Append-only enforced a DB su `audit_records`, `evidence_spans`, `claim_ledger_entries`, `final_answer_spans`, `final_gate_reports`, `published_answer_lifecycle_events`, `source_loss_events`, `source_loss_propagation_records`.
-- Endpoint API 8.6 read-only verificato da snapshot pre/post sui count delle tabelle 8.4/8.5/audit.
+- Append-only enforced a DB su `audit_records`, `evidence_spans`, `claim_ledger_entries`, `final_answer_spans`, `final_gate_reports`, `published_answer_lifecycle_events`, `source_loss_events`, `source_loss_propagation_records`, `source_quality_assessments`.
+- Endpoint API 8.6/8.7F read-only verificato (per 8.6) da snapshot pre/post sui count delle tabelle 8.4/8.5/audit.
 
 ---
 
 ## Prossimo passo
 
-Le possibili direzioni naturali, da decidere con prompt operativo separato, includono:
+Il blocco operativo immediatamente successivo è **8.7G-PRE**: analisi rigorosa del Final Answer Gate e decisione sulla policy Source Quality Gate (selezione tra P1/P2/P3/P4/P5 come definite in PHASE_8_7_PLAN.md §6.2, eventuale introduzione di `coverage_gap_statements.kind='source_quality_block'` in una migration separata, definizione del contratto di consultazione degli assessment da parte del gate). Nessun codice 8.7G viene scritto prima di 8.7G-PRE.
 
-- **Source Quality Evaluator** come fase dedicata (es. 8.7 o 9.0). È oggi il debito strategico più rilevante per avvicinarsi alla promessa anti-allucinazione completa. La 8.6 ha reso osservabili eventi e propagazioni, ma il sistema non distingue ancora tra fonti forti, deboli, primarie, secondarie, indipendenti, fresche o contraddette.
-- **`0007_evaluation_retention.sql`** per retention reale, una volta deciso il perimetro.
-- **Stretch 8.6**: `GET /api/v1/published-answers/{id}/source-loss-impact`, se decisamente utile in operativo.
-- **Cursor pagination** sugli endpoint read 8.6.
-- **RBAC e redaction** dei JSONB esposti dagli endpoint read.
-- **Smoke test end-to-end con Redis reale** e worker main loop reale (XREADGROUP/XACK/PEL effettivi).
+Direzioni complementari, da decidere con prompt operativo separato:
 
-Nessuna di queste è scritta nel repo al commit corrente.
+- **8.7H** — realistic flow tests source quality + documentazione finale.
+- **0008_* retention** una volta deciso il perimetro.
+- **RBAC e redaction** dei JSONB esposti dagli endpoint read 8.6/8.7F.
+- **Cursor pagination** sugli endpoint read.
+- **Stretch 8.6**: `GET /api/v1/published-answers/{id}/source-loss-impact`.
+- **Smoke test end-to-end con Redis reale** e worker main loop reale.

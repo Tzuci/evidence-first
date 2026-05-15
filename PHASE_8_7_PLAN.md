@@ -2,788 +2,479 @@
 
 Documento di **piano architetturale** per la Fase 8.7 dell'Evidence-First MVP-0. La fase introduce il primo modulo dedicato alla valutazione della **qualità delle fonti** che supportano i claim del Claim Ledger.
 
-> **Stato di questo documento: piano, NON implementato.**
+> **Stato di questo documento.**
 >
-> Nessun file di codice applicativo, nessuna migration, nessun test, nessun aggiornamento di `PROJECT_STATE.md` o `README.md` viene prodotto in 8.7A. L'unico output di 8.7A è questo file `PHASE_8_7_PLAN.md`. I blocchi successivi (8.7B, 8.7C, …) sono enunciati qui ma non implementati.
+> Documento nato come piano 8.7A; aggiornato dopo 8.7F al commit `91397ae6f02abd429cff29b6e0248cf9a7c16317`.
+>
+> I blocchi **8.7A–8.7F sono implementati**; **8.7G e 8.7H restano da fare**. Le sezioni di questo documento sono state allineate dove rilevante; le formulazioni "non implementato" originarie sono state superate per 8.7B/C/D/E/F e mantenute per 8.7G/H.
 
-**Commit di partenza**: `7cbd45ae416ead0b2f5221ace4925dee374fa0c9`.
+**Commit di partenza del piano**: `7cbd45ae416ead0b2f5221ace4925dee374fa0c9`.
+**Commit di allineamento documentale**: `91397ae6f02abd429cff29b6e0248cf9a7c16317`.
 
-**Collegamento logico**: la Fase 8.6 ha reso **osservabili** via HTTP read-only gli eventi lifecycle (`published_answer_lifecycle_events`) e la propagazione della source loss (`source_loss_events`, `source_loss_propagation_records`). La Fase 8.7 deve iniziare a **valutare la qualità** delle fonti che il sistema usa per supportare claim. La 8.6 osserva; la 8.7 valuta.
+**Collegamento logico**: la Fase 8.6 ha reso **osservabili** via HTTP read-only gli eventi lifecycle e la propagazione della source loss. La Fase 8.7 ha cominciato a **valutare la qualità** delle fonti che il sistema usa per supportare claim. La 8.6 osserva; la 8.7 valuta. La 8.7G consumerà.
+
+---
+
+## Stato dei blocchi 8.7
+
+| Blocco | Descrizione | Stato |
+|---|---|---|
+| 8.7A | Plan (`PHASE_8_7_PLAN.md`) | **done** |
+| 8.7B | DB schema (`migrations/0007_source_quality.sql`) | **done** |
+| 8.7C | Shared schemas (`SOURCE_QUALITY_*_VALUES`, Literal aliases, `SourceQualityAssessmentRead`) | **done** |
+| 8.7D | Mock Source Quality Evaluator service | **done** |
+| 8.7E | Worker integration (W-A) — step in `task_created` con SAVEPOINT + audit aggregato | **done** |
+| 8.7F | Read API (due endpoint GET su evidence_span e su task) | **done** |
+| 8.7G | Gate integration (Source Quality Gate policy) | **next** |
+| 8.7H | Realistic flow + docs finalization | **pending** |
 
 ---
 
 ## 1. Stato di partenza
 
-Al commit `7cbd45a` il repo offre i seguenti elementi rilevanti per la 8.7. Tutto ciò che segue è verificabile leggendo i file indicati; nessuno di questi elementi viene modificato dalla 8.7A (questo piano).
+Al commit `7cbd45a` il repo offriva gli elementi rilevanti per la 8.7. Tutto ciò che segue è verificabile leggendo i file indicati; nessuno di questi elementi è stato modificato dalla 8.7B/C/D/E/F.
 
 ### 1.1 Schema DB già applicato (migrations 0001–0006)
 
 - **Storage e documenti** (`0002_storage.sql`, `0003_documents.sql`):
   - `storage_blobs`, `storage_objects` (content-addressed, deduplicato, refcount-based).
-  - `uploaded_documents` con colonne `tier` (`user_provided` | `system_generated`), `language`, `mime_type`, `content_hash`, `size_bytes`, `created_by`.
-  - `document_versions` (con `version_kind ∈ {original, parsed, normalized}`).
-  - `document_chunks` (CHECK `dc_origin_xor` impone `document_version_id IS NOT NULL`).
-  - `evidence_spans` (append-only via trigger; `quote`, `quote_hash`).
-  - `prompt_injection_flags` (placeholder, vuoto in MVP-0).
+  - `uploaded_documents` con colonne `tier`, `language`, `mime_type`, `content_hash`, `size_bytes`, `created_by`.
+  - `document_versions`, `document_chunks`, `evidence_spans` append-only, `prompt_injection_flags` placeholder.
 
 - **Claim Ledger** (`0004_claim_ledger.sql`):
-  - `logical_claims` con UNIQUE `(task_id, canonical_claim_hash)`.
-  - `raw_claims`, `classified_claims`.
-  - `claim_ledger_entries` (append-only, supersede via `claim_lineage.relation_kind='supersedes'`).
-  - `claim_evidence_links` (CHECK `cel_origin_xor`: `evidence_span_id` NOT NULL, `retrieved_source_span_id` NULL).
-  - `verification_records` con `check_kind ∈ {csv, cve_lite, nli, judge}`, UNIQUE `(claim_ledger_entry_id, check_kind, check_name)`.
-  - `contradiction_records` (placeholder, vuoto).
-  - `claim_support_links` (placeholder per `basis|assumption|precondition|counterposition`).
-  - `human_review_requests` (placeholder).
+  - `logical_claims`, `raw_claims`, `classified_claims`.
+  - `claim_ledger_entries` append-only, supersede via `claim_lineage.relation_kind='supersedes'`.
+  - `claim_evidence_links` (CHECK `cel_origin_xor`).
+  - `verification_records` con `check_kind ∈ {csv, cve_lite, nli, judge}`.
+  - placeholder per `contradiction_records`, `claim_support_links`, `human_review_requests`.
 
 - **Answers / Gate / Published** (`0005_answers_gate.sql`):
-  - `agent_runs` (`run_kind ∈ {compile_draft, final_answer_gate}`).
-  - `draft_final_answers`, `final_answer_spans` (append-only), `final_answer_span_claim_links`.
-  - `final_gate_reports` (append-only, UNIQUE per draft, FK composita verso draft).
+  - `agent_runs`, `draft_final_answers`, `final_answer_spans`, `final_answer_span_claim_links`.
+  - `final_gate_reports` append-only, UNIQUE per draft, FK composita.
   - `published_answers` con `status ∈ {published, withdrawn, superseded}`.
-  - `coverage_gap_statements` con `kind ∈ {unverified_claim, missing_evidence, out_of_scope, source_loss}`.
+  - `coverage_gap_statements`.
 
 - **Lifecycle e source loss** (`0006_lifecycle.sql`):
-  - `published_answer_lifecycle_events` (append-only).
-  - `source_loss_events` con `loss_kind ∈ {source_deleted, source_access_lost, quote_mismatch, document_replaced, policy_retraction}`.
-  - `source_loss_propagation_records` con `propagation_kind ∈ {claim_marked_unverifiable, published_answer_impacted, no_claims_impacted, no_active_published_answers_impacted}`, `status ∈ {recorded, skipped, failed}`, idempotenza via 4 partial unique indexes ristretti a `status IN ('recorded', 'skipped')`.
+  - `published_answer_lifecycle_events`, `source_loss_events`, `source_loss_propagation_records`.
 
-### 1.2 Endpoint API attivi
+### 1.2 Endpoint API attivi al commit di partenza
 
-Quelli rilevanti per la 8.7 (read-only, dovranno coesistere con i futuri endpoint 8.7F):
+Read-only rilevanti per la 8.7 (ora coesistono con i due endpoint 8.7F implementati):
 
-- `POST /api/v1/projects/{id}/documents` — upload `.txt`/`.md`.
-- `GET /api/v1/documents/{id}` — single document read.
-- `GET /api/v1/documents/{id}/chunks` — lista chunks.
-- `GET /api/v1/claims/{logical_id}/evidence` — aggregato latest entry + links + verification_records.
-- `GET /api/v1/source-loss-events/{id}` — single source_loss_event (8.6B).
-- `GET /api/v1/source-loss-events/{id}/propagation` — propagation rows (8.6C).
-- `GET /api/v1/tasks/{task_id}/source-loss-events` — task-level listing S1 ∪ S2 (8.6D).
+- `POST /api/v1/projects/{id}/documents`, `GET /api/v1/documents/{id}`, `GET /api/v1/documents/{id}/chunks`.
+- `GET /api/v1/claims/{logical_id}/evidence`.
+- `GET /api/v1/source-loss-events/{id}` (8.6B), `/propagation` (8.6C).
+- `GET /api/v1/tasks/{task_id}/source-loss-events` (8.6D).
 
-### 1.3 Servizi worker attivi
+### 1.3 Servizi worker attivi al commit di partenza
 
-- `services/extractor.py` (mock-driven, sentence-split deterministico).
-- `services/cve_lite.py` (verifica `quote ∈ chunk_text` AND `sha256(quote) == quote_hash`, scrive `verification_records` con `check_kind='cve_lite'`).
-- `services/final_answer_gate.py` (regola "verified-backed" come definita in 8.4).
-- `services/source_loss_propagator.py` (append-only su `source_loss_propagation_records`, mai mutazione di `published_answers.status`).
-- `services/published_answer_lifecycle.py` (unica entità autorizzata a mutare `published_answers.status` per il path withdrawal).
+- `services/extractor.py`, `services/cve_lite.py`, `services/final_answer_gate.py`, `services/source_loss_propagator.py`, `services/published_answer_lifecycle.py`.
 
 ### 1.4 Chiarimento critico sullo stato attuale
 
-Tre affermazioni che vincolano la progettazione della 8.7:
+Tre affermazioni che hanno vincolato (e continuano a vincolare) la progettazione della 8.7:
 
-1. **Una `evidence_span` collegata a un claim NON significa automaticamente fonte affidabile.** Significa solo che esiste un legame referenziale tra un claim del ledger e un quote di un chunk persistito nel corpus chiuso dell'utente. L'autorevolezza, la freschezza, l'indipendenza e la rilevanza del documento sottostante NON sono mai state valutate.
+1. **Una `evidence_span` collegata a un claim NON significa automaticamente fonte affidabile.** L'autorevolezza, la freschezza, l'indipendenza e la rilevanza del documento sottostante NON sono mai state valutate prima della 8.7.
 
-2. **`verified_fact` (state del Claim Ledger) oggi significa esclusivamente "supporto verificato secondo il CVE-lite mock-driven"**: la quote esiste nel chunk con il suo hash atteso. Non significa che la fonte sia di qualità. Significa che il claim ha almeno un supporto testuale presente e checksummed.
+2. **`verified_fact` (state del Claim Ledger) significa esclusivamente "supporto verificato secondo il CVE-lite mock-driven"**: la quote esiste nel chunk con il suo hash atteso. Non significa che la fonte sia di qualità.
 
-3. **Source loss gestisce la perdita o invalidazione di una fonte** (`source_deleted`, `source_access_lost`, `quote_mismatch`, `document_replaced`, `policy_retraction`), non la qualità iniziale della fonte. Un documento perfettamente accessibile e con quote intatte può comunque essere debole, secondario, datato o non indipendente — nessuno di questi giudizi è oggi possibile.
+3. **Source loss gestisce la perdita o invalidazione di una fonte**, non la qualità iniziale della fonte. Un documento perfettamente accessibile può comunque essere debole, secondario, datato o non indipendente.
 
-La 8.7 deve introdurre questi giudizi come **dimensioni separate**, senza confonderle con la verifica testuale o con la source loss.
+La 8.7 ha introdotto questi giudizi come **dimensioni separate** in `source_quality_assessments`, senza confonderle con la verifica testuale o con la source loss.
 
 ---
 
 ## 2. Definizione realistica di source quality
 
-Per MVP-0 "source quality" è un giudizio **strutturale, multi-dimensionale, dichiarato e append-only/versionato** su una fonte. Le dimensioni sotto sono progettate per essere **ortogonali**: ognuna risponde a una domanda diversa e nessuna implica le altre.
+Per MVP-0 "source quality" è un giudizio **strutturale, multi-dimensionale, dichiarato e append-only/versionato** su una fonte. Le dimensioni sotto sono progettate per essere **ortogonali**.
 
-### 2.1 Tassonomia (codomini proposti)
+### 2.1 Tassonomia (codomini implementati in 8.7B + 8.7C)
 
-I codomini sono fissati come stringhe-enum a livello applicativo e (per il blocco 8.7B) a livello CHECK di DB.
+I codomini sono fissati come stringhe-enum a livello DB (CHECK constraint in `0007_source_quality.sql`) e come tuple Python in `packages/shared/evidencefirst_shared/schemas.py` (`SOURCE_QUALITY_*_VALUES`).
 
 #### `source_type`
-Domanda: che tipo di artefatto è la fonte?
-Codominio:
-- `user_document`
-- `web_page`
-- `academic_paper`
-- `official_document`
-- `database_record`
-- `news_article`
-- `blog`
-- `forum`
-- `unknown`
+- `user_document` | `web_page` | `academic_paper` | `official_document` | `database_record` | `news_article` | `blog` | `forum` | `unknown`
 
-Note: in MVP-0 closed-corpus, la quasi totalità delle fonti è `user_document`. Il codominio prevede già i valori `web_page`/`news_article`/etc. perché la stessa tassonomia deve essere riusabile in fasi che introdurranno web retrieval o tier `system_generated` non-corpus. La classificazione resta dichiarata, non dedotta da una rete.
+In MVP-0 closed-corpus, la quasi totalità delle fonti è `user_document`. Il codominio prevede già i valori web/news/etc. per riusabilità futura.
 
 #### `source_role`
-Domanda: la fonte è primaria, secondaria, terziaria o non classificabile?
-Codominio:
-- `primary` (es. articolo originale, sentenza, dataset originale)
-- `secondary` (analisi/sintesi/citazione di una primaria)
-- `tertiary` (enciclopedia generalista, riassunto di sintesi)
-- `unclear`
+- `primary` | `secondary` | `tertiary` | `unclear`
 
 #### `authority_level`
-Domanda: quanto è autorevole l'editore/autore rispetto al dominio del claim?
-Codominio: `high` | `medium` | `low` | `unknown`.
-
-Note: la decisione su cosa significa "high" è policy-dipendente e va portata in una tabella `source_quality_policies` (vedi §4) per restare auditabile.
+- `high` | `medium` | `low` | `unknown`
 
 #### `independence_level`
-Domanda: la fonte è indipendente dal soggetto del claim, oppure è interna/affiliata/auto-dichiarata?
-Codominio: `independent` | `affiliated` | `self_reported` | `unknown`.
+- `independent` | `affiliated` | `self_reported` | `unknown`
 
 #### `freshness`
-Domanda: la fonte è recente/aggiornata rispetto al claim?
-Codominio: `current` | `recent` | `stale` | `undated` | `not_time_sensitive`.
-
-Note: distinguere `undated` da `stale` evita di penalizzare ingiustamente fonti senza data esplicita ma di natura non time-sensitive.
+- `current` | `recent` | `stale` | `undated` | `not_time_sensitive`
 
 #### `relevance`
-Domanda: la fonte supporta direttamente il claim, ne supporta solo il contesto, o è marginale?
-Codominio: `direct_support` | `contextual_support` | `weak_support` | `irrelevant`.
+- `direct_support` | `contextual_support` | `weak_support` | `irrelevant`
 
 #### `extract_quality`
-Domanda: come si comporta l'estratto (`evidence_spans.quote`) rispetto al chunk e al claim?
-Codominio:
-- `exact_quote_match` (la quote esiste verbatim nel chunk; CVE-lite passa)
-- `paraphrase_match` (la quote è una parafrasi corretta)
-- `partial_match` (overlap parziale)
-- `quote_mismatch` (la quote non si trova nel chunk; può coincidere con `loss_kind='quote_mismatch'` in `source_loss_events`, vedi §7)
+- `exact_quote_match` | `paraphrase_match` | `partial_match` | `quote_mismatch`
 
-Note: `quote_mismatch` qui è un fatto di qualità dell'estratto; lo stesso fatto in `source_loss_events` è un fatto di perdita di fonte. Le due tabelle resteranno separate e ognuna manterrà il proprio significato.
+`quote_mismatch` qui è un fatto di qualità dell'estratto; lo stesso fatto in `source_loss_events` è un fatto di perdita di fonte. Le due tabelle restano separate.
 
 #### `contradiction_status`
-Domanda: la fonte è in conflitto con altre fonti note?
-Codominio:
-- `no_known_contradiction`
-- `contradicted_by_stronger_source`
-- `conflicting_sources`
-- `unchecked`
+- `no_known_contradiction` | `contradicted_by_stronger_source` | `conflicting_sources` | `unchecked`
 
-Note: in 8.7 il valore di default è `unchecked`. Il detector reale di contraddizioni (`contradiction_records` placeholder) è fuori scope.
+In 8.7 il valore di default è `unchecked` (mock). Detector reale rinviato a 8.8C.
 
 #### `overall_quality`
-Domanda: in una sola etichetta, qual è il giudizio complessivo?
-Codominio:
-- `strong`
-- `adequate`
-- `weak`
-- `unsuitable`
-- `unknown`
+- `strong` | `adequate` | `weak` | `unsuitable` | `unknown`
 
-Note: NON deve essere derivato automaticamente da una formula opaca. Deve essere prodotto da una funzione di policy esplicita (vedi §4 e §6), e la funzione stessa deve essere parte dell'audit (versione di policy registrata).
+NON derivato automaticamente da formule opache. Prodotto da una funzione di policy esplicita.
 
 #### `confidence`
-Domanda: quanto siamo sicuri di questo assessment?
-Codominio: `DOUBLE PRECISION` in `[0.0, 1.0]`.
+`DOUBLE PRECISION` in `[0.0, 1.0]` o NULL.
 
-Note: **è uno score interno, non una verità assoluta**. Non deve essere usato dal Final Answer Gate come unica chiave decisionale; va consumato in combinazione con `overall_quality` e con la policy.
+**Score interno, non verità assoluta.** Non deve essere usato dal Final Answer Gate come unica chiave decisionale.
 
-### 2.2 Append-only / versionato
+### 2.2 Append-only / versionato (implementato in 8.7B)
 
-Tutte le dimensioni sopra DEVONO essere registrate in modo:
-
-- **Append-only**: nessuna mutazione distruttiva del valore precedente. Un assessment esistente non viene aggiornato; viene supersedeato da uno nuovo.
-- **Versionato**: ogni assessment ha un `version_no` monotonicamente crescente per la stessa `target` (es. `evidence_span_id` o `document_id`), oppure è collegato a un `policy_version` esplicito.
+Tutte le dimensioni sono registrate in modo **append-only** (trigger `source_quality_assessments_append_only` su `reject_modify_append_only`) e **versionato** (`version_no` monotonicamente crescente per `(target_kind, target_id)`, partial unique indexes `sqa_evidence_version_uq` / `sqa_chunk_version_uq` / `sqa_document_version_uq`).
 
 Motivazioni:
-- coerenza con `claim_ledger_entries`, `evidence_spans`, `audit_records`, `published_answer_lifecycle_events`, `source_loss_events`, `source_loss_propagation_records` (tutte append-only via trigger);
-- auditabilità completa nel tempo;
+- coerenza con le altre tabelle append-only;
+- auditabilità nel tempo;
 - abilità di rieseguire l'assessment con una policy diversa senza riscrivere la storia;
-- compatibilità con un futuro detector di drift (un assessment passato da `strong` a `weak` ha valore diagnostico).
+- compatibilità con un futuro detector di drift.
 
 ---
 
 ## 3. Cosa la 8.7 NON è (rigorosamente)
 
-Per evitare confusione di scope, queste sono le distinzioni che il piano impone:
+Invarianti semantiche fondative:
 
-1. **Source quality ≠ claim correctness.** Un claim può essere falso anche se la fonte è autorevole; un claim può essere corretto anche se la fonte è debole.
-2. **Source quality ≠ evidence support.** Un legame `claim_evidence_links` ben formato non implica qualità della fonte; un legame mal formato non implica fonte debole.
-3. **Source quality ≠ verification outcome.** `verification_records.outcome='pass'` significa "il check CVE-lite è passato", non "la fonte è affidabile".
-4. **Source quality ≠ source loss.** La perdita di fonte è un evento (la fonte non è più accessibile / la quote non corrisponde più); la qualità è un giudizio sulla fonte mentre è presente.
-5. **Source quality ≠ final publication eligibility.** L'eligibility è composta da: correctness, evidence support, source quality, policy gate. Sono quattro assi separati.
+1. **Source quality ≠ claim correctness.**
+2. **Source quality ≠ evidence support.**
+3. **Source quality ≠ verification outcome.**
+4. **Source quality ≠ source loss.**
+5. **Source quality ≠ final publication eligibility.**
 
-Questa distinzione è la prima invariante semantica della Fase 8.7.
-
----
-
-## 4. Possibile modello dati (confronto di opzioni)
-
-La 8.7A NON scrive migration. Qui si presentano tre opzioni, con un confronto e una **raccomandazione non implementata**.
-
-In tutti i casi la migration target sarebbe `migrations/0007_source_quality.sql`, che resta da scrivere e applicare nel blocco 8.7B.
-
-### 4.1 Opzione A — Nuova tabella dedicata `source_quality_assessments`
-
-Schema indicativo (NON da scrivere ora):
-
-```sql
--- migrations/0007_source_quality.sql  (BOZZA INDICATIVA, NON DA SCRIVERE IN 8.7A)
-CREATE TABLE source_quality_assessments (
-    id                      UUID PRIMARY KEY DEFAULT app_new_uuid(),
-    tenant_id               UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
-    project_id              UUID REFERENCES projects(id) ON DELETE RESTRICT,
-    -- Target della valutazione: esattamente UNO tra i tre seguenti deve essere non-null.
-    evidence_span_id        UUID REFERENCES evidence_spans(id) ON DELETE RESTRICT,
-    document_chunk_id       UUID REFERENCES document_chunks(id) ON DELETE RESTRICT,
-    document_id             UUID REFERENCES uploaded_documents(id) ON DELETE RESTRICT,
-    -- Versione monotona per (target_kind, target_id).
-    version_no              INTEGER NOT NULL CHECK (version_no >= 1),
-    -- Dimensioni (codomini come da §2.1).
-    source_type             TEXT NOT NULL CHECK (source_type IN (...)),
-    source_role             TEXT NOT NULL CHECK (source_role IN (...)),
-    authority_level         TEXT NOT NULL CHECK (authority_level IN (...)),
-    independence_level      TEXT NOT NULL CHECK (independence_level IN (...)),
-    freshness               TEXT NOT NULL CHECK (freshness IN (...)),
-    relevance               TEXT NOT NULL CHECK (relevance IN (...)),
-    extract_quality         TEXT NOT NULL CHECK (extract_quality IN (...)),
-    contradiction_status    TEXT NOT NULL CHECK (contradiction_status IN (...)),
-    overall_quality         TEXT NOT NULL CHECK (overall_quality IN (...)),
-    confidence              DOUBLE PRECISION CHECK (confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)),
-    -- Provenienza dell'assessment.
-    evaluator_name          TEXT NOT NULL,
-    evaluator_version       TEXT NOT NULL,
-    policy_version_id       UUID REFERENCES policy_versions(id) ON DELETE RESTRICT,
-    -- Idempotenza e payload.
-    idempotency_key         TEXT NOT NULL,
-    payload                 JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT sqa_target_xor CHECK (
-        ((evidence_span_id IS NOT NULL)::int +
-         (document_chunk_id IS NOT NULL)::int +
-         (document_id IS NOT NULL)::int) = 1
-    ),
-    CONSTRAINT sqa_version_evidence_uq UNIQUE (evidence_span_id, version_no)
-        -- equivalenti UNIQUE per i due altri target via partial unique indexes
-);
--- Trigger append-only standard via reject_modify_append_only.
-```
-
-#### Opzione A — Pro / contro
-
-**Pro:**
-- Separazione netta dal Claim Ledger: nessun rischio di confusione semantica.
-- Schema pulito, leggibile, evolutivo.
-- Append-only banale (trigger esistente `reject_modify_append_only`).
-- Append-only versionato compatibile con la convenzione di `claim_ledger_entries`.
-- Permette assessment a granularità diverse (span / chunk / document) senza join sintetici.
-- Permette di rieseguire assessment con `policy_version_id` diverso senza modificare le vecchie righe.
-- Testabilità eccellente: il modulo si testa in isolamento, senza interferire con CVE-lite o gate.
-
-**Contro:**
-- Una tabella nuova in più.
-- Richiede una nuova migration `0007_source_quality.sql` con tutti i suoi vincoli, partial unique indexes per il target XOR, e trigger.
-- Lookup da claim → assessment richiede join via `claim_evidence_links → evidence_spans → source_quality_assessments`, oppure aggregazioni a livello document.
-- Le tre forme di target (span/chunk/document) richiedono tre partial unique indexes per la versione monotona.
-
-**Impatto su Claim Ledger:** nessun impatto strutturale. Le entry del ledger restano append-only e non vengono toccate. L'assessment vive in un'altra tabella e viene join-ato dai lettori (gate, API).
-
-**Impatto su Final Answer Gate:** nessuna modifica a `final_gate_reports` o `coverage_gap_statements`. La policy futura del gate (vedi §6) consulterà gli assessment via join e potrà emettere `coverage_gap_statements` con `kind='source_loss'` o un nuovo `kind` da introdurre più avanti — l'introduzione di un nuovo `kind` NON è in 8.7B, è un blocco separato.
-
-**Compatibilità con append-only:** trigger standard.
-
-**Testabilità:** alta (modulo isolato).
-
-**Rischio di migration:** medio. Il CHECK ternario `sqa_target_xor` e i tre partial UNIQUE devono essere scritti correttamente al primo colpo; un secondo `0008` di patch è da evitare.
-
-### 4.2 Opzione B — Riuso di `verification_records` con nuovi `check_kind`
-
-Schema indicativo: NESSUNA migration nuova. Si estendono i valori del CHECK su `verification_records.check_kind` per accogliere check tipo `source_authority`, `source_independence`, `source_freshness`, `source_relevance`, `source_overall_quality`.
-
-**Pro:**
-- Zero nuove tabelle.
-- Pattern già noto: ogni dimensione diventa un check separato (`check_kind`, `check_name`).
-- Audit naturale via `verification_records.payload`.
-
-**Contro:**
-- Confonde semanticamente "verifica testuale del claim" con "valutazione della fonte". Va contro l'invariante §3.3.
-- `verification_records` è scoped a `claim_ledger_entries`; valutazioni a livello document sono goffe (richiedono claim "proxy" o sono impossibili senza estendere lo schema).
-- L'estensione del CHECK `check_kind` è una modifica vincolante di una tabella esistente: rompe la promessa di immutabilità delle migration 0004 (modifica del CHECK richiede DROP/ADD CONSTRAINT).
-- Difficile rappresentare versioning monotono di un "assessment complessivo" se ogni dimensione è una riga separata.
-- Difficile esprimere un `overall_quality` aggregato senza una semantica artificiale di "riga rappresentativa".
-
-**Impatto su Claim Ledger:** minimo strutturalmente, alto semanticamente (mischia due concetti distinti).
-
-**Impatto su Final Answer Gate:** la regola "verified-backed" si è fondata sulla nozione "esiste un link verso latest entry con state `verified_fact`". L'estensione di `check_kind` rischia di creare ambiguità: il gate dovrebbe filtrare per `check_kind='cve_lite'` esplicitamente, altrimenti varrebbe anche un check di authority. È un cambio di contratto invisibile.
-
-**Compatibilità con append-only:** preservata.
-
-**Testabilità:** ridotta perché i test esistenti su `verification_records` dovrebbero essere aggiornati per non assumere `check_kind ∈ {csv, cve_lite, nli, judge}`.
-
-**Rischio di migration:** alto (modifica CHECK su tabella esistente vincolata in 0004).
-
-### 4.3 Opzione C — Ibrida: tabella dedicata + audit dei check
-
-Combina le due. Si crea `source_quality_assessments` per il giudizio aggregato e versionato (come Opzione A) e, **opzionalmente**, si registrano i singoli check di policy in `verification_records` con `check_kind` esistenti SOLO se semanticamente compatibili (es. un check "evidence_quote_present" potrebbe vivere in `cve_lite`). I check di authority/freshness/indipendence NON entrano in `verification_records`: vivono solo nel payload dell'assessment.
-
-**Pro:**
-- Mantiene la separazione semantica netta (Opzione A).
-- Permette audit fine-grained di singoli sotto-check tramite `verification_records` quando questi sono semanticamente "verifica testuale".
-- Nessun bisogno di estendere il CHECK su `check_kind`.
-
-**Contro:**
-- Modello dati più complesso da comprendere e documentare.
-- Rischio di duplicazione concettuale tra `payload` dell'assessment e righe `verification_records`.
-
-**Impatto su Claim Ledger / Gate / append-only / testabilità / rischio migration:** come Opzione A, più la complessità descritta.
-
-### 4.4 Raccomandazione (non implementata)
-
-**Raccomandata: Opzione A.**
-
-Motivazioni:
-- L'Opzione A mantiene rigida la distinzione delle quattro categorie elencate in §3.
-- Non altera in alcun modo le migration 0001–0006.
-- È compatibile con qualunque evoluzione futura (web search, contradiction detector, retention).
-- Le contro (una tabella in più, partial unique indexes per il target XOR) sono pagamenti contenuti e una-tantum.
-
-L'Opzione C resta un'alternativa accettabile se in fase di scrittura della migration emergono casi reali in cui un sotto-check beneficia di vivere come `verification_records`. L'Opzione B è sconsigliata.
+Vedi `PROJECT_STATE.md` "Semantica Source Quality" per la spiegazione operativa.
 
 ---
 
-## 5. Interazione con Claim Ledger
+## 4. Modello dati — Opzione A IMPLEMENTATA
 
-La 8.7 NON cancella, NON modifica e NON sostituisce le `claim_ledger_entries` esistenti. L'interazione con il ledger è regolata da queste invarianti:
+Confronto storico tra opzioni mantenuto per memoria progettuale. **L'Opzione A è stata implementata in `migrations/0007_source_quality.sql`** (blocco 8.7B).
 
-### 5.1 Invarianti
+### 4.1 Opzione A — Nuova tabella dedicata `source_quality_assessments` (IMPLEMENTATA)
 
-1. **Append-only stretto preservato.** Le entry esistenti restano immutabili.
-2. **Nessuna estensione di `claim_lineage.relation_kind`.** La 8.7 non introduce nuove relazioni nel ledger.
-3. **Nessuna estensione di `claim_ledger_entries.state`.** Non viene introdotto uno stato `low_quality_evidence` o simile.
-4. **Distinzione semantica rigorosa.** Source quality NON è correctness.
+Schema effettivamente applicato (vedi `migrations/0007_source_quality.sql` per la fonte autorevole):
 
-### 5.2 Comportamenti ammessi
+- Tabella `source_quality_assessments` con `id` UUID, `tenant_id` NOT NULL FK, `project_id` FK NULL-able, tre colonne target (`evidence_span_id`, `document_chunk_id`, `document_id`) con CHECK `sqa_target_xor`.
+- `version_no` INTEGER NOT NULL `CHECK (version_no >= 1)`.
+- Nove dimensioni di qualità con CHECK enum.
+- `confidence` DOUBLE PRECISION CHECK range `[0.0, 1.0]` o NULL.
+- `evaluator_name`, `evaluator_version`, `policy_name`, `policy_version` come stringhe opache (nessun FK a `policy_versions`).
+- `idempotency_key`, `payload` JSONB DEFAULT `'{}'`, `created_at`.
+- Sei partial unique indexes: tre per versioning + tre per idempotency, uno per target kind.
+- Trigger append-only standard.
+- Indici di lookup su `tenant_id`, `project_id`, target per granularità, `overall_quality`, `source_role`, `freshness`.
 
-Quando un assessment produce un giudizio rilevante (es. fonte debole o contraddetta) per un claim, sono ammessi DUE comportamenti, da scegliere a livello di policy (8.7G):
+**Pro effettivi (osservati dopo l'implementazione):**
+- Separazione semantica netta dal Claim Ledger.
+- Append-only standard via trigger condiviso.
+- Test isolation eccellente (il modulo si testa senza interferire con CVE-lite o gate).
+- Permette assessment a granularità diverse senza join sintetici.
 
-**Comportamento M1 — solo metadata (consigliato come default).**
-- L'assessment vive nella nuova tabella `source_quality_assessments`.
+**Contro effettivi:**
+- Una tabella in più.
+- I tre partial unique indexes richiedono attenzione (non un singolo UNIQUE sulla coppia (target, version)).
+
+### 4.2 Opzione B — Riuso di `verification_records` con nuovi `check_kind` (SCARTATA)
+
+Confusione semantica tra "verifica testuale" e "qualità della fonte", modifica vincolante del CHECK in 0004, difficoltà di versioning aggregato. **Non implementata.**
+
+### 4.3 Opzione C — Ibrida (NON SCELTA)
+
+Combinazione di A + sotto-check eventuali in `verification_records`. **Non implementata**: la complessità non era giustificata in MVP-0.
+
+### 4.4 Decisione finale
+
+Opzione A implementata in 8.7B. Storicamente raccomandata; confermata in implementazione.
+
+---
+
+## 5. Interazione con Claim Ledger (invariante, comportamento M1 attivo)
+
+La 8.7 NON cancella, NON modifica e NON sostituisce le `claim_ledger_entries` esistenti. Le invarianti enunciate originariamente restano in piedi:
+
+1. **Append-only stretto preservato.**
+2. **Nessuna estensione di `claim_lineage.relation_kind`.**
+3. **Nessuna estensione di `claim_ledger_entries.state`.**
+4. **Distinzione semantica rigorosa.**
+
+### 5.2 Comportamento attivo: M1 (solo metadata)
+
+Lo stato corrente del sistema implementa **M1**:
+- L'assessment vive nella tabella `source_quality_assessments`.
 - `claim_ledger_entries` resta invariata.
-- Il Claim Ledger continua a riflettere la verifica testuale (CVE-lite) e i passaggi a `unverifiable` per source loss.
-- Il Final Answer Gate futuro (8.7G) consulta gli assessment e può rifiutare/limitare la pubblicazione anche se il ledger dice `verified_fact`.
+- Il Final Answer Gate NON consulta gli assessment in 8.4/8.7F. La consultazione è 8.7G.
 
-**Comportamento M2 — superseding del claim con motivazione esplicita di qualità.**
-- Solo in casi gravissimi e dichiarati (es. fonte unica, weakly_supported, contraddetta da una primary autorevole).
-- Si appende `claim_ledger_entries v(N+1)` con stato esistente (es. `disputed_fact` o `unverifiable`) e `transition_reason` esplicito che la policy 8.7 deve registrare (es. `transition_reason='source_quality_downgrade'`).
-- Lineage via `relation_kind='supersedes'` (nessuna estensione necessaria).
-- L'audit è emesso sulla chain task con un nuovo `event_type` (es. `claim.source_quality_downgrade`).
-
-**Nota di prudenza:** M2 è potente ma pericoloso. Se mal calibrato, mischia "claim falso" e "fonte debole", che §3 vieta. Il default deve essere M1.
+**M2** (superseding del claim per source_quality_downgrade) resta una opzione di policy futura, esplicitamente rinviata e non scelta in 8.7G come default.
 
 ### 5.3 Distinzione dei quattro assi
-
-Per rendere l'interazione comprensibile a chi legge il sistema:
 
 | Asse                               | Domanda                                                | Dove vive                                                                 |
 | ---------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------- |
 | Claim correctness                  | Il claim è vero?                                       | (non valutato in MVP-0)                                                   |
 | Evidence support                   | C'è almeno un'evidenza ben formata per questo claim?   | `claim_evidence_links`                                                    |
-| Source quality                     | Le fonti di quell'evidenza sono buone?                 | `source_quality_assessments` (nuova)                                      |
-| Final publication eligibility      | Il sistema deve pubblicare questo claim?               | `final_gate_reports` + policy 8.7G                                        |
-
-Il rispetto di queste distinzioni è l'invariante fondante della Fase 8.7.
+| Source quality                     | Le fonti di quell'evidenza sono buone?                 | `source_quality_assessments` (implementata 8.7B)                          |
+| Final publication eligibility      | Il sistema deve pubblicare questo claim?               | `final_gate_reports` + policy 8.7G (pendente)                             |
 
 ---
 
 ## 6. Interazione con Final Answer Gate
 
-La 8.7A NON modifica il Final Answer Gate. La 8.7G (futura) introdurrà la policy. Il piano definisce **le policy possibili**, non le scrive.
+**Stato corrente: il Gate NON è modificato.** La 8.7G introdurrà la policy. Le policy candidate restano in piedi.
 
-### 6.1 Regola attuale (8.4, ricapitolata)
+### 6.1 Regola attuale (8.4, invariata)
 
-Uno span è verified-backed se e solo se esiste `final_answer_span_claim_links` tale che:
-
+Uno span è verified-backed se e solo se:
 ```
 link.claim_ledger_entry_id == latest_entry_id_for(claim_logical_id)
 AND latest_entry_state_for(claim_logical_id) == 'verified_fact'
 ```
 
-### 6.2 Policy candidate per il gate futuro
+### 6.2 Policy candidate per 8.7G
 
-Vanno valutate come opzioni, non implementate ora.
+- **P1 — block on uniformly weak support.** Block se tutte le evidence_spans di uno span hanno `overall_quality ∈ {weak, unsuitable}`.
+- **P2 — require strong support for sensitive claims.** Per claim "rilevanti", richiesta `overall_quality='strong'` + `source_role='primary'`.
+- **P3 — flag secondary-only support.** Non blocca ma marca lo span come secondary-only.
+- **P4 — downgrade confidence on stale or non-independent sources.** Non blocca, abbassa una confidence aggregata.
+- **P5 — publish with disclosure on weak-but-declared sources.** Pubblicazione con nota.
 
-- **Policy P1 — block on uniformly weak support.**
-  Se per uno span TUTTE le `evidence_spans` collegate al claim hanno `overall_quality ∈ {weak, unsuitable}`, il gate rifiuta con `coverage_gap_statements.kind='unverified_claim'` e una motivazione di qualità (gap_key esteso, o nuovo `kind` dedicato — vedi sotto).
-
-- **Policy P2 — require strong support for sensitive claims.**
-  Per claim marcati come "rilevanti" (criterio futuro, non in 8.7), il gate richiede almeno una `evidence_span` con `overall_quality='strong'` e `source_role='primary'`.
-
-- **Policy P3 — flag secondary-only support.**
-  Se nessuna `evidence_span` collegata al claim ha `source_role='primary'`, il gate non blocca ma marca il claim "secondary-only-supported" nel payload. La pubblicazione procede con una nota.
-
-- **Policy P4 — downgrade confidence on stale or non-independent sources.**
-  Se le sole fonti sono `freshness='stale'` o `independence_level ∈ {affiliated, self_reported}`, il gate abbassa una confidence aggregata, senza necessariamente bloccare.
-
-- **Policy P5 — publish with disclosure on weak-but-declared sources.**
-  Mantiene la pubblicazione possibile con un'esplicita nota di "fonte debole dichiarata". Necessario per non penalizzare i casi in cui l'utente carica esplicitamente una fonte che riconosce come weak e cerca comunque elaborazione.
+Proposta di default per 8.7G-PRE: **P1 + P5** (block stretto + escape esplicito).
 
 ### 6.3 Coverage gap kinds
 
-Per evitare di mischiare "claim non verificato" con "fonte debole", la 8.7 raccomanda di NON riusare `kind='unverified_claim'` per i source-quality block. Una opzione:
+Per evitare di mischiare "claim non verificato" con "fonte debole", si raccomanda di introdurre in una migration separata (probabilmente in concomitanza con 8.7G) un nuovo `kind='source_quality_block'` su `coverage_gap_statements`, NON in 8.7B. Decisione formale rinviata a 8.7G-PRE.
 
-- introdurre in una migration separata (NON in 8.7B) un nuovo `kind='source_quality_block'` su `coverage_gap_statements`, con relativa `gap_key`.
+### 6.4 Nessun cambiamento contrattuale prima di 8.7G
 
-Decisione rinviata. In 8.7B questa estensione del CHECK NON viene fatta.
-
-### 6.4 Nessun cambiamento contrattuale in 8.7A
-
-Il gate corrente continua a usare la regola "verified-backed". 8.7A non altera nulla. 8.7G discute la policy e la implementa.
+Il gate corrente continua a usare la regola "verified-backed". 8.7B/C/D/E/F non lo alterano. 8.7G discute e implementa la policy.
 
 ---
 
-## 7. Interazione con Source Loss
+## 7. Interazione con Source Loss (invariata)
 
-La 8.7 distingue rigorosamente i due concetti:
+I due concetti restano distinti:
 
 | Concetto                | Significato                                                                    | Dove vive                                                  |
 | ----------------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------- |
 | Source loss             | Fonte persa, inaccessibile, modificata, quote non più riconducibile            | `source_loss_events`, `source_loss_propagation_records`    |
-| Source quality          | Fonte presente ma debole / obsoleta / non indipendente / non primaria          | `source_quality_assessments` (futura)                      |
+| Source quality          | Fonte presente ma debole / obsoleta / non indipendente / non primaria          | `source_quality_assessments` (implementata 8.7B)           |
 
-### 7.1 Casi di interazione
-
-- **`loss_kind='quote_mismatch'`** rimane un evento di source loss. Il source quality `extract_quality='quote_mismatch'` riflette lo stesso fatto ma da una prospettiva diversa (qualità dell'estratto). Il modulo 8.7 può decidere se, una volta osservato uno `source_loss_events.loss_kind='quote_mismatch'`, lanciare anche un assessment con `extract_quality='quote_mismatch'`. Questo NON è automaticamente richiesto: l'evento di source loss conserva il suo significato canonico (la propagazione marca i claim `unverifiable/source_lost`), e l'assessment è un complemento informativo, non una conseguenza obbligatoria.
-
-- **`loss_kind='document_replaced'`** può richiedere un **reassessment** della qualità: la nuova versione del documento potrebbe avere un assessment diverso. È legittimo emettere un nuovo `source_quality_assessments v(N+1)` con `policy_version_id` invariata o anche con un payload che spiega "post-replacement reassessment".
-
-- **`loss_kind='source_deleted'`/`source_access_lost'`/`policy_retraction'`** sono eventi che precludono futuri assessment di qualità per quell'evidence_span: la fonte non c'è più. La 8.7 NON deve modificare la riga di source loss per riflettere giudizi di qualità.
-
-- **`freshness='stale'`** è un giudizio di qualità, NON un source loss. Una fonte stale è una fonte presente. Non deve produrre `source_loss_events`.
-
-### 7.2 Invarianti incrociate
-
-1. La 8.7 NON modifica `source_loss_events`, `source_loss_propagation_records`, né il propagator.
-2. Un source_loss event può ESSERE seguito da un assessment di qualità, mai sostituito da esso.
-3. Un assessment di qualità non emette `source_loss_events`.
+Le invarianti incrociate restano in piedi: la 8.7 NON modifica le tabelle source_loss; un source_loss event può ESSERE seguito da un assessment di qualità, mai sostituito da esso; un assessment non emette `source_loss_events`.
 
 ---
 
-## 8. API future (read-only, non implementate)
+## 8. API read-only — STATO IMPLEMENTATO (8.7F)
 
-I seguenti endpoint sono **proposte di blocco 8.7F**. Non vengono implementati in 8.7A. Sono read-only end-to-end (nessun INSERT/UPDATE/DELETE, nessun Redis, nessuna invocazione worker).
+### 8.1 `GET /api/v1/evidence-spans/{evidence_span_id}/source-quality` — IMPLEMENTATO
 
-### 8.1 `GET /api/v1/evidence-spans/{id}/source-quality`
+Vedi `apps/api/app/routes/source_quality.py` per la fonte autorevole.
 
-Restituisce l'ultimo assessment per la `evidence_spans` indicata.
+- 404 `RESOURCE_NOT_FOUND` `details.resource="evidence_spans"` se lo span non esiste.
+- 200 con `items=[]` e `latest_assessment=null` se non esistono assessment.
+- 200 con wrapper `{evidence_span_id, latest_assessment, items}`, items ordinati ASC per `(version_no, created_at, id)`, `limit` 1–5000 default 100.
+- `latest_assessment` = ultimo elemento dello slice (massimo `version_no` tra gli items restituiti).
 
-**Response shape (indicativa):**
-```json
-{
-  "evidence_span_id": "<uuid>",
-  "latest_assessment": {
-    "id": "<uuid>",
-    "version_no": 2,
-    "source_type": "user_document",
-    "source_role": "secondary",
-    "authority_level": "medium",
-    "independence_level": "self_reported",
-    "freshness": "undated",
-    "relevance": "direct_support",
-    "extract_quality": "exact_quote_match",
-    "contradiction_status": "unchecked",
-    "overall_quality": "adequate",
-    "confidence": 0.7,
-    "evaluator_name": "mvp0_source_quality_v1",
-    "evaluator_version": "0.1.0",
-    "policy_version_id": "<uuid>",
-    "created_at": "..."
-  }
-}
-```
+### 8.4 `GET /api/v1/tasks/{task_id}/source-quality` — IMPLEMENTATO
 
-**Errori:**
-- `404 RESOURCE_NOT_FOUND` con `details.resource="evidence_spans"` se lo span non esiste.
-- `200` con `latest_assessment: null` se lo span esiste ma non ha mai avuto assessment (lista vuota: non si fabbrica storia).
+- 404 `RESOURCE_NOT_FOUND` `details.resource="task_masters"` se il task non esiste.
+- 200 con un item per evidence_span linkato al task via `claim_evidence_links` JOIN `logical_claims`; span senza assessment esposti con `latest_assessment=null` e `items=[]`.
+- `summary` con `evidence_spans_total`, `spans_with_assessment`, `spans_without_assessment`, `latest_overall_quality_counts` sul codominio `overall_quality` (`{strong, adequate, weak, unsuitable, unknown}`, sempre tutti presenti con default 0).
+- I counts del summary considerano solo l'`latest_assessment` per span.
 
-**Paginazione:** N/A (single-row latest). Una variante futura potrebbe esporre `/history` come fa il claim ledger.
+### 8.2 / 8.3 / 8.5 — FUTURI / OPZIONALI
 
-### 8.2 `GET /api/v1/documents/{id}/source-quality`
+I seguenti endpoint restano future/opzionali, NON implementati in 8.7F:
 
-Latest assessment a granularità documento.
+- `GET /api/v1/documents/{id}/source-quality` (document-level).
+- `GET /api/v1/claims/{logical_id}/source-quality` (claim-level con rollup).
+- `GET /api/v1/published-answers/{id}/source-quality-report` (post-fatto sul published).
 
-**Response shape:**
-```json
-{
-  "document_id": "<uuid>",
-  "latest_assessment": { ... },
-  "evaluator_name": "...",
-  "policy_version_id": "<uuid>"
-}
-```
+Verranno valutati quando emergerà un consumatore concreto (UI, reporting, ecc.).
 
-**Errori:** `404 RESOURCE_NOT_FOUND` `details.resource="uploaded_documents"`.
+### 8.6 Invarianti comuni (osservate in 8.7F)
 
-### 8.3 `GET /api/v1/claims/{logical_id}/source-quality`
-
-Aggregato: per ogni `evidence_span` collegata via `claim_evidence_links` alla latest entry del claim, il latest assessment.
-
-**Response shape:**
-```json
-{
-  "claim_logical_id": "<uuid>",
-  "items": [
-    {
-      "evidence_span_id": "<uuid>",
-      "latest_assessment": { ... } | null
-    }
-  ],
-  "rollup": {
-    "any_strong": false,
-    "any_primary": false,
-    "all_weak_or_unsuitable": true
-  }
-}
-```
-
-Il blocco `rollup` è un riassunto applicativo deterministico. NON sostituisce la policy del gate, che resta consumatore diretto delle righe.
-
-### 8.4 `GET /api/v1/tasks/{task_id}/source-quality-summary`
-
-Per ogni claim del task, il rollup di qualità delle fonti.
-
-**Response shape:**
-```json
-{
-  "task_id": "<uuid>",
-  "items": [
-    {
-      "claim_logical_id": "<uuid>",
-      "rollup": { ... }
-    }
-  ]
-}
-```
-
-**Paginazione:** `limit` con tetto coerente con 8.6 (default 200, max 2000).
-
-### 8.5 `GET /api/v1/published-answers/{id}/source-quality-report`
-
-Per ogni span del published_answer, l'aggregato qualità delle fonti che lo supportano. Utile per il post-fatto (capire perché un certo published è stato pubblicato).
-
-**Response shape:**
-```json
-{
-  "published_answer_id": "<uuid>",
-  "items": [
-    {
-      "final_answer_span_id": "<uuid>",
-      "claim_logical_id": "<uuid>",
-      "evidence_quality_summary": { ... }
-    }
-  ]
-}
-```
-
-### 8.6 Invarianti comuni
-
-- **Read-only end-to-end** (verificato da snapshot pre/post sui count delle tabelle, come 8.6).
-- **Schemi shared** dedicati in `packages/shared/evidencefirst_shared/schemas.py` (`SourceQualityAssessmentRead`, `SourceQualityRollupRead`, ecc.).
-- **404 normalizzati** secondo la convenzione `details.resource` già adottata in 8.6.
-- **JSONB esposti verbatim** in MVP-0 (RBAC redaction = debito futuro, come dichiarato in 8.6).
-- **Nessun nuovo `ErrorCode`** introdotto.
+- Read-only end-to-end (no INSERT/UPDATE/DELETE; nessun import di codice worker).
+- Schemi shared dedicati (`SourceQualityAssessmentRead` in `packages/shared/evidencefirst_shared/schemas.py`).
+- 404 normalizzati secondo la convenzione `details.resource`.
+- JSONB esposti verbatim (RBAC redaction = debito futuro).
+- Nessun nuovo `ErrorCode`.
 
 ---
 
-## 9. Worker / pipeline futura (non implementata)
+## 9. Worker / pipeline — W-A IMPLEMENTATA (8.7E)
 
-La 8.7 deve scegliere DOVE e QUANDO eseguire l'evaluator. Quattro opzioni, da valutare in fase 8.7E:
+### 9.1 Opzione W-A — Step sincrono dentro `task.created` (IMPLEMENTATA)
 
-### 9.1 Opzione W-A — Step sincrono dentro `task.created`
+Stato:
+- Source quality eseguita nel `task_created` fresh path **dopo `task.analyzed_partial`** e **prima di `task.compiling`**, dentro `_run_8_3_extract_and_verify`.
+- Implementata via `apps/worker/app/services/source_quality_orchestrator.py` che chiama `assess_source_quality` per ogni `evidence_span_id` linkato ai claim del task via `claim_evidence_links` JOIN `logical_claims`.
+- Idempotency key deterministica: `task:{task_id}:span:{evidence_span_id}:v1`.
+- **Nessun nuovo stream Redis. Nessun nuovo consumer. Nessuna modifica al dispatcher.**
+- Singolo audit aggregato `task.source_quality_assessed` sulla chain del task, con `status='completed'|'failed'` e payload con counts.
+- **Fallimento source quality non blocca 8.4**: la chiamata all'orchestrator è wrappata in `conn.begin_nested()` (SAVEPOINT). Su eccezione: rollback del savepoint + audit `failed` con `error_type` (no stack trace) + pipeline continua.
+- Sui resume da `compiling` o `analyzed_partial` lo step **non** viene re-eseguito.
 
-Il worker, dopo `claim_evidence_links`, invoca il Source Quality Evaluator come step della pipeline (mock-driven in MVP-0).
+### 9.2 Opzione W-B — Consumer asincrono dedicato
 
-**Pro:** un solo evento, audit chain compatto, ordine deterministico. **Contro:** allunga la pipeline `task.created`; un fallimento dell'evaluator rischia di bloccare il published.
+Non implementata. Resta candidato per quando arriverà un evaluator reale (con eventuale web search).
 
-### 9.2 Opzione W-B — Consumer asincrono su evento dedicato
+### 9.3 / 9.4 — W-C / W-D
 
-Un nuovo stream Redis `app.events.source_quality.requested` con un nuovo consumer.
+Non implementate. Rinviate.
 
-**Pro:** disaccoppia completamente l'evaluator dalla pipeline; permette reassessment indipendenti. **Contro:** nuovo stream, nuovo consumer, nuovo EPR consumer_name, nuove migration test, eventuale DLQ futura.
+### 9.5 Trade-off osservati
 
-### 9.3 Opzione W-C — Servizio sincrono chiamato dal worker, ma DOPO il gate
-
-Il gate non consuma source quality in 8.7; ma dopo il gate, l'evaluator gira asincrono per popolare i metadati di qualità che le 8.7F espongono.
-
-**Pro:** non blocca la prima pubblicazione. **Contro:** finestra di "published senza quality assessment" osservabile.
-
-### 9.4 Opzione W-D — Job di reassessment periodico
-
-Un job ricorrente rileva fonti stale o assessment vecchi rispetto alla policy corrente e produce un nuovo assessment.
-
-**Pro:** abilita drift detection futuro. **Contro:** richiede scheduler / cron-like (non esiste in MVP-0).
-
-### 9.5 Raccomandazione (non implementata)
-
-- Per MVP-0 mock-driven: **W-A** è il punto di minor frizione (un nuovo step nel consumer `task_created`, mock-driven, idempotente come gli altri step 8.3/8.4).
-- Per un secondo blocco: introdurre **W-B** quando arriva il vero source quality evaluator (con eventuale web search reale).
-- **W-C** e **W-D** sono lasciate per fasi successive.
-
-Trade-off:
-- **Semplicità MVP**: vince W-A.
-- **Idempotenza**: tutte e tre le prime opzioni la garantiscono via UNIQUE su `idempotency_key` come gli altri servizi.
-- **Audit trail**: tutte producono audit `chain_scope='task'` con `event_type='source_quality.assessed'` (nuovo event_type, append-only).
-- **Costo computazionale**: in MVP-0 trascurabile (mock).
-- **Compatibilità futura con web search/API**: meglio W-B.
+- **Semplicità MVP**: W-A ha vinto e funziona; integrazione contenuta.
+- **Idempotenza**: garantita via key deterministica + UNIQUE `(target_id, idempotency_key)`.
+- **Audit trail**: singolo aggregato; copre success e failed senza affollare la chain.
+- **Costo computazionale**: trascurabile (mock).
+- **Compatibilità futura**: per provider reali / web search si dovrà valutare il passaggio a W-B.
 
 ---
 
-## 10. Test plan futuro (non scritto in 8.7A)
+## 10. Test plan — STATO
 
-I seguenti test sono **da implementare** nei blocchi successivi (in particolare 8.7D/8.7E/8.7F/8.7H). Qui si elencano e si dichiara cosa devono verificare.
+Test implementati nei blocchi 8.7D/E/F (riferimenti ai file presenti nel repo):
 
-### 10.1 Unit test del Source Quality Evaluator service (mock-driven)
+- `apps/worker/tests/test_source_quality_evaluator_service.py` — 14 scenari.
+- `apps/worker/tests/test_source_quality_orchestrator.py` — 7 scenari.
+- `apps/worker/tests/test_task_created_source_quality_step.py` — 4 scenari (incluso savepoint rollback + audit `failed`).
+- `apps/worker/tests/test_consumer_with_documents.py` — 14 eventi nella sequenza approved (incluso `task.source_quality_assessed` al posto 9 / 14 e nella sequenza rejected).
+- `apps/api/tests/test_source_quality_read_endpoint.py` — read API 8.7F (test passati riportati dall'utente).
 
-- `test_evaluator_classifies_primary_vs_secondary`
-- `test_evaluator_classifies_official_vs_blog`
-- `test_evaluator_marks_stale_freshness`
-- `test_evaluator_marks_undated_when_no_date_signal`
-- `test_evaluator_returns_quote_mismatch_when_quote_not_in_chunk`
-- `test_evaluator_records_unchecked_contradiction_status_by_default`
-- `test_evaluator_two_conflicting_sources_flow` (richiede contradiction detector, può restare skipped)
-- `test_evaluator_is_idempotent_on_redelivery` (stessa target + idempotency_key → no duplicates)
-- `test_evaluator_appends_new_assessment_under_different_policy_version`
-- `test_evaluator_no_mutation_of_previous_assessments` (snapshot pre/post)
+Test plan ancora da implementare (in 8.7G/H):
 
-### 10.2 Integration test della pipeline
-
-- `test_pipeline_emits_source_quality_assessed_audit_event`
-- `test_pipeline_associates_assessment_with_evidence_span`
-- `test_pipeline_realistic_flow_task_to_published_with_quality_metadata`
-
-### 10.3 Final Answer Gate policy test (quando implementato in 8.7G)
-
-- `test_gate_blocks_claim_supported_only_by_weak_sources` (Policy P1)
-- `test_gate_approves_claim_with_strong_primary_source`
-- `test_gate_flags_secondary_only_claim_without_blocking` (Policy P3)
-- `test_gate_publish_with_disclosure_on_weak_declared_source` (Policy P5)
-
-### 10.4 Read-only invariant test (per gli endpoint 8.7F)
-
-Sulla falsariga dei test 8.6 (`test_task_source_loss_events_endpoint_is_read_only`):
-
-- snapshot pre/post sui count di `source_quality_assessments`, `claim_ledger_entries`, `published_answers`, `audit_records`, `source_loss_events`, `source_loss_propagation_records`;
-- nessun drift dopo qualunque GET sui 5 endpoint 8.7F.
-
-### 10.5 Append-only / no mutation invariants
-
-- INSERT su `source_quality_assessments` consentito; UPDATE/DELETE rifiutati dal trigger.
-- Un assessment v1 + v2 coesistono; v1 ha payload identico prima e dopo l'INSERT di v2.
-
-### 10.6 Realistic flow
-
-Sulla falsariga di `tests/test_phase_8_5_source_loss_flow.py`:
-
-- `tests/test_phase_8_7_source_quality_flow.py` che seed-a task + corpus + claim, esegue mock-evaluator, e verifica via HTTP gli endpoint 8.7F.
+- Final Answer Gate policy test (8.7G).
+- Realistic flow test `tests/test_phase_8_7_source_quality_flow.py` (8.7H).
 
 ---
 
 ## 11. Non-obiettivi (esplicitamente fuori scope per 8.7)
 
-La 8.7 planning NON include e NON implementerà:
+Restano fuori scope per tutta la 8.7 (compresi 8.7G/H):
 
-- Web search reale.
-- Provider AI reali.
-- Crawling, scraping.
+- Web search reale, provider AI reali, crawling/scraping.
 - UI dedicata per source quality.
 - RBAC reale o redaction di JSONB.
-- Retention policy distruttiva (rinviata a `0007_evaluation_retention.sql` o `0008_*`, comunque diverso e separato dalla migration 8.7B).
-- Migration concreta (la 8.7A non scrive `migrations/0007_source_quality.sql`).
-- Scoring "perfetto" o algoritmi di reputazione cross-tenant.
+- Retention policy distruttiva.
+- Scoring "perfetto", algoritmi di reputazione cross-tenant.
 - Verità assoluta sulla fonte.
 - Ranking commerciale o monetario.
 - Withdrawal automatico da source quality.
 - Modifica della propagazione source loss.
 - Estensione di `claim_lineage.relation_kind`.
-- Estensione di `verification_records.check_kind` (in particolare l'Opzione B di §4 è scartata).
-- Estensione di `coverage_gap_statements.kind` (rinviata a blocchi successivi).
-- Modifica del Final Answer Gate.
+- Estensione di `verification_records.check_kind`.
 - Modifica del CVE-lite o dell'extractor.
 
-Inoltre la 8.7A NON modifica:
-
-- Codice applicativo (API, worker, shared).
-- Test esistenti.
-- Migrations.
-- `PROJECT_STATE.md`.
-- `README.md`.
-
-L'unico output della 8.7A è il file `PHASE_8_7_PLAN.md`.
+Per 8.7G in particolare resta ammessa solo: una migration aggiuntiva separata che eventualmente estenda `coverage_gap_statements.kind` per introdurre `source_quality_block`, da decidere in 8.7G-PRE.
 
 ---
 
-## 12. Roadmap a blocchi proposta
+## 12. Roadmap a blocchi — stato
 
-I blocchi successivi sono enunciati ma non implementati in 8.7A.
+| Blocco | Descrizione | Stato |
+|---|---|---|
+| 8.7A | `PHASE_8_7_PLAN.md` | done |
+| 8.7B | `migrations/0007_source_quality.sql` | done |
+| 8.7C | Shared schemas | done |
+| 8.7D | Mock Source Quality Evaluator service | done |
+| 8.7E | Worker integration (W-A) | done |
+| 8.7F | Read API (due endpoint) | done |
+| 8.7G | Gate policy integration + eventuale `coverage_gap_statements.kind='source_quality_block'` | next |
+| 8.7H | Realistic flow tests + docs finalization | pending |
 
-### 12.1 Sequenza proposta
-
-- **8.7A — `PHASE_8_7_PLAN.md`** (questo blocco). Piano e basta.
-- **8.7B — `migrations/0007_source_quality.sql`.** Migration per l'Opzione A: `source_quality_assessments` + `source_quality_factors` (opzionale, decisione in 8.7B) + `source_quality_policies` (opzionale). Trigger append-only standard. Partial unique indexes per `(target_kind, target_id, version_no)` o equivalente. Nessun altro CHECK alterato.
-- **8.7C — Shared schemas.** `packages/shared/evidencefirst_shared/schemas.py` riceve `SourceQualityAssessmentRead`, `SourceQualityRollupRead`. Nessuna modifica ai modelli 8.4/8.5/8.6 esistenti.
-- **8.7D — Mock Source Quality Evaluator service.** `apps/worker/app/services/source_quality_evaluator.py`. Deterministico, mock-driven, niente AI, niente web. Politica di default conservativa: tutti i `user_document` non datati diventano `freshness='undated'`, `source_type='user_document'`, `authority_level='unknown'`, `overall_quality='adequate'` se CVE-lite passa, `overall_quality='weak'` se CVE-lite fallisce. Idempotente.
-- **8.7E — Worker integration (W-A).** Il consumer `task_created` chiama l'evaluator dopo `claim_evidence_links`. Audit `source_quality.assessed` su `chain_scope='task'`.
-- **8.7F — Read API.** I cinque endpoint di §8. Read-only invariant test inclusi. Nessuna modifica al gate.
-- **8.7G — Gate policy integration.** Implementa una sola delle policy P1–P5 (proposta: P1 + P5 con flag di policy). Nuovo `kind='source_quality_block'` su `coverage_gap_statements` SOLO qui, in una migration separata. Aggiornamento del Final Answer Gate per consultare gli assessment.
-- **8.7H — Realistic flow tests + docs.** `tests/test_phase_8_7_source_quality_flow.py`. Aggiornamento finale di `PROJECT_STATE.md` (al termine di 8.7H, NON ora).
-
-### 12.2 Ordine
-
-L'ordine proposto rispetta:
-
-1. **Schema first**: 8.7B prima di qualunque codice.
-2. **Shared types prima dei consumatori**: 8.7C prima di 8.7D/8.7F.
-3. **Service prima del worker integration**: 8.7D prima di 8.7E.
-4. **Read API prima del gate policy**: 8.7F prima di 8.7G, così la policy del gate è osservabile via HTTP quando viene scritta.
-5. **Test realistici alla fine**: 8.7H come gate complessivo.
-
-### 12.3 Variante accettabile
-
-Se 8.7G appare prematuro (probabile in MVP-0), si può chiudere la fase a 8.7F: gli assessment vengono scritti e osservati, ma il gate resta invariato. La distinzione tra "qualità misurata" e "qualità decisionale" è una conquista intermedia legittima.
+Variante accettabile (rispettata): chiusura intermedia a 8.7F. Gli assessment sono scritti e osservabili via HTTP; il gate resta invariato. La distinzione tra "qualità misurata" e "qualità decisionale" è la conquista intermedia.
 
 ---
 
-## 13. Rischi residui
+## 13. Anti-Hallucination roadmap
 
-Reali e specifici del piano 8.7:
+> **Il progetto non promette di impedire a un LLM di generare internamente output errati. Promette di impedire che claim fattuali non supportati, contraddetti o basati su fonti inadeguate vengano pubblicati come affidabili.**
 
-- **Falso senso di sicurezza da score numerici.** `confidence` ∈ [0, 1] e `overall_quality` ∈ {strong, adequate, weak, unsuitable, unknown} possono essere letti come verità. Mitigazione: documentazione esplicita, response shape che NON mostra mai un singolo numero come "rating della fonte".
-- **Bias verso fonti istituzionali.** Una policy ingenua marcherebbe ogni documento ufficiale come `authority_level='high'` ignorando dominio e contesto. Mitigazione: `authority_level` resta `unknown` di default; mai derivato senza policy esplicita.
-- **Domini diversi richiedono criteri diversi.** Scientifico vs legale vs news. Mitigazione: codomini ortogonali e policy-versioned. Una `policy_version_id` cambia il significato pratico dei valori senza riscrivere la storia.
-- **Assenza di web search reale.** L'indipendenza, la corroborazione e (in parte) la freschezza non sono deducibili da un corpus chiuso. Mitigazione: i campi restano `unknown` finché non c'è una fonte esterna da consultare; la 8.7 NON pretende di valutarli in MVP-0.
-- **Fonti user-provided autorevoli ma non verificabili esternamente.** Una sentenza ufficiale caricata dall'utente è autorevole, ma in MVP-0 il sistema non può confermarla esternamente. Mitigazione: distinguere `authority_level='unknown'` (default in MVP-0) da `authority_level='high'` (consentito solo via policy che dichiara la regola usata).
-- **Rischio di overblocking.** Una policy troppo severa può bloccare claim legittimi. Mitigazione: in 8.7G partire con una sola policy (es. P1 con soglia conservativa) e P5 come escape.
-- **Rischio di underblocking.** Senza policy, gli assessment non producono effetti. Mitigazione: 8.7F espone gli assessment via HTTP; un operatore può consultarli e agire manualmente nei blocchi intermedi 8.7F → 8.7G.
-- **Necessità futura di RBAC/redaction.** I payload JSONB degli assessment possono contenere dati sensibili (es. valutazioni interne sull'autore). Stesso debito già dichiarato in 8.6 §9.
-- **Costo computazionale.** Mock-driven trascurabile; con un evaluator AI reale il costo diventa significativo. La 8.7 NON introduce provider reali (vincolo MVP-0 `PROVIDERS_ENABLED=mock`, `MAX_COST_PER_TASK=0`).
-- **Explainability.** Una decisione "fonte debole" deve essere spiegabile. Mitigazione: `payload` JSONB dell'assessment porta i sotto-criteri ridondanti rispetto agli enum, così che un'interfaccia futura possa renderli.
-- **Confusione concettuale rispetto al ledger.** Il rischio più grave: mischiare claim-falso e fonte-debole. Mitigazione: §3 e §5.
+Roadmap successiva alla 8.7F, da affrontare in blocchi separati:
 
----
-
-## 14. Decisione documentale (8.7A)
-
-- **`PHASE_8_7_PLAN.md`** è creato (questo file).
-- **`PHASE_8_6_PLAN.md`** non viene modificato.
-- **`PROJECT_STATE.md`** non viene modificato (l'aggiornamento spetta a 8.7H, non a 8.7A).
-- **`README.md`** non viene modificato.
-- **Codice applicativo, test, migrations** non vengono toccati.
-- La 8.7A è esclusivamente documentale.
+- **8.7G — Source Quality nel Final Answer Gate.** Integrazione decisionale: il gate consulta `source_quality_assessments` e applica una policy (proposta: P1 block + P5 disclosure). Eventuale introduzione di `coverage_gap_statements.kind='source_quality_block'` in una migration separata (da decidere in 8.7G-PRE).
+- **8.8A — Claim Entailment Checker.** Verifica che la quote effettivamente implichi (o sia compatibile con) il claim, non solo che sia testualmente presente. Oggi `verification_records.check_kind='cve_lite'` verifica solo presenza testuale.
+- **8.8B — Citation-to-Claim Validator.** Verifica che il claim citi le evidenze corrette, non evidenze "vicine" che non lo supportano davvero.
+- **8.8C — Contradiction Detector.** Detector reale di contraddizioni tra claim o tra fonti. Oggi `contradiction_records` placeholder, `source_quality.contradiction_status='unchecked'` per costruzione.
+- **8.8D — Final Answer Sentence Gate.** Gate a livello frase del published_answer, non solo a livello span verified-backed (uno span può contenere prosa generata dal compiler che eccede ciò che la quote effettivamente supporta).
+- **8.8E — Anti-Hallucination Report API.** Endpoint aggregato che espone, per un published_answer, lo stato di tutti gli assi (entailment, citation, contradiction, source quality, source loss).
+- **8.9 — External Verification / Web-RAG controllato.** Verified Web Mode con cattura immutabile delle fonti recuperate (`retrieved_sources`/`retrieved_chunks`/`retrieved_source_spans` previste in schema futuro).
+- **9.0 — Multi-agent consensus + adversarial review reale.** Provider AI reali, consensus engine, critical reviewer adversariale.
 
 ---
 
-FILE_COMPLETATI
-- PHASE_8_7_PLAN.md
+## 14. Rischi residui
+
+Rischi specifici allo stato post-8.7F:
+
+- **Source Quality mock deterministic.** L'evaluator scrive sempre `overall_quality='unknown'` e `confidence=0.5`. Le altre dimensioni sono fissate dalla policy mock. Nessuna valutazione semantica è realmente effettuata.
+- **Gate non ancora integrato.** Gli assessment sono scritti ma non consumati dal Final Answer Gate. Un consumatore disattento potrebbe trattare l'esistenza dell'assessment come "approvazione di qualità": NON lo è.
+- **Payload JSONB esposto senza RBAC.** Gli endpoint 8.7F restituiscono `payload` verbatim. Debito già noto in 8.6, non risolto in 8.7F.
+- **Task pre-8.7E senza assessment.** I task processati prima dell'integrazione 8.7E non hanno righe in `source_quality_assessments`. Nessun backfill: gli endpoint 8.7F restituiscono `items=[]` per quei task. Comportamento coerente con lo stato DB, ma può sorprendere chi cerca uniformità di copertura.
+- **No backfill** previsto in 8.7G/H.
+- **No Claim Entailment Checker, no Citation-to-Claim Validator, no Contradiction Detector reale, no Final Answer Sentence Gate, no External Verification.** Tutti rinviati a 8.8x e 8.9.
+- **"unknown" non deve essere interpretato come approvazione forte.** L'enum `overall_quality='unknown'` significa letteralmente "il sistema oggi non sa". Una policy 8.7G ingenua che trattasse `unknown` come "passa" produrrebbe falsi positivi sistemici. La policy 8.7G dovrà gestire `unknown` esplicitamente.
+- **Falso senso di sicurezza da score numerici.** `confidence=0.5` costante oggi: nessuna informazione utile. Quando un evaluator reale produrrà valori variabili, sarà tentante leggerli come verità.
+- **Bias verso fonti istituzionali.** Una futura policy di `authority_level='high'` ingenua marcherebbe ogni documento "ufficiale" come autorevole. Mitigazione: la policy resta esplicita e versionata via `(policy_name, policy_version)`.
+- **Domini eterogenei** (scientifico/legale/news) richiedono criteri diversi non scrivibili in un unico CHECK.
+- **Assenza di web search reale**: indipendenza, corroborazione e freschezza esterne restano largamente `unknown`.
+- **Fonti user-provided autorevoli ma non verificabili esternamente.**
+- **Rischio di overblocking** in 8.7G se P1 viene calibrata troppo severamente.
+- **Rischio di underblocking** finché 8.7G non viene scritta.
+- **Costo computazionale futuro** quando si introdurrà un evaluator reale.
+- **N+1 query** nel task endpoint 8.7F (loop su evidence_span_id): accettato per MVP-0, batchabile in futuro.
+- **Coesistenza con retention.** Il numero `0007` è ora occupato da source_quality; la retention futura (storica `0007_evaluation_retention.sql`) deve essere rinominata a `0008_*` o successiva.
+
+---
+
+## 15. Decisione documentale
+
+- **8.7A**: `PHASE_8_7_PLAN.md` creato (questo file nella sua versione originale).
+- **8.7B**: `migrations/0007_source_quality.sql` scritta e applicata.
+- **8.7C**: `packages/shared/evidencefirst_shared/schemas.py` esteso con codomini e `SourceQualityAssessmentRead`.
+- **8.7D**: `apps/worker/app/services/source_quality_evaluator.py` scritto.
+- **8.7E**: `apps/worker/app/services/source_quality_orchestrator.py` scritto; `apps/worker/app/consumers/task_created.py` integrato con step SAVEPOINT-protetto e audit aggregato.
+- **8.7F**: `apps/api/app/routes/source_quality.py` scritto; registrato in `apps/api/app/main.py`.
+- **8.7G**: pending (next).
+- **8.7H**: pending.
+- **`PHASE_8_6_PLAN.md`** non modificato.
+- **`PROJECT_STATE.md`** aggiornato (post-8.7F) a riflettere stato implementato + roadmap.
+- **`README.md`**: aggiornamento minimo di nota di stato post-8.7F.
+
+---
+
+FILE_COMPLETATI (8.7A–F, cumulativo)
+- `PHASE_8_7_PLAN.md` (8.7A; aggiornato post-8.7F)
+- `migrations/0007_source_quality.sql` (8.7B)
+- `packages/shared/evidencefirst_shared/schemas.py` (8.7C)
+- `apps/worker/app/services/source_quality_evaluator.py` (8.7D)
+- `apps/worker/app/services/source_quality_orchestrator.py` (8.7E)
+- `apps/worker/app/consumers/task_created.py` (integrazione 8.7E)
+- `apps/api/app/routes/source_quality.py` (8.7F)
+- `apps/api/app/main.py` (registrazione router 8.7F)
+- Test 8.7D/E/F worker + API
 
 FILE_DA_FARE_PROSSIMO_BLOCCO
-- review manuale del piano
-- git diff --check
-- commit:
-  - `git add PHASE_8_7_PLAN.md`
-  - `git commit -m "Add phase 8.7 source quality plan"`
-  - `git push`
+- `PHASE_8_7G_PRE.md` — analisi rigorosa del Final Answer Gate e decisione policy Source Quality Gate (P1/P2/P3/P4/P5, gestione `unknown`, eventuale `coverage_gap_statements.kind='source_quality_block'`).
 
-RISCHI_RESIDUI
-- Confusione tra correctness, evidence support, source quality e publication eligibility se §3 / §5 non vengono onorati dai blocchi successivi.
-- Falso senso di sicurezza da score numerici (`confidence` ∈ [0,1], `overall_quality` enum).
-- Bias verso fonti istituzionali se la policy di `authority_level` non resta esplicita e versionata.
-- Domini eterogenei (scientifico/legale/news) richiedono criteri diversi non scrivibili in un unico CHECK.
-- Assenza di web search reale in MVP-0: indipendenza, corroborazione e freschezza esterne restano largamente `unknown`.
-- Fonti user-provided autorevoli ma non verificabili esternamente: rischio di sovra- o sotto-stimare la qualità.
-- Rischio di overblocking nel futuro Final Answer Gate (Policy P1 troppo severa).
-- Rischio di underblocking se gli assessment vengono scritti ma non consumati dal gate (8.7F senza 8.7G).
-- Debito RBAC / redaction su payload JSONB (già noto in 8.6, non risolto in 8.7).
-- Costo computazionale futuro quando si introdurrà un evaluator reale (oltre MVP-0).
-- Migration `0007_source_quality.sql` con CHECK ternario `sqa_target_xor` e partial unique indexes: rischio medio di errori al primo colpo, da affrontare in 8.7B con cura.
-- Coesistenza con `0007_evaluation_retention.sql` (placeholder non scritto): l'allocazione del numero `0007` deve essere coordinata tra source_quality e retention; il piano propone implicitamente di rinominare la retention come `0008_*` o successiva.
+RISCHI_RESIDUI (sintesi, vedi §14 per il dettaglio)
+- Source Quality mock deterministic (`overall_quality='unknown'`, `confidence=0.5`).
+- Gate non ancora integrato; assessment scritti ma non consumati.
+- Payload JSONB esposto senza RBAC.
+- Task pre-8.7E senza assessment, no backfill.
+- No Claim Entailment Checker, no Citation-to-Claim Validator, no Contradiction Detector reale, no Final Answer Sentence Gate, no External Verification (rinviati a 8.8x/8.9).
+- "unknown" non equivale ad approvazione forte: deve essere gestito esplicitamente dalla policy 8.7G.
+- Rischio overblocking / underblocking nel futuro Gate policy.
+- Coesistenza retention: `0008_*` da assegnare quando si scriverà.
