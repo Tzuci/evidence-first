@@ -561,7 +561,7 @@ def test_approved_scenario_publishes_answer():
             {"t": task_id},
         ).one()
         assert str(report[0]) == "approved"
-        assert str(report[1]) == "all_spans_verified"
+        assert str(report[1]) == "all_spans_verified_with_warnings"
 
         pa = conn.execute(
             text(
@@ -574,16 +574,29 @@ def test_approved_scenario_publishes_answer():
         assert str(pa[1]) == hashlib.sha256(summary_text.encode("utf-8")).hexdigest()
         assert str(pa[2]) == "published"
 
-        gap_count = int(
+        warning_gap_count = int(
             conn.execute(
                 text(
                     "SELECT COUNT(*) FROM coverage_gap_statements "
-                    "WHERE draft_final_answer_id = :d"
+                    "WHERE draft_final_answer_id = :d "
+                    "AND kind = 'source_quality_warning'"
                 ),
                 {"d": draft_id},
             ).scalar_one()
         )
-        assert gap_count == 0
+        assert warning_gap_count >= 1
+
+        non_warning_gap_count = int(
+            conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM coverage_gap_statements "
+                    "WHERE draft_final_answer_id = :d "
+                    "AND kind <> 'source_quality_warning'"
+                ),
+                {"d": draft_id},
+            ).scalar_one()
+        )
+        assert non_warning_gap_count == 0
 
     with get_engine().connect() as conn:
         chain_ok = verify_task_audit_chain(conn, task_id=task_id)

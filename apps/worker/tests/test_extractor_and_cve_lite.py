@@ -599,7 +599,7 @@ def test_extractor_produces_v1_and_cve_lite_verifies_pass():
             {"t": task_id},
         ).one()
         assert str(gate[0]) == "approved"
-        assert str(gate[1]) == "all_spans_verified"
+        assert str(gate[1]) == "all_spans_verified_with_warnings"
 
         pa_status = conn.execute(
             text("SELECT status FROM published_answers WHERE task_id = :t"),
