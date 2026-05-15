@@ -13,6 +13,7 @@ from .routes import health as health_routes
 from .routes import lifecycle_events as lifecycle_events_routes
 from .routes import projects as projects_routes
 from .routes import source_loss as source_loss_routes
+from .routes import source_quality as source_quality_routes
 from .routes import task_source_loss as task_source_loss_routes
 from .routes import tasks as tasks_routes
 
@@ -35,6 +36,7 @@ def create_app() -> FastAPI:
     app.include_router(source_loss_routes.router)
     app.include_router(lifecycle_events_routes.router)
     app.include_router(task_source_loss_routes.router)
+    app.include_router(source_quality_routes.router)
 
     return app
 
