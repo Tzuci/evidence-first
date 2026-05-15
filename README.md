@@ -1,9 +1,9 @@
 # Evidence-First Multi-AI Platform — MVP-0
 
-Piattaforma multi-AI **evidence-first** ed **evidence-gated**. Il sistema è progettato per impedire che claim fattuali non supportati, contraddetti o basati su fonti inadeguate vengano pubblicati come affidabili. Non promette di eliminare le allucinazioni: promette evidenze tracciabili, registrate nel Claim Ledger, verificate, valutate sulla qualità delle fonti, propagate via lifecycle/source-loss, e approvate dal Final Answer Gate.
+Piattaforma multi-AI **evidence-first** ed **evidence-gated**. Il sistema è progettato per impedire che claim fattuali non supportati, contraddetti o basati su fonti inadeguate vengano pubblicati come affidabili. Non promette di eliminare le allucinazioni: promette evidenze tracciabili, registrate nel Claim Ledger, verificate, valutate sulla qualità delle fonti, propagate via lifecycle/source-loss, **e ora consultate dal Final Answer Gate** prima di qualunque pubblicazione.
 
-> **Stato corrente.** Repository al commit **`91397ae`** ("Add source quality read endpoints"), Fase **8.7F** conclusa.
-> Fasi implementate: 8.1–8.4 (foundation, storage, claim ledger, compiler + Final Answer Gate + first `published_answers`), 8.5 (lifecycle + source loss + propagator), 8.6 minima (read API lifecycle e source-loss), 8.7A–F (Source Quality Evaluator append-only + worker integration in `task.created` + read API).
+> **Stato corrente.** Repository al commit **`79815764`** ("Use source quality in final answer gate"), Fase **8.7G** conclusa.
+> Fasi implementate: 8.1–8.4 (foundation, storage, claim ledger, compiler + Final Answer Gate + first `published_answers`), 8.5 (lifecycle + source loss + propagator), 8.6 minima (read API lifecycle e source-loss), 8.7A–F (Source Quality Evaluator append-only + worker integration in `task.created` + read API), **8.7G (Source Quality consumata dal Final Answer Gate, policy P1+P3+P4, migration `0008_coverage_gap_source_quality.sql`)**.
 > Per lo stato di dettaglio fase-per-fase, l'elenco completo degli endpoint, la pipeline aggiornata e i debiti tecnici, vedi [`PROJECT_STATE.md`](PROJECT_STATE.md).
 >
 > Le sezioni sotto descrivono lo stato della Fase 8.4 al momento della sua chiusura e sono **storiche**: hanno valore di documentazione architetturale del nucleo evidence-gated minimo, ma NON riflettono lo stato corrente del repository. Le fasi successive (8.5, 8.6, 8.7) NON sono qui documentate; vedi `PROJECT_STATE.md`.
@@ -11,12 +11,12 @@ Piattaforma multi-AI **evidence-first** ed **evidence-gated**. Il sistema è pro
 Disponibile localmente:
 - Postgres 16, Redis 7
 - API HTTP (FastAPI) con `health`, `projects`, `tasks`, `audit`, `documents`, `claims`, `answers`, lifecycle/source-loss read API (8.6), source quality read API (8.7F)
-- Worker Redis Streams single-consumer, FK-safe, idempotente, resume-safe, con pipeline 8.4 + step Source Quality (8.7E) prima del compiler
+- Worker Redis Streams single-consumer, FK-safe, idempotente, resume-safe, con pipeline 8.4 + step Source Quality (8.7E) prima del compiler e Source Quality consumata dal Final Answer Gate (8.7G)
 - Web Next.js minimale (home + `/diagnostic`)
 - Storage filesystem deduplicato content-addressed con upsert concorrenza-safe
 - Audit chain hash-linked, append-only, verificabile end-to-end
 
-In 8.4 i task con documenti e claim verificati raggiungono lo stato terminale `published`, con un `published_answers` v1 e un `final_gate_reports` `approved`. I task con documenti ma senza claim verificati raggiungono lo stato terminale `analyzed_partial` con un `final_gate_reports` `rejected` e l'evento audit `task.publication_held`. La sequenza audit con documenti è stata estesa in 8.7E con `task.source_quality_assessed` tra `task.analyzed_partial` e `task.compiling`: vedi `PROJECT_STATE.md` per la sequenza aggiornata.
+In 8.4 i task con documenti e claim verificati raggiungevano lo stato terminale `published`, con un `published_answers` v1 e un `final_gate_reports` `approved` (`reason_code='all_spans_verified'`). I task con documenti ma senza claim verificati raggiungevano `analyzed_partial` con un `final_gate_reports` `rejected` e l'evento audit `task.publication_held`. La sequenza audit è stata estesa in 8.7E con `task.source_quality_assessed` tra `task.analyzed_partial` e `task.compiling`. **In 8.7G il Final Answer Gate consulta `source_quality_assessments` come terzo asse decisionale**: con il mock evaluator attuale (che scrive `overall_quality='unknown'` e `contradiction_status='unchecked'`), il `reason_code` di default per task approved è ora **`all_spans_verified_with_warnings`**, e ogni task verified-backed accumula un `coverage_gap_statements` di kind `source_quality_warning` per span. Vedi `PROJECT_STATE.md` per la sequenza aggiornata e per i nuovi branch decisionali del Gate.
 
 **Renderer esterni Markdown/HTML/PDF/DOCX/JSON-LD restano fuori scope per MVP-0.** Il nucleo evidence-gated produce `draft_final_answers`, `final_answer_spans` e `published_answers` con `summary_text` testuale e `content_hash`, ma non emette artefatti esportabili in formati di rendering. Gli endpoint answers sono read-only e restituiscono JSON normalizzato.
 
@@ -24,7 +24,7 @@ In 8.4 i task con documenti e claim verificati raggiungono lo stato terminale `p
 
 ## Scope MVP-0 (sintesi)
 
-Incluso (oggi, post-8.7F):
+Incluso (oggi, post-8.7G):
 - Closed Corpus, Postgres + Redis + filesystem locale.
 - Audit chain hash-linked (append-only, verificabile).
 - `event_processing_records` con idempotenza per consumer.
@@ -33,21 +33,24 @@ Incluso (oggi, post-8.7F):
 - Document upload reale `.txt`/`.md` con chunking deterministico ed `evidence_spans` minimali.
 - **Claim Ledger append-only** con extractor mock-driven e CVE-lite mock-driven.
 - **Compiler mock-driven** che produce `draft_final_answers` v1 con `final_answer_spans` 1:1 sui claim `verified_fact`.
-- **Final Answer Gate mock-driven** che decide `approved`/`rejected`, scrive `final_gate_reports` (append-only) e, su approved, inserisce `published_answers` v1 con `status='published'`.
+- **Final Answer Gate mock-driven**: decide `approved`/`rejected`, scrive `final_gate_reports` (append-only) e, su approved, inserisce `published_answers` v1 con `status='published'`. In 8.7G consulta `source_quality_assessments` per applicare la policy P1+P3+P4 (block su `unsuitable`/`contradicted_by_stronger_source`/`conflicting_sources`; warning su `weak`/`unknown`/`unchecked`/missing).
 - **Lifecycle e source loss** (8.5): withdrawal asincrona, source loss event/propagation append-only, due API producer.
 - **Read API 8.6** su lifecycle events e source-loss events/propagation/task-listing (read-only end-to-end).
 - **Source Quality 8.7**: tabella `source_quality_assessments` append-only, mock evaluator deterministic, orchestrator chiamato in `task.created` dopo `analyzed_partial` (SAVEPOINT-protected, audit aggregato `task.source_quality_assessed`), due endpoint read 8.7F.
+- **Source Quality consumata dal Gate (8.7G)**: migration `0008_coverage_gap_source_quality.sql` estende `coverage_gap_statements.kind` con `source_quality_block` e `source_quality_warning`; il Gate emette i nuovi gap e i nuovi reason_code `source_quality_block` (rejected) e `all_spans_verified_with_warnings` (approved).
 - Coerenza referenziale stretta a livello DB tra task ↔ draft ↔ gate ↔ published via UNIQUE composite e FK composite.
 
 Escluso (rinviato a fasi successive — vedi `PHASE_8_7_PLAN.md` §13 per la roadmap anti-allucinazione):
 - Provider AI reali, Verified Web Mode, Hybrid Mode, consensus engine.
-- Source Quality Gate (8.7G): gli assessment esistono ma il Final Answer Gate NON li consuma ancora.
 - Contradiction detector reale (8.8C), Claim Entailment Checker (8.8A), Citation-to-Claim Validator (8.8B), Final Answer Sentence Gate (8.8D), Anti-Hallucination Report API (8.8E), External Verification / Web-RAG (8.9), Multi-agent consensus + adversarial review reale (9.0).
+- Realistic flow test end-to-end che attivi i branch source_quality_block e source_quality_warning con seed non-mock (8.7H).
 - Renderer e/o export Markdown/HTML/PDF/DOCX/JSON-LD.
 - PDF/OCR, vector store cloud, S3/GCS/Azure.
 - Human Review UI completa, retention/eval/export jobs.
-- RBAC reale e redaction dei JSONB esposti dagli endpoint read.
-- Retention reale distruttiva (`0008_*` futura).
+- RBAC reale e redaction dei JSONB esposti dagli endpoint read e dei `details` dei `coverage_gap_statements` source_quality.
+- Retention reale distruttiva (`0009_*` futura; il numero `0008` è ora occupato da `coverage_gap_source_quality`).
+- Backfill source quality per task pre-8.7E.
+- Recompile/draft v2 dopo `source_quality_block`.
 
 ---
 
@@ -67,81 +70,67 @@ Per 8.4 vedi la sezione storica più sotto. Per 8.5, 8.6, 8.7 vedi [`PROJECT_STA
 
 ## Fase 8.4 — Compiler, Final Answer Gate, primo `published_answers` (sezione storica)
 
-> Le righe sotto descrivono lo stato al commit di chiusura 8.4 e restano valide per il nucleo 8.4. Le fasi successive (8.5/8.6/8.7) hanno aggiunto step alla pipeline (in particolare `task.source_quality_assessed` in 8.7E tra `task.analyzed_partial` e `task.compiling`) e non sono qui documentate. Vedi `PROJECT_STATE.md` per la pipeline corrente.
+> Le righe sotto descrivono lo stato al commit di chiusura 8.4 e restano valide per il nucleo 8.4. Le fasi successive (8.5/8.6/8.7) hanno aggiunto step alla pipeline (in particolare `task.source_quality_assessed` in 8.7E tra `task.analyzed_partial` e `task.compiling`) e branch decisionali al Gate (in 8.7G, vedi nota più sotto). Vedi `PROJECT_STATE.md` per la pipeline e le decisioni correnti.
 
 ### Cosa cambia in 8.4
 
 - **Migration `0005_answers_gate.sql` applicata.** Introduce `agent_runs`, `agent_outputs` (placeholder, vuota in 8.4), `truncation_events` (placeholder, vuota in 8.4), `continuation_attempts` (placeholder, vuota in 8.4), `coverage_gap_statements`, `draft_final_answers`, `final_answer_spans`, `final_answer_span_claim_links`, `final_gate_reports`, `published_answers`. Installa il trigger `lc_block_delete_if_published` (rinviato da 0004). Nessuna modifica a 0001, 0002, 0003, 0004.
-- **`task_masters.status` ricreato in modo difensivo.** 0005 esegue un `ALTER TABLE ... DROP CONSTRAINT task_masters_status_check` seguito da un `ADD CONSTRAINT` con lo stesso codominio già accettato in 0003: `created`, `ingesting`, `analyzing`, `verifying`, `compiling`, `published`, `blocked`, `failed`, `cancelled`, `archived`, `analyzed_partial`. **Non viene introdotto alcuno status `publication_held`**: gli stati `compiling` e `published` esistevano già nel CHECK precedente e restano invariati.
-- **Append-only stretto sui due livelli answers/gate.** Trigger `final_answer_spans_append_only` su `final_answer_spans` e trigger `final_gate_reports_append_only` su `final_gate_reports`, entrambi basati sul comune `reject_modify_append_only`. Nessuna riga di queste due tabelle viene mai mutata dopo l'INSERT.
-- **Coerenza referenziale stretta a livello DB.** `draft_final_answers` ha UNIQUE composito `(id, task_id)`. `final_gate_reports` ha UNIQUE composito `(id, task_id, draft_final_answer_id)` e FK composita `(draft_final_answer_id, task_id) → draft_final_answers(id, task_id)`. `published_answers` ha UNIQUE composito `(id, task_id)`, FK composita `(draft_final_answer_id, task_id) → draft_final_answers(id, task_id)` e FK composita `(final_gate_report_id, task_id, draft_final_answer_id) → final_gate_reports(id, task_id, draft_final_answer_id)`. Conseguenza: è impossibile a DB avere un gate report o un published answer il cui `task_id` non corrisponde al `task_id` del draft sottostante.
-- **Compiler mock-driven (`apps/worker/app/services/compiler.py`).** Deterministico, nessuna AI. `COMPILER_NAME="mvp0_compiler_v1"`, `COMPILER_VERSION="0.1.0"`. Per ogni task in `analyzed_partial` (o resuming da `compiling`) seleziona la **latest** `claim_ledger_entries` per ogni `claim_logical_id` filtrata a `state='verified_fact'`, ordinata per `(logical_claims.created_at, logical_claims.id)`. Costruisce `summary_text` deterministico concatenando `canonical_claim_text` con terminatore `\n`. Inserisce `draft_final_answers` v1, `final_answer_spans` 1:1 con i verified (offset coerenti), `final_answer_span_claim_links` con `link_role='primary_support'`. Tutti gli INSERT idempotenti via `ON CONFLICT DO NOTHING` sui vincoli UNIQUE dichiarati in 0005. `agent_outputs` non viene popolato in 8.4.
+- **`task_masters.status` ricreato in modo difensivo.** 0005 esegue un `ALTER TABLE ... DROP CONSTRAINT task_masters_status_check` seguito da un `ADD CONSTRAINT` con lo stesso codominio già accettato in 0003. **Non viene introdotto alcuno status `publication_held`**.
+- **Append-only stretto sui due livelli answers/gate.** Trigger `final_answer_spans_append_only` su `final_answer_spans` e trigger `final_gate_reports_append_only` su `final_gate_reports`, entrambi basati sul comune `reject_modify_append_only`.
+- **Coerenza referenziale stretta a livello DB.** UNIQUE composite e FK composite tra `draft_final_answers`, `final_gate_reports`, `published_answers`.
+- **Compiler mock-driven (`apps/worker/app/services/compiler.py`).** Deterministico, nessuna AI. `COMPILER_NAME="mvp0_compiler_v1"`, `COMPILER_VERSION="0.1.0"`.
 - **Final Answer Gate mock-driven (`apps/worker/app/services/final_answer_gate.py`).** Deterministico, nessuna AI. `GATE_NAME="mvp0_gate_v1"`, `GATE_VERSION="0.1.0"`. Regola di verifica corretta:
 
   > Uno span è verified-backed se e solo se esiste almeno un `final_answer_span_claim_links` tale che `link.claim_ledger_entry_id == latest_entry_id_for(claim_logical_id)` **e** `latest_entry_state_for(claim_logical_id) == 'verified_fact'`.
 
-  Non basta che l'ultima entry del claim sia `verified_fact`: il link deve puntare esattamente a quella entry. Un link a v1 candidate quando esiste v2 verified non è sufficiente. Tre branch decisionali:
-  - **Zero spans** (compiler non ha trovato `verified_fact`): `decision='rejected'`, `reason_code='no_verified_claims'`, una `coverage_gap_statements` con `kind='missing_evidence'`, `severity='block'`, `gap_key='no_verified_claims'`. Nessun `published_answers`.
+  Tre branch decisionali originari di 8.4:
+  - **Zero spans**: `decision='rejected'`, `reason_code='no_verified_claims'`, una `coverage_gap_statements` con `kind='missing_evidence'`, `severity='block'`, `gap_key='no_verified_claims'`. Nessun `published_answers`.
   - **Tutti gli spans verified-backed**: `decision='approved'`, `reason_code='all_spans_verified'`, `published_answers` v1 con `status='published'`, `content_hash = sha256(summary_text utf-8)`.
   - **Spans non verified-backed presenti**: `decision='rejected'`, `reason_code='unverified_spans_present'`, una `coverage_gap_statements` per ciascuno span scoperto con `kind='unverified_claim'`, `severity='block'`, `gap_key='span:<final_answer_span_id>'`. Nessun `published_answers`.
 
-  **Nota post-8.7F.** Il Final Answer Gate non è cambiato. Source Quality (8.7) NON è ancora consumata dal gate. L'integrazione decisionale è prevista in 8.7G.
-- **Worker single-consumer 8.4 (`apps/worker/app/consumers/task_created.py`).** La pipeline 8.3 (extractor + CVE-lite → `analyzed_partial`) è preservata. Dopo `task.analyzed_partial`, il consumer prosegue nello stesso evento verso compiler + gate. FK-safe sul caso task non visibile (preserva il comportamento 8.1d-patch1). Resume-safe: se entra con task in `compiling`, finalizza usando l'eventuale `final_gate_reports` preesistente; se non esiste, riesegue compiler + gate idempotentemente. Guardia finale `WORKER_PIPELINE_INCOMPLETE`: il consumer non chiama mai `mark_succeeded` lasciando un task in `compiling` senza `final_gate_reports`. **Nota post-8.7E.** Tra `task.analyzed_partial` e `task.compiling` è ora inserito lo step Source Quality (mock evaluator + audit aggregato `task.source_quality_assessed`, SAVEPOINT-protetto). Vedi `PROJECT_STATE.md` per la sequenza audit completa post-8.7E.
-- **Sequenza audit con documenti (approved scenario, originale 8.4).** Sulla chain del task, 13 eventi worker-side dopo `task.created`/`task.docs_attached` emessi dall'API:
-  1. `task.analyzing`
-  2. `task.docs_loaded`
-  3. `task.claims_extracted`
-  4. `task.claims_classified`
-  5. `task.claims_ledger_initialized`
-  6. `task.cve_lite_started`
-  7. `task.cve_lite_completed`
-  8. `task.analyzed_partial`
-  9. `task.compiling`
-  10. `task.draft_compiled`
-  11. `task.final_gate_started`
-  12. `task.final_gate_completed`
-  13. `task.published`
+  **Nota post-8.7G.** Il Final Answer Gate ora consulta `source_quality_assessments` come terzo asse decisionale. La regola di verifica 8.4 è invariata, ma vengono aggiunti due branch:
+  - **Approved con warning** (`reason_code='all_spans_verified_with_warnings'`): tutti gli span verified-backed, ma almeno uno presenta una source quality warning (latest `overall_quality ∈ {weak, unknown}`, `contradiction_status='unchecked'`, o latest mancante). Il `published_answers` v1 viene comunque inserito; il warning è solo un gap `kind='source_quality_warning'`, `severity='warn'`.
+  - **Rejected per source quality** (`reason_code='source_quality_block'`): tutti gli span verified-backed, ma almeno uno presenta una source quality block (latest `overall_quality='unsuitable'` o `contradiction_status ∈ {contradicted_by_stronger_source, conflicting_sources}`). Un gap `kind='source_quality_block'`, `severity='block'` per ogni span bloccato. Nessun `published_answers`.
 
-  In 8.7E la sequenza diventa di 14 eventi con `task.source_quality_assessed` inserito tra `task.analyzed_partial` e `task.compiling`. Vedi `PROJECT_STATE.md`.
-- **Sequenza audit con documenti (rejected zero-verified scenario, originale 8.4).** Identica fino a `task.final_gate_completed`, poi:
-  - 13. `task.publication_held`
+  Priorità: CVE-lite > Source Quality. Uno span non verified-backed produce sempre `unverified_spans_present`, indipendentemente dalla qualità delle fonti. Vedi `PROJECT_STATE.md` per la tabella completa dei branch e dei reason_code.
+- **Worker single-consumer 8.4 (`apps/worker/app/consumers/task_created.py`).** La pipeline 8.3 (extractor + CVE-lite → `analyzed_partial`) è preservata. Dopo `task.analyzed_partial`, il consumer prosegue nello stesso evento verso compiler + gate. FK-safe sul caso task non visibile (preserva il comportamento 8.1d-patch1). Resume-safe. Guardia finale `WORKER_PIPELINE_INCOMPLETE`. **Nota post-8.7E.** Tra `task.analyzed_partial` e `task.compiling` è inserito lo step Source Quality (mock evaluator + audit aggregato `task.source_quality_assessed`, SAVEPOINT-protetto). **Nota post-8.7G.** Il consumer non è modificato in 8.7G: solo il Gate è esteso.
+- **Sequenza audit con documenti (approved scenario, originale 8.4).** Sulla chain del task, 13 eventi worker-side dopo `task.created`/`task.docs_attached`. In 8.7E la sequenza diventa di 14 eventi con `task.source_quality_assessed` inserito tra `task.analyzed_partial` e `task.compiling`. In 8.7G la sequenza è invariata rispetto a 8.7E; cambia solo il `reason_code` nel `final_gate_reports`. Vedi `PROJECT_STATE.md`.
+- **Sequenza audit con documenti (rejected scenario, originale 8.4).** Identica fino a `task.final_gate_completed`, poi `task.publication_held`. **`task.publication_held` è esclusivamente un evento audit, non uno stato di `task_masters.status`.** In 8.7G il rejected può ora avere anche `reason_code='source_quality_block'` (oltre a `no_verified_claims` e `unverified_spans_present`).
+- **Task senza documenti: comportamento invariato.** Sequenza worker: `task.analyzing`, `task.blocked`.
+- **Idempotenza completa.** Doppio delivery dello stesso `task.created` non duplica righe in nessuna tabella, comprese le nuove `coverage_gap_statements` di kind `source_quality_*` introdotte da 8.7G.
+- **Endpoint API read-only.**
+  - `GET /api/v1/tasks/{task_id}/draft`
+  - `GET /api/v1/tasks/{task_id}/final-gate-report` — invariato in 8.7G come signature; i `coverage_gap_statements` collegati possono ora avere `kind ∈ {source_quality_block, source_quality_warning}`.
+  - `GET /api/v1/tasks/{task_id}/published-answer`
+  - `GET /api/v1/published-answers/{published_answer_id}`
 
-  **`task.publication_held` è esclusivamente un evento audit, non uno stato di `task_masters.status`.** La task in DB resta `analyzed_partial`.
-- **Task senza documenti: comportamento invariato.** Sequenza worker: `task.analyzing`, `task.blocked`. Lo step Source Quality 8.7E NON viene eseguito (non c'è il path `_run_8_3_extract_and_verify`).
-- **Idempotenza completa.** Doppio delivery dello stesso `task.created` non duplica righe in nessuna delle nuove tabelle 8.4 (`agent_runs`, `draft_final_answers`, `final_answer_spans`, `final_answer_span_claim_links`, `final_gate_reports`, `coverage_gap_statements`, `published_answers`) né eventi audit. Tutti gli INSERT del worker usano `ON CONFLICT DO NOTHING` su vincoli UNIQUE espliciti dichiarati in 0005. In 8.7E l'idempotenza dello step source quality è garantita via key deterministica `task:{task_id}:span:{evidence_span_id}:v1` + partial UNIQUE indexes `sqa_*_idem_uq` in `0007_source_quality.sql`.
-- **Endpoint API read-only (nessun side effect).**
-  - `GET /api/v1/tasks/{task_id}/draft` — ultima `draft_final_answers` per task con `final_answer_spans` ordinati per `span_index`.
-  - `GET /api/v1/tasks/{task_id}/final-gate-report` — ultimo `final_gate_reports` per task con `coverage_gap_statements` collegati al draft.
-  - `GET /api/v1/tasks/{task_id}/published-answer` — ultimo `published_answers` per task.
-  - `GET /api/v1/published-answers/{published_answer_id}` — single-row view per id.
-
-  Errori normalizzati con envelope `{"error": {"code": "...", "message": "...", "details": {...}, ...}}`. `ErrorCode.NOT_PUBLISHED` **non esiste** in MVP-0: per il caso "task esiste ma non è ancora pubblicato" si restituisce `RESOURCE_NOT_FOUND` con `details.resource='published_answers'`. Per task inesistente si restituisce `RESOURCE_NOT_FOUND` con `details.resource='task_masters'`. Per draft/gate non ancora prodotti su task esistente si usa `details.resource='draft_final_answers'` o `'final_gate_reports'`.
+  Errori normalizzati con envelope `{"error": {"code": "...", "message": "...", "details": {...}, ...}}`. `ErrorCode.NOT_PUBLISHED` **non esiste** in MVP-0: per "task esiste ma non è ancora pubblicato" si restituisce `RESOURCE_NOT_FOUND` con `details.resource='published_answers'`.
 
   Gli endpoint aggiuntivi 8.5/8.6/8.7F sono elencati in `PROJECT_STATE.md`.
-- **Schemi shared aggiornati.** `packages/shared/evidencefirst_shared/schemas.py` espone `AgentRunRead`, `FinalAnswerSpanRead`, `FinalAnswerSpanClaimLinkRead`, `CoverageGapStatementRead`, `DraftFinalAnswerRead`, `DraftFinalAnswerWithSpansRead`, `FinalGateReportRead`, `PublishedAnswerRead`. In 8.5 sono stati aggiunti `PublishedAnswerLifecycleEventRead`, `SourceLossEventRead`, `SourceLossPropagationRecordRead`. In 8.7C sono stati aggiunti `SourceQualityAssessmentRead` e i codomini `SOURCE_QUALITY_*_VALUES`.
+- **Schemi shared aggiornati.** `packages/shared/evidencefirst_shared/schemas.py` espone i Read model 8.4 + 8.5 + 8.7C. Non sono stati aggiunti Read model nuovi in 8.7G.
 
-### Stati terminali del consumer in 8.4
+### Stati terminali del consumer in 8.4 (invariati in 8.7G)
 
 Il consumer considera la task terminale (e chiama `mark_succeeded` sulla `event_processing_records`) nei seguenti casi:
 - `blocked` — task senza documenti, branch invariato.
-- `published` — approved scenario completato.
-- `analyzed_partial` **e** esiste già un `final_gate_reports` per il task — rejected scenario completato (zero verified oppure unverified spans). In questo caso una redelivery viene loggata come `skipped_terminal`.
+- `published` — approved scenario completato (oggi con mock: `reason_code='all_spans_verified_with_warnings'`; in futuro con evaluator reale clean: `reason_code='all_spans_verified'`).
+- `analyzed_partial` **e** esiste già un `final_gate_reports` per il task — rejected scenario completato (zero verified oppure unverified spans oppure source_quality_block).
 
-Lo stato `analyzed_partial` **non è** terminale di per sé. Una task in `analyzed_partial` senza `final_gate_reports` è in attesa: il consumer la fa proseguire verso `compiling` su una redelivery o sulla prima delivery valida. Lo stato `compiling` **non è mai** terminale di propria iniziativa: la guardia `WORKER_PIPELINE_INCOMPLETE` blocca `mark_succeeded` se il pipeline lascia la task in `compiling` senza un `final_gate_reports`.
+Lo stato `analyzed_partial` **non è** terminale di per sé. Lo stato `compiling` **non è mai** terminale di propria iniziativa.
 
-### Cosa NON cambia in 8.4 (storico)
+### Cosa NON cambia in 8.4 (storico) — invariato anche in 8.7G
 
 - Nessun **renderer** Markdown/HTML/PDF/DOCX/JSON-LD.
 - Nessun **export** verso filesystem o storage cloud.
 - Nessun **provider AI esterno**. **Costo API = 0.** `PROVIDERS_ENABLED=mock`.
 - Nessun **Verified Web Mode**, **Hybrid Mode**, **consensus engine**, **contradiction detector** avanzato, **critical reviewer**.
-- Nessun **`published_answer_lifecycle_events`**, nessun **`source_loss_events`** con propagator. (Introdotti in 8.5.)
-- Nessun **stato `publication_held`** a livello DB. Solo evento audit `task.publication_held`.
-- Nessun **trigger di propagazione** su `published_answers` (la withdrawal/supersede di un published answer non è automatizzata in 8.4: i campi `withdrawn_at`, `superseded_at`, `superseded_by_id` esistono ma non sono guidati da pipeline). In 8.5 è arrivato il path withdrawal asincrono via API + consumer dedicato.
+- Nessuno **stato `publication_held`** a livello DB. Solo evento audit `task.publication_held`.
+- Nessun **trigger di propagazione** su `published_answers` (la withdrawal/supersede di un published answer non è automatizzata in 8.4: i campi `withdrawn_at`, `superseded_at`, `superseded_by_id` esistono ma non sono guidati da pipeline). In 8.5 è arrivato il path withdrawal asincrono via API + consumer dedicato. **8.7G non ha aggiunto nulla a questo path**: un task bloccato da `source_quality_block` non triggera automaticamente withdrawal su altri published answer.
+- Nessun **stato `claim_ledger_entries.state`** del tipo `source_quality_downgraded`. La policy M1 (`PHASE_8_7_PLAN.md §5.2`, solo metadata) resta attiva anche dopo 8.7G.
 
 ### Cosa è arrivato dopo
 
-`0006_lifecycle.sql` (8.5) ha introdotto `published_answer_lifecycle_events` (append-only) e `source_loss_events`/`source_loss_propagation_records` con il primo propagator che marca i claim impattati e le pubblicazioni dipendenti. La 8.6 minima ha aggiunto endpoint read-only su lifecycle e source-loss. La 8.7 ha introdotto `0007_source_quality.sql`, il mock Source Quality Evaluator (8.7D), l'orchestrator + integrazione in `task.created` con audit aggregato e SAVEPOINT (8.7E), e i due endpoint read 8.7F. La 8.7G consumerà gli assessment nel Final Answer Gate. Vedi `PROJECT_STATE.md` e `PHASE_8_7_PLAN.md` per i dettagli.
+`0006_lifecycle.sql` (8.5) ha introdotto `published_answer_lifecycle_events` e `source_loss_events`/`source_loss_propagation_records`. La 8.6 minima ha aggiunto endpoint read-only su lifecycle e source-loss. La 8.7B ha introdotto `0007_source_quality.sql`, la 8.7D il mock Source Quality Evaluator, la 8.7E l'orchestrator + integrazione in `task.created` con audit aggregato e SAVEPOINT, la 8.7F i due endpoint read. **La 8.7G ha introdotto `0008_coverage_gap_source_quality.sql` con i due nuovi kind `source_quality_block` e `source_quality_warning`, ed ha esteso `apps/worker/app/services/final_answer_gate.py` per consumare `source_quality_assessments` secondo la policy P1+P3+P4.** Vedi `PROJECT_STATE.md` e `PHASE_8_7_PLAN.md` per i dettagli.
 
 ---
 
@@ -168,17 +157,17 @@ make test
 | `make psql` / `make redis-cli` | shell |
 | `make clean` | distrugge i volumi |
 
-`make migrate` applica `0001`, `0002`, `0003`, `0004`, `0005`, `0006`, `0007` in ordine. Idempotente: rieseguirla è no-op.
+`make migrate` applica `0001`, `0002`, `0003`, `0004`, `0005`, `0006`, `0007`, `0008` in ordine. Idempotente: rieseguirla è no-op.
 
 ---
 
-## Smoke test 8.4 (approved scenario end-to-end)
+## Smoke test 8.4 (approved scenario end-to-end, aggiornato post-8.7G)
 
 ````bash
 # 1) Crea progetto
 PID=$(curl -s -X POST localhost:8000/api/v1/projects \
   -H 'content-type: application/json' \
-  -d '{"name":"smoke-84-demo"}' | jq -r .id)
+  -d '{"name":"smoke-87g-demo"}' | jq -r .id)
 
 # 2) Carica un documento .txt con frasi factual (cifre)
 DID=$(curl -s -X POST "localhost:8000/api/v1/projects/$PID/documents" \
@@ -188,7 +177,7 @@ DID=$(curl -s -X POST "localhost:8000/api/v1/projects/$PID/documents" \
 # 3) Crea il task con documento
 TID=$(curl -s -X POST localhost:8000/api/v1/tasks \
   -H 'content-type: application/json' \
-  -d "{\"project_id\":\"$PID\",\"objective\":\"smoke 8.4\",\"mode\":\"closed_corpus\",\"document_ids\":[\"$DID\"]}" \
+  -d "{\"project_id\":\"$PID\",\"objective\":\"smoke 8.7G\",\"mode\":\"closed_corpus\",\"document_ids\":[\"$DID\"]}" \
   | jq -r .id)
 
 # 4) Polling fino a stato terminale
@@ -198,7 +187,6 @@ while true; do
   case "$S" in
     published|blocked) break ;;
     analyzed_partial)
-      # Terminale solo se esiste un final_gate_reports per questo task.
       HAS_REPORT=$(curl -s -o /dev/null -w "%{http_code}" "localhost:8000/api/v1/tasks/$TID/final-gate-report")
       [ "$HAS_REPORT" = "200" ] && break
       ;;
@@ -206,13 +194,14 @@ while true; do
   sleep 1
 done
 
-# 5) Audit chain (post-8.7E approved: 14 eventi worker-side dopo task.created/task.docs_attached)
+# 5) Audit chain (post-8.7E approved: 14 eventi worker-side; 8.7G non aggiunge eventi)
 curl -s "localhost:8000/api/v1/tasks/$TID/audit?limit=500" | jq '.items[].event_type'
 
 # 6) Latest del ledger (claim verified visibili)
 curl -s "localhost:8000/api/v1/tasks/$TID/claims" | jq
 
-# 7) Endpoint answers 8.4
+# 7) Endpoint answers 8.4 (post-8.7G: reason_code default ora 'all_spans_verified_with_warnings'
+#    quando con mock attuale; coverage_gap_statements include source_quality_warning)
 curl -s "localhost:8000/api/v1/tasks/$TID/draft" | jq
 curl -s "localhost:8000/api/v1/tasks/$TID/final-gate-report" | jq
 curl -s "localhost:8000/api/v1/tasks/$TID/published-answer" | jq
@@ -225,29 +214,158 @@ curl -s "localhost:8000/api/v1/published-answers/$PAID" | jq
 curl -s "localhost:8000/api/v1/tasks/$TID/source-quality" | jq
 ````
 
-Smoke test rejected zero-verified: come sopra ma con un documento privo di frasi che superino CVE-lite (oppure forzando `quote_hash` non corrispondente in test). Il task termina in `analyzed_partial`; `GET /final-gate-report` restituisce `decision='rejected'`, `reason_code='no_verified_claims'`, una `coverage_gap_statements` con `kind='missing_evidence'`, `gap_key='no_verified_claims'`; `GET /published-answer` restituisce `404 RESOURCE_NOT_FOUND` con `details.resource='published_answers'`.
+Smoke test rejected zero-verified: come sopra ma con un documento privo di frasi che superino CVE-lite (oppure forzando `quote_hash` non corrispondente in test). Il task termina in `analyzed_partial`; `GET /final-gate-report` restituisce `decision='rejected'`, `reason_code='no_verified_claims'`, una `coverage_gap_statements` con `kind='missing_evidence'`, `gap_key='no_verified_claims'`; `GET /published-answer` restituisce `404 RESOURCE_NOT_FOUND` con `details.resource='published_answers'`. **Source Quality non viene consultata in questo branch (priorità CVE-lite).**
+
+Smoke test rejected source_quality_block: non riproducibile da smoke test end-to-end senza un evaluator reale o un seed manuale di `source_quality_assessments`. Coperto dai test worker `apps/worker/tests/test_final_answer_gate_source_quality.py` (scenari 5/6/7/8/10/11/12).
 
 ---
 
 ## Architettura runtime (sintesi)
 
-┌────────────┐  POST /tasks (commit-then-publish)
-│    API     │ ──────────────────────────────► Postgres
-│  (FastAPI) │                                  ▲
-│            │ ──xadd──► Redis Stream events:   │
-└────────────┘            task.created          │
-                                │               │
-                                ▼               │
-                         ┌──────────────┐       │
-                         │   Worker     |──────►┘
-                         │ single-csmr  │
-                         │ FK-safe      │
-                         │ resume-safe  │
-                         │ pipeline 8.4 │
-                         │ + 8.7E SQ    │
-                         └──────────────┘
+ARCHITETTURA RUNTIME — Evidence-First MVP-0
 
-Pipeline 8.4 nel worker con documenti, approved scenario (estesa con 8.7E source quality):
+┌──────────────────────────────────────────────────────────────┐
+│                         UTENTE / CLIENT                      │
+└───────────────────────────────┬──────────────────────────────┘
+                                │
+                                │ HTTP
+                                ▼
+
+┌──────────────────────────────────────────────────────────────┐
+│                         API FastAPI                          │
+│                                                              │
+│  Responsabilità:                                             │
+│  - crea progetti                                             │
+│  - carica documenti                                          │
+│  - crea task                                                 │
+│  - espone endpoint read-only                                 │
+│  - pubblica eventi Redis dopo commit DB                      │
+│                                                              │
+│  Pattern: commit-then-publish                                │
+└───────────────┬───────────────────────────────┬──────────────┘
+                │                               │
+                │ write/read                    │ XADD dopo commit
+                ▼                               ▼
+
+┌──────────────────────────────┐      ┌──────────────────────────────┐
+│          PostgreSQL          │      │          Redis Stream         │
+│                              │      │                              │
+│  Fonte di verità:            │      │  Eventi asincroni:           │
+│  - tenants / users           │      │  - task.created              │
+│  - projects / tasks          │      │  - source_loss.detected      │
+│  - documents / chunks        │      │  - withdrawal_requested      │
+│  - evidence_spans            │      │                              │
+│  - claim ledger              │      └──────────────┬───────────────┘
+│  - verification records                            │
+│  - source_quality_assessments                      │
+│  - draft / gate / published                        │
+│  - lifecycle / source loss                         │
+│  - audit_records hash-linked                       │
+└──────────────────────────────┘                     │
+                ▲                                     │
+                │                                     │ consume
+                │                                     ▼
+
+┌──────────────────────────────────────────────────────────────┐
+│                         WORKER                               │
+│                                                              │
+│  Caratteristiche:                                            │
+│  - single-consumer per stream                                │
+│  - FK-safe                                                   │
+│  - resume-safe                                               │
+│  - idempotente                                               │
+│  - usa transazioni DB                                        │
+│  - usa SAVEPOINT per step non bloccanti                      │
+│                                                              │
+│  Pipeline task.created:                                      │
+│                                                              │
+│  1. task.analyzing                                           │
+│  2. task.docs_loaded                                         │
+│  3. task.claims_extracted                                    │
+│  4. task.claims_classified                                   │
+│  5. task.claims_ledger_initialized                           │
+│  6. task.cve_lite_started                                    │
+│  7. task.cve_lite_completed                                  │
+│  8. task.analyzed_partial                                    │
+│                                                              │
+│  9. Source Quality step — 8.7E                               │
+│     - legge evidence_span collegati ai claim                 │
+│     - scrive source_quality_assessments                      │
+│     - emette audit task.source_quality_assessed              │
+│     - protetto da SAVEPOINT                                  │
+│                                                              │
+│  10. task.compiling                                          │
+│  11. task.draft_compiled                                     │
+│  12. task.final_gate_started                                 │
+│                                                              │
+│  13. Final Answer Gate — 8.4 + 8.7G                          │
+│      - verifica che gli span siano verified-backed           │
+│      - consulta source_quality_assessments                   │
+│      - applica policy P1 + P3 + P4                           │
+│      - può approvare, approvare con warning, o bloccare      │
+│                                                              │
+│  14. task.final_gate_completed                               │
+│  15. task.published                                          │
+│      oppure task.publication_held                            │
+└──────────────────────────────┬───────────────────────────────┘
+                               │
+                               │ write/read
+                               ▼
+
+┌──────────────────────────────────────────────────────────────┐
+│                         PostgreSQL                           │
+│                                                              │
+│  Il worker aggiorna solo tramite servizi controllati:        │
+│                                                              │
+│  - Claim Ledger append-only                                  │
+│  - Verification records                                      │
+│  - Source Quality append-only                                │
+│  - Draft final answer                                        │
+│  - Final gate report                                         │
+│  - Coverage gap statements                                   │
+│  - Published answer                                          │
+│  - Audit chain                                               │
+└──────────────────────────────────────────────────────────────┘
+
+VERSIONE SINTETICA RUNTIME
+
+Client
+  │
+  ▼
+API FastAPI
+  │
+  ├──► PostgreSQL
+  │       - task
+  │       - documenti
+  │       - evidenze
+  │       - claim ledger
+  │       - source quality
+  │       - gate report
+  │       - published answer
+  │       - audit chain
+  │
+  └──► Redis Stream
+          task.created
+              │
+              ▼
+        Worker
+          │
+          ├── Extractor
+          ├── CVE-lite verifier
+          ├── Claim Ledger
+          ├── Source Quality Evaluator     ← 8.7E
+          ├── Compiler
+          └── Final Answer Gate
+                ├── verified-backed check  ← 8.4
+                └── source quality policy  ← 8.7G
+                      │
+                      ├── approved
+                      ├── approved with warnings
+                      └── rejected / publication held
+
+
+
+Pipeline 8.4 + 8.7E + 8.7G nel worker con documenti, approved scenario (mock attuale → warning path):
 
 task.created event
 │
@@ -262,12 +380,12 @@ load chunks/spans                    audit task.docs_loaded
 │
 ▼
 extractor mock-driven                audit task.claims_extracted
-audit task.claims_classified
-audit task.claims_ledger_initialized
+                                     audit task.claims_classified
+                                     audit task.claims_ledger_initialized
 │
 ▼
 CVE-lite mock-driven                 audit task.cve_lite_started
-audit task.cve_lite_completed
+                                     audit task.cve_lite_completed
 │
 ▼
 analyzing → analyzed_partial         audit task.analyzed_partial
@@ -282,29 +400,58 @@ analyzed_partial → compiling         audit task.compiling
 compiler mock-driven                 audit task.draft_compiled
 │
 ▼
-Final Answer Gate                    audit task.final_gate_started
-audit task.final_gate_completed
+[8.7G] Final Answer Gate             audit task.final_gate_started
+       + Source Quality consultation audit task.final_gate_completed
 │
-├── approved
-│     └─► compiling → published  audit task.published
+├── approved (clean, evaluator reale)
+│     └─► compiling → published          audit task.published
 │         + published_answers v1
+│         + reason_code='all_spans_verified'
 │
-└── rejected
-└─► compiling → analyzed_partial  audit task.publication_held
-+ final_gate_reports rejected
-(NO published_answers)
+├── approved with warnings (default oggi con mock)
+│     └─► compiling → published          audit task.published
+│         + published_answers v1
+│         + reason_code='all_spans_verified_with_warnings'
+│         + coverage_gap_statements kind='source_quality_warning' per span
+│
+├── rejected unverified
+│     └─► compiling → analyzed_partial   audit task.publication_held
+│         + final_gate_reports rejected
+│         + reason_code='unverified_spans_present' (priorità CVE-lite)
+│         + coverage_gap_statements kind='unverified_claim'
+│         (NO published_answers)
+│
+├── rejected source_quality_block (nuovo branch 8.7G; oggi mai attivato con mock)
+│     └─► compiling → analyzed_partial   audit task.publication_held
+│         + final_gate_reports rejected
+│         + reason_code='source_quality_block'
+│         + coverage_gap_statements kind='source_quality_block'
+│         (NO published_answers)
+│
+└── rejected zero verified
+      └─► compiling → analyzed_partial   audit task.publication_held
+          + final_gate_reports rejected
+          + reason_code='no_verified_claims'
+          + coverage_gap_statements kind='missing_evidence'
+          (NO published_answers)
 │
 ▼
 mark_succeeded   (solo se stato terminale coerente:
-blocked | published | analyzed_partial+gate_report)
+                  blocked | published | analyzed_partial+gate_report)
 
 Note 8.7E:
-- Lo step source quality è SAVEPOINT-protected: un fallimento NON aborta la transazione del consumer e NON blocca 8.4. L'audit `task.source_quality_assessed` viene comunque emesso con `status='failed'`.
-- Sui resume da `compiling` lo step source quality NON viene re-eseguito; il consumer entra direttamente in `_run_8_4_compile_and_gate`.
+- Lo step source quality è SAVEPOINT-protected: un fallimento NON aborta la transazione del consumer e NON blocca 8.4.
+- Sui resume da `compiling` lo step source quality NON viene re-eseguito.
+
+Note 8.7G:
+- Il Gate consulta `source_quality_assessments` come read-only (zero mutazioni su quella tabella).
+- Priorità: CVE-lite > Source Quality. Uno span non verified-backed produce `unverified_spans_present` indipendentemente dalla qualità delle fonti.
+- Con il mock attuale (`overall_quality='unknown'` + `contradiction_status='unchecked'`), il branch attivo per task verified-backed è "approved with warnings".
+- Il branch "rejected source_quality_block" si attiverà solo con un evaluator reale che produca `unsuitable`, `contradicted_by_stronger_source` o `conflicting_sources`.
 
 Resume scenario (consumer entra con task già in `compiling`):
 - se esiste `final_gate_reports`: finalizza usandolo (drive a `published` se approved, a `analyzed_partial` con `task.publication_held` se rejected).
-- se non esiste: riesegue compiler + gate idempotentemente; gli audit di stato già emessi (`task.compiling`, `task.source_quality_assessed`) non vengono ri-emessi grazie alle guardie status-based degli `UPDATE` su `task_masters` e al fatto che lo step 8.7E vive nel fresh-run path.
+- se non esiste: riesegue compiler + gate idempotentemente (compreso lo step 8.7G di consultazione source quality).
 
 ---
 
@@ -319,3 +466,4 @@ Resume scenario (consumer entra con task già in `compiling`):
 - [`docs/migration_plan.md`](docs/migration_plan.md)
 - [`PROJECT_STATE.md`](PROJECT_STATE.md)
 - [`PHASE_8_7_PLAN.md`](PHASE_8_7_PLAN.md)
+- [`PHASE_8_7G_PRE.md`](PHASE_8_7G_PRE.md)
