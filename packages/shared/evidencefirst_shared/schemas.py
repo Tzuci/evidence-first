@@ -603,3 +603,139 @@ class SourceQualityAssessmentRead(BaseModel):
     idempotency_key: str
     payload: dict[str, Any]
     created_at: _dt.datetime
+
+
+# ---------------------------------------------------------------------------
+# Claim Entailment (Phase 8.8A — Block SCHEMA, Shared schemas)
+# ---------------------------------------------------------------------------
+#
+# These types describe the claim_entailment_checks table introduced by
+# migration 0009_claim_entailment_checks.sql. The DB remains the source of
+# truth for every constraint (CHECK enum on verdict, CHECK range on
+# confidence, CHECK on version_no, composite FK against
+# claim_ledger_entries(id, claim_logical_id), UNIQUE on
+# (claim_ledger_entry_id, evidence_span_id, version_no), UNIQUE on
+# (claim_ledger_entry_id, evidence_span_id, idempotency_key), append-only
+# trigger, FK ON DELETE RESTRICT).
+#
+# Semantic invariants — read carefully before extending or consuming these
+# types (see PHASE_8_8A_PRE.md §3, §4). These boundaries are NOT the same
+# as those of Source Quality and MUST NOT be conflated:
+#
+#   - claim entailment ≠ claim correctness.
+#     A verdict of 'entailed' means the quote supports the claim, NOT that
+#     the claim is true in the world.
+#
+#   - claim entailment ≠ evidence support.
+#     A claim_evidence_links row is a structural link; this table evaluates
+#     whether the link is semantically justified by the quote.
+#
+#   - claim entailment ≠ CVE-lite verification.
+#     CVE-lite (verification_records, check_kind='cve_lite') checks that
+#     the quote is textually present in the document chunk and that the
+#     quote_hash matches. Claim entailment answers a separate question:
+#     given that the quote is present, does the quote IMPLY the claim?
+#
+#   - claim entailment ≠ source quality.
+#     SourceQualityAssessmentRead judges the SOURCE that hosts the quote
+#     (authority, freshness, independence). This Read model judges the
+#     RELATION between the claim and the quote. An 'entailed' verdict
+#     with overall_quality='unsuitable' is a real and distinguishable
+#     situation; the two axes are orthogonal and consumed separately by
+#     the Final Answer Gate.
+#
+#   - claim entailment ≠ contradiction detection.
+#     A 'contradicted' verdict here is a LOCAL signal on a single
+#     (claim, evidence_span) pair. Cross-source contradictions belong to
+#     a future Contradiction Detector (Phase 8.8C) and are NOT this
+#     table's responsibility.
+#
+# This is the FIRST shared schemas block for Claim Entailment. No Create
+# model is introduced here on purpose: the producer side (mock entailment
+# checker service in 8.8A-CODE) does not yet exist, and no API is yet
+# exposed. A future block may add ClaimEntailmentCheckCreate when (and
+# only when) there is a real consumer for it.
+
+# --- Codomain constants ----------------------------------------------------
+# Mirror exactly the CHECK constraint cec_verdict_chk in
+# migrations/0009_claim_entailment_checks.sql. Any change to the DB
+# codomain MUST also be reflected here.
+#
+# Note on naming: this tuple is named SOURCE_ENTAILMENT_VERDICT_VALUES to
+# match the public name fixed by the Phase 8.8A-SHARED specification. The
+# semantic content is claim ↔ quote entailment (see invariants above);
+# the prefix 'SOURCE_' refers to the evidence quote acting as the source
+# of entailment for the claim, NOT to source-quality concepts (which are
+# evaluated separately by SourceQualityAssessmentRead).
+
+SOURCE_ENTAILMENT_VERDICT_VALUES: tuple[str, ...] = (
+    "entailed",
+    "partially_supported",
+    "not_supported",
+    "contradicted",
+    "uncertain",
+)
+
+
+# --- Literal type alias ----------------------------------------------------
+# Strict alias for the entailment verdict. Used directly inside
+# ClaimEntailmentCheckRead.verdict (deliberately stricter than the Source
+# Quality Read model, which keeps ``str`` for its quality dimensions): the
+# verdict codomain is fixed by migration 0009 and is invariant for the
+# 8.8A phase.
+
+ClaimEntailmentVerdict = Literal[
+    "entailed",
+    "partially_supported",
+    "not_supported",
+    "contradicted",
+    "uncertain",
+]
+
+
+# --- Read model ------------------------------------------------------------
+class ClaimEntailmentCheckRead(BaseModel):
+    """Single claim_entailment_checks row.
+
+    Append-only by trigger. Each row records one semantic-entailment
+    judgement for the pair (claim_ledger_entry_id, evidence_span_id), at
+    a given version_no.
+
+    Semantic boundary (see PHASE_8_8A_PRE.md §3, §4):
+      - 'entailed':              the quote semantically entails (or is
+                                  equivalent to) the claim.
+      - 'partially_supported':   the quote supports part of the claim but
+                                  not all of it.
+      - 'not_supported':         the quote does not entail the claim and
+                                  does not contradict it.
+      - 'contradicted':          the quote directly contradicts the claim
+                                  on a single (claim, quote) pair; cross-
+                                  source contradictions are out of scope.
+      - 'uncertain':             the checker cannot decide.
+
+    confidence is an internal score in [0.0, 1.0] (or NULL); it is
+    NEVER intended as a single-number truth score and MUST NOT be
+    consumed by the Final Answer Gate as a unique decision key.
+
+    claim_logical_id is denormalized to match the composite FK on the
+    underlying table (cec_entry_logical_consistency); it MUST equal the
+    claim_logical_id of the referenced claim_ledger_entry row.
+    """
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    project_id: uuid.UUID | None
+    task_id: uuid.UUID
+    claim_logical_id: uuid.UUID
+    claim_ledger_entry_id: uuid.UUID
+    evidence_span_id: uuid.UUID
+    version_no: int
+    verdict: ClaimEntailmentVerdict
+    confidence: float | None
+    checker_name: str
+    checker_version: str
+    policy_name: str
+    policy_version: str
+    idempotency_key: str
+    rationale: str | None
+    payload: dict[str, Any]
+    created_at: _dt.datetime
