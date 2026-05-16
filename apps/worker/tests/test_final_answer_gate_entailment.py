@@ -1,54 +1,65 @@
-"""Worker-level tests for the Source Quality integration in
-apps/worker/app/services/final_answer_gate.py (Phase 8.7G).
+"""Worker-level tests for the Claim Entailment integration in
+apps/worker/app/services/final_answer_gate.py (Phase 8.8A-GATE-CODE).
 
-Coverage map (per the block 8.7G-2 prompt):
+Coverage map (per the block 8.8A-GATE-CODE-B prompt §3):
 
-  1.  test_unknown_quality_produces_warning_keeps_approved
-  2.  test_missing_assessment_produces_warning_keeps_approved
-  3.  test_weak_quality_produces_warning_keeps_approved
-  4.  test_unchecked_contradiction_produces_warning_keeps_approved
-  5.  test_unsuitable_quality_produces_block_rejects_task
-  6.  test_contradicted_by_stronger_source_produces_block
-  7.  test_conflicting_sources_produces_block
-  8.  test_latest_version_wins_block_after_weak
-  9.  test_latest_version_wins_clean_after_unsuitable
-  10. test_latest_version_wins_block_after_unknown
-  11. test_multiple_evidence_spans_one_block_rejects
-  12. test_cve_priority_unverified_takes_precedence_over_source_quality
-  13. test_idempotent_on_redelivery_no_duplicate_gaps
+   1. test_contradicted_blocks_publication
+   2. test_not_supported_is_warning_not_block
+   3. test_partially_supported_is_warning
+   4. test_uncertain_is_warning
+   5. test_missing_check_is_warning
+   6. test_entailed_clean_if_no_source_quality_warning
+   7. test_cve_lite_unverified_has_priority_over_entailment_block
+   8. test_entailment_block_has_priority_over_source_quality_block
+   9. test_source_quality_block_still_works_when_no_entailment_block
+  10. test_source_quality_warning_and_entailment_warning_coexist
+  11. test_latest_version_wins
+  12. test_no_mutation_of_claim_entailment_checks
+  13. test_final_gate_report_payload_contains_entailment_summary
 
-The CVE-lite priority test (#12) is the architectural invariant of
-PHASE_8_7G_PRE.md §8.4: when a span is not verified-backed, the Gate
-must emit 'unverified_spans_present' and NOT consult Source Quality.
+The CVE-lite > Entailment priority test (#7) and the
+Entailment > Source Quality priority test (#8) are the architectural
+invariants of PHASE_8_8A_GATE_PRE.md §7: when a span is not
+verified-backed, the Gate must emit 'unverified_spans_present' and NOT
+consult claim_entailment_checks; when entailment blocks AND source
+quality also blocks, the Gate's reason_code must be 'entailment_block'
+(both gap kinds may be emitted for audit completeness).
 
-Test #13 covers idempotency: a second invocation of run_final_answer_gate
-on the same draft must not duplicate gap rows, must not duplicate the
-gate report, and must not duplicate the published answer.
+Test #12 covers idempotency: a second invocation of run_final_answer_gate
+on the same draft must not mutate claim_entailment_checks (read-only
+contract per PHASE_8_8A_GATE_PRE.md §10.6).
 
-Phase 8.7G invariants verified across all tests:
-  - The Gate does NOT mutate source_quality_assessments (read-only
-    SELECT). Tested explicitly via pre/post snapshot in #1 and #5.
-  - The Gate does NOT mutate claim_ledger_entries or claim_lineage.
-  - The audit chain for the task remains valid after each Gate run.
-  - All gap rows use the deterministic gap_key format
-    f'span:{span_id}:source_quality_{block,warning}'.
+Phase 8.8A-GATE invariants verified across all tests:
+  - The Gate does NOT mutate claim_entailment_checks (read-only SELECT).
+    Tested explicitly via pre/post snapshot in #12.
+  - The Gate does NOT mutate claim_ledger_entries.
+  - The Gate does NOT mutate source_quality_assessments.
+  - All entailment gap rows use the deterministic gap_key format
+    f'span:{final_answer_span_id}:entailment_{block,warning}'.
+  - Reason code 'entailment_block' is emitted when ANY span has
+    verdict='contradicted' (latest version).
+  - Reason code 'all_spans_verified_with_warnings' is REUSED for
+    approved-with-warnings paths (no new reason code introduced
+    specifically for entailment warnings).
 
 Design notes:
   - Local helpers only (no imports from other test files), per the
-    block prompt.
+    block prompt §3.
   - DB-real tests against the worker's get_engine().
   - All ids/hashes are uuid.uuid4()-derived per invocation, so the
     file is safe to rerun.
   - We do NOT go through the task_created consumer for these unit-style
     tests: we seed the minimal claim+span topology directly and call
     run_final_answer_gate() on a hand-built draft. This is the same
-    approach used by test_source_quality_orchestrator.py for the
-    orchestrator.
-  - We also seed source_quality_assessments rows directly (not via the
-    mock evaluator) so we can drive the policy matrix with exact
-    overall_quality / contradiction_status values. The mock evaluator
-    only ever emits ('unknown','unchecked'), which the suite would
-    cover only in scenarios #1 and #4.
+    approach used by test_final_answer_gate_source_quality.py.
+  - We seed claim_entailment_checks rows directly (not via the mock
+    checker) so we can drive the policy matrix with exact verdict
+    values. The mock checker only ever emits 'entailed', 'not_supported'
+    or 'uncertain', so 'contradicted' / 'partially_supported' must be
+    seeded for the corresponding scenarios.
+  - We also seed source_quality_assessments rows directly when needed
+    (priority/coexistence tests) so the Source Quality axis can be
+    driven independently of the entailment axis.
 """
 from __future__ import annotations
 
@@ -135,7 +146,7 @@ def _seeded_dev(
                     RETURNING id
                     """
                 ),
-                {"t": tenant_id, "n": f"fag-sq-test-{uuid.uuid4()}"},
+                {"t": tenant_id, "n": f"fag-ent-test-{uuid.uuid4()}"},
             ).first()[0]
         )
     )
@@ -179,7 +190,7 @@ def _create_evidence_span(
     marker = uuid.uuid4().hex[:12]
     quote = f"quotable span {marker}"
     chunk_text = (
-        f"Final answer gate source quality test marker {marker}. "
+        f"Final answer gate entailment test marker {marker}. "
         f"This sentence contains the digit 7 and a {quote}."
     )
     content_hash_payload = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
@@ -344,7 +355,7 @@ def _create_evidence_span(
 
 
 # ---------------------------------------------------------------------------
-# seed: logical_claim + verified_fact entry + claim_evidence_link
+# seed: logical_claim + ledger entry + claim_evidence_link
 # ---------------------------------------------------------------------------
 def _create_logical_claim_with_verified_entry(
     conn: Connection,
@@ -520,7 +531,71 @@ def _create_draft_with_span(
 
 
 # ---------------------------------------------------------------------------
-# seed: source_quality_assessments (direct INSERT for policy testing)
+# seed: claim_entailment_checks (direct INSERT for policy testing)
+# ---------------------------------------------------------------------------
+def _seed_entailment_check(
+    conn: Connection,
+    *,
+    tenant_id: uuid.UUID,
+    project_id: uuid.UUID,
+    task_id: uuid.UUID,
+    claim_logical_id: uuid.UUID,
+    claim_ledger_entry_id: uuid.UUID,
+    evidence_span_id: uuid.UUID,
+    verdict: str,
+    version_no: int = 1,
+    confidence: float | None = 0.7,
+) -> uuid.UUID:
+    """INSERT a claim_entailment_checks row with the given verdict.
+
+    Bypasses the mock checker so tests can drive the policy matrix
+    with arbitrary verdict values including 'contradicted' and
+    'partially_supported' (which the MVP-0 mock checker never emits).
+    """
+    new_id = uuid.UUID(
+        str(
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO claim_entailment_checks (
+                      id, tenant_id, project_id, task_id,
+                      claim_logical_id, claim_ledger_entry_id, evidence_span_id,
+                      version_no, verdict, confidence,
+                      checker_name, checker_version,
+                      policy_name, policy_version,
+                      idempotency_key, rationale, payload
+                    ) VALUES (
+                      :id, :t, :p, :tid,
+                      :lc, :le, :es,
+                      :vn, :v, :conf,
+                      'test_seed_checker', '0.1.0',
+                      'test_seed_policy', '0.1.0',
+                      :ik, NULL, CAST('{}' AS JSONB)
+                    )
+                    RETURNING id
+                    """
+                ),
+                {
+                    "id": uuid.uuid4(),
+                    "t": tenant_id,
+                    "p": project_id,
+                    "tid": task_id,
+                    "lc": claim_logical_id,
+                    "le": claim_ledger_entry_id,
+                    "es": evidence_span_id,
+                    "vn": version_no,
+                    "v": verdict,
+                    "conf": confidence,
+                    "ik": f"test:{uuid.uuid4()}",
+                },
+            ).first()[0]
+        )
+    )
+    return new_id
+
+
+# ---------------------------------------------------------------------------
+# seed: source_quality_assessments (for priority/coexistence tests)
 # ---------------------------------------------------------------------------
 def _seed_source_quality_assessment(
     conn: Connection,
@@ -531,14 +606,12 @@ def _seed_source_quality_assessment(
     overall_quality: str,
     contradiction_status: str = "no_known_contradiction",
     version_no: int = 1,
-    relevance: str = "direct_support",
-    extract_quality: str = "exact_quote_match",
 ) -> uuid.UUID:
     """INSERT a source_quality_assessments row with the given dimensions.
 
-    Bypasses the mock evaluator so tests can drive the policy matrix
-    with arbitrary overall_quality / contradiction_status combinations.
-    All other dimensions default to safe codomain values.
+    Used by the priority/coexistence tests so the Source Quality axis
+    can be driven independently of the entailment axis. Defaults the
+    other dimensions to clean values.
     """
     new_id = uuid.UUID(
         str(
@@ -556,7 +629,7 @@ def _seed_source_quality_assessment(
                     ) VALUES (
                       :id, :t, :p, :es, :vn,
                       'user_document', 'unclear', 'unknown', 'unknown',
-                      'undated', :rel, :eq, :cs,
+                      'undated', 'direct_support', 'exact_quote_match', :cs,
                       :oq, 0.5,
                       'test_seed_evaluator', '0.1.0',
                       'test_seed_policy', '0.1.0',
@@ -571,8 +644,6 @@ def _seed_source_quality_assessment(
                     "p": project_id,
                     "es": evidence_span_id,
                     "vn": version_no,
-                    "rel": relevance,
-                    "eq": extract_quality,
                     "cs": contradiction_status,
                     "oq": overall_quality,
                     "ik": f"test:{uuid.uuid4()}",
@@ -581,67 +652,6 @@ def _seed_source_quality_assessment(
         )
     )
     return new_id
-
-
-# ---------------------------------------------------------------------------
-# seed: claim_entailment_checks (clean rows for Source Quality isolation)
-# ---------------------------------------------------------------------------
-def _seed_entailment_check_entailed(
-    conn: Connection,
-    *,
-    tenant_id: uuid.UUID,
-    project_id: uuid.UUID,
-    task_id: uuid.UUID,
-    claim_logical_id: uuid.UUID,
-    claim_ledger_entry_id: uuid.UUID,
-    evidence_span_id: uuid.UUID,
-    version_no: int = 1,
-) -> uuid.UUID:
-    """Seed a clean Claim Entailment row.
-
-    Source Quality gate tests are intentionally focused on the Source Quality
-    axis. After 8.8A-GATE-CODE, a missing entailment check correctly produces
-    an entailment_warning. For tests that need to isolate Source Quality
-    behavior, this helper seeds verdict='entailed' so Entailment is clean.
-    """
-    return uuid.UUID(
-        str(
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO claim_entailment_checks (
-                      id, tenant_id, project_id, task_id,
-                      claim_logical_id, claim_ledger_entry_id, evidence_span_id,
-                      version_no, verdict, confidence,
-                      checker_name, checker_version,
-                      policy_name, policy_version,
-                      idempotency_key, rationale, payload
-                    ) VALUES (
-                      :id, :t, :p, :tid,
-                      :lc, :le, :es,
-                      :vn, 'entailed', 0.8,
-                      'test_seed_checker', '0.1.0',
-                      'test_seed_policy', '0.1.0',
-                      :ik, 'seeded clean entailment for source quality test isolation',
-                      CAST('{}' AS JSONB)
-                    )
-                    RETURNING id
-                    """
-                ),
-                {
-                    "id": uuid.uuid4(),
-                    "t": tenant_id,
-                    "p": project_id,
-                    "tid": task_id,
-                    "lc": claim_logical_id,
-                    "le": claim_ledger_entry_id,
-                    "es": evidence_span_id,
-                    "vn": version_no,
-                    "ik": f"test:{uuid.uuid4()}",
-                },
-            ).first()[0]
-        )
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -734,16 +744,52 @@ def _fetch_published(
     return None if row is None else dict(row._mapping)
 
 
-def _count_sqa_for_span(
-    conn: Connection, *, evidence_span_id: uuid.UUID
+def _fetch_gate_report(
+    conn: Connection, *, task_id: uuid.UUID
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        text(
+            """
+            SELECT id, decision, reason_code, payload
+            FROM final_gate_reports
+            WHERE task_id = :tid
+            """
+        ),
+        {"tid": task_id},
+    ).first()
+    if row is None:
+        return None
+    m = dict(row._mapping)
+    if isinstance(m.get("payload"), str):
+        import json as _json
+        m["payload"] = _json.loads(m["payload"])
+    return m
+
+
+def _count_entailment_checks_for_task(
+    conn: Connection, *, task_id: uuid.UUID
 ) -> int:
     return int(
         conn.execute(
             text(
-                "SELECT COUNT(*) FROM source_quality_assessments "
-                "WHERE evidence_span_id = :tid"
+                "SELECT COUNT(*) FROM claim_entailment_checks "
+                "WHERE task_id = :tid"
             ),
-            {"tid": evidence_span_id},
+            {"tid": task_id},
+        ).scalar_one()
+    )
+
+
+def _count_ledger_entries_for_logical(
+    conn: Connection, *, claim_logical_id: uuid.UUID
+) -> int:
+    return int(
+        conn.execute(
+            text(
+                "SELECT COUNT(*) FROM claim_ledger_entries "
+                "WHERE claim_logical_id = :lc"
+            ),
+            {"lc": claim_logical_id},
         ).scalar_one()
     )
 
@@ -754,34 +800,15 @@ def _gaps_by_kind(
     return [g for g in gaps if str(g["kind"]) == kind]
 
 
-def _reason_codes_in_gap(gap: dict[str, Any]) -> list[str]:
-    """Extract the reason_code values from a source_quality_* gap's details."""
-    details = gap.get("details") or {}
-    reasons = details.get("reasons") or []
-    return [str(r.get("reason_code")) for r in reasons]
-
-
 # ===========================================================================
-# 1) overall_quality='unknown' produces a warning, decision stays approved.
-#    Mock evaluator default; also asserts the Gate does NOT mutate
-#    source_quality_assessments.
+# 1) verdict='contradicted' produces block, decision rejected, no published.
 # ===========================================================================
-def test_unknown_quality_produces_warning_keeps_approved():
+def test_contradicted_blocks_publication():
     _skip_if_db_unreachable()
     engine = get_engine()
     with engine.begin() as conn:
         ctx = _seed_task_with_one_verified_span(conn)
-        _seed_source_quality_assessment(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            evidence_span_id=ctx["evidence_span_id"],
-            overall_quality="unknown",
-            contradiction_status="unchecked",
-            version_no=1,
-        )
-
-        _seed_entailment_check_entailed(
+        _seed_entailment_check(
             conn,
             tenant_id=ctx["tenant_id"],
             project_id=ctx["project_id"],
@@ -789,213 +816,7 @@ def test_unknown_quality_produces_warning_keeps_approved():
             claim_logical_id=ctx["claim_logical_id"],
             claim_ledger_entry_id=ctx["claim_ledger_entry_id"],
             evidence_span_id=ctx["evidence_span_id"],
-        )
-
-    # Snapshot pre/post on source_quality_assessments for this span.
-    with engine.connect() as conn:
-        sqa_count_before = _count_sqa_for_span(
-            conn, evidence_span_id=ctx["evidence_span_id"]
-        )
-
-    with engine.begin() as conn:
-        outcome = run_final_answer_gate(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            task_id=ctx["task_id"],
-        )
-
-    assert outcome["decision"] == "approved"
-    assert outcome["reason_code"] == "all_spans_verified_with_warnings"
-    assert outcome["spans_total"] == 1
-    assert outcome["spans_verified"] == 1
-    assert outcome["spans_unverified"] == 0
-    assert outcome["published_answer_id"] is not None
-    assert outcome["coverage_gaps_emitted"] == 1
-
-    with engine.connect() as conn:
-        gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
-        sqa_count_after = _count_sqa_for_span(
-            conn, evidence_span_id=ctx["evidence_span_id"]
-        )
-        published = _fetch_published(conn, task_id=ctx["task_id"])
-
-    # The Gate must NEVER mutate source_quality_assessments.
-    assert sqa_count_before == sqa_count_after
-
-    # Exactly one warning gap.
-    warning_gaps = _gaps_by_kind(gaps, "source_quality_warning")
-    assert len(warning_gaps) == 1
-    assert _gaps_by_kind(gaps, "source_quality_block") == []
-    assert _gaps_by_kind(gaps, "unverified_claim") == []
-    assert _gaps_by_kind(gaps, "missing_evidence") == []
-
-    w = warning_gaps[0]
-    assert w["severity"] == "warn"
-    assert w["gap_key"] == (
-        f"span:{ctx['final_answer_span_id']}:source_quality_warning"
-    )
-    reasons = _reason_codes_in_gap(w)
-    # Two warning conditions match: overall_quality='unknown' and
-    # contradiction_status='unchecked'.
-    assert "source_quality_unknown" in reasons
-    assert "source_quality_contradiction_unchecked" in reasons
-
-    assert published is not None
-    assert str(published["status"]) == "published"
-
-
-# ===========================================================================
-# 2) latest assessment missing -> warning, decision stays approved.
-#    No source_quality_assessments row at all for the evidence_span.
-# ===========================================================================
-def test_missing_assessment_produces_warning_keeps_approved():
-    _skip_if_db_unreachable()
-    engine = get_engine()
-    with engine.begin() as conn:
-        ctx = _seed_task_with_one_verified_span(conn)
-        # NO _seed_source_quality_assessment call: the LEFT JOIN LATERAL
-        # in the Gate will return NULL for this evidence_span.
-
-    with engine.begin() as conn:
-        outcome = run_final_answer_gate(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            task_id=ctx["task_id"],
-        )
-
-    assert outcome["decision"] == "approved"
-    assert outcome["reason_code"] == "all_spans_verified_with_warnings"
-    assert outcome["published_answer_id"] is not None
-
-    with engine.connect() as conn:
-        gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
-
-    warning_gaps = _gaps_by_kind(gaps, "source_quality_warning")
-    assert len(warning_gaps) == 1
-    assert _gaps_by_kind(gaps, "source_quality_block") == []
-
-    reasons = _reason_codes_in_gap(warning_gaps[0])
-    assert "source_quality_missing_assessment" in reasons
-
-
-# ===========================================================================
-# 3) overall_quality='weak' -> warning, decision stays approved.
-# ===========================================================================
-def test_weak_quality_produces_warning_keeps_approved():
-    _skip_if_db_unreachable()
-    engine = get_engine()
-    with engine.begin() as conn:
-        ctx = _seed_task_with_one_verified_span(conn)
-        _seed_source_quality_assessment(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            evidence_span_id=ctx["evidence_span_id"],
-            overall_quality="weak",
-            contradiction_status="no_known_contradiction",
-            version_no=1,
-        )
-
-    with engine.begin() as conn:
-        outcome = run_final_answer_gate(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            task_id=ctx["task_id"],
-        )
-
-    assert outcome["decision"] == "approved"
-    assert outcome["reason_code"] == "all_spans_verified_with_warnings"
-    assert outcome["published_answer_id"] is not None
-
-    with engine.connect() as conn:
-        gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
-
-    warning_gaps = _gaps_by_kind(gaps, "source_quality_warning")
-    assert len(warning_gaps) == 1
-    assert _gaps_by_kind(gaps, "source_quality_block") == []
-
-    reasons = _reason_codes_in_gap(warning_gaps[0])
-    assert "source_quality_weak" in reasons
-    # no_known_contradiction is the clean contradiction status, so no
-    # contradiction warning should fire.
-    assert "source_quality_contradiction_unchecked" not in reasons
-
-
-# ===========================================================================
-# 4) contradiction_status='unchecked' -> warning, decision stays approved.
-# ===========================================================================
-def test_unchecked_contradiction_produces_warning_keeps_approved():
-    _skip_if_db_unreachable()
-    engine = get_engine()
-    with engine.begin() as conn:
-        ctx = _seed_task_with_one_verified_span(conn)
-        _seed_source_quality_assessment(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            evidence_span_id=ctx["evidence_span_id"],
-            # overall_quality='adequate' is clean on the OQ axis, so only
-            # the unchecked contradiction status fires the warning.
-            overall_quality="adequate",
-            contradiction_status="unchecked",
-            version_no=1,
-        )
-
-    with engine.begin() as conn:
-        outcome = run_final_answer_gate(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            task_id=ctx["task_id"],
-        )
-
-    assert outcome["decision"] == "approved"
-    assert outcome["reason_code"] == "all_spans_verified_with_warnings"
-
-    with engine.connect() as conn:
-        gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
-
-    warning_gaps = _gaps_by_kind(gaps, "source_quality_warning")
-    assert len(warning_gaps) == 1
-    reasons = _reason_codes_in_gap(warning_gaps[0])
-    assert reasons == ["source_quality_contradiction_unchecked"]
-
-
-# ===========================================================================
-# 5) overall_quality='unsuitable' -> block, decision rejected, no published.
-#    Also asserts that the Gate does NOT mutate source_quality_assessments.
-# ===========================================================================
-def test_unsuitable_quality_produces_block_rejects_task():
-    _skip_if_db_unreachable()
-    engine = get_engine()
-    with engine.begin() as conn:
-        ctx = _seed_task_with_one_verified_span(conn)
-        _seed_source_quality_assessment(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            evidence_span_id=ctx["evidence_span_id"],
-            overall_quality="unsuitable",
-            contradiction_status="no_known_contradiction",
-            version_no=1,
-        )
-
-        _seed_entailment_check_entailed(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            task_id=ctx["task_id"],
-            claim_logical_id=ctx["claim_logical_id"],
-            claim_ledger_entry_id=ctx["claim_ledger_entry_id"],
-            evidence_span_id=ctx["evidence_span_id"],
-        )
-
-    with engine.connect() as conn:
-        sqa_count_before = _count_sqa_for_span(
-            conn, evidence_span_id=ctx["evidence_span_id"]
+            verdict="contradicted",
         )
 
     with engine.begin() as conn:
@@ -1007,195 +828,46 @@ def test_unsuitable_quality_produces_block_rejects_task():
         )
 
     assert outcome["decision"] == "rejected"
-    assert outcome["reason_code"] == "source_quality_block"
+    assert outcome["reason_code"] == "entailment_block"
     assert outcome["spans_total"] == 1
     assert outcome["spans_verified"] == 1
     assert outcome["spans_unverified"] == 0
     assert outcome["published_answer_id"] is None
-    assert outcome["coverage_gaps_emitted"] == 1
 
     with engine.connect() as conn:
         gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
-        sqa_count_after = _count_sqa_for_span(
-            conn, evidence_span_id=ctx["evidence_span_id"]
-        )
         published = _fetch_published(conn, task_id=ctx["task_id"])
 
-    # The Gate must NEVER mutate source_quality_assessments.
-    assert sqa_count_before == sqa_count_after
-
-    block_gaps = _gaps_by_kind(gaps, "source_quality_block")
+    block_gaps = _gaps_by_kind(gaps, "entailment_block")
     assert len(block_gaps) == 1
-    assert _gaps_by_kind(gaps, "source_quality_warning") == []
-    assert _gaps_by_kind(gaps, "unverified_claim") == []
-
-    b = block_gaps[0]
-    assert b["severity"] == "block"
-    assert b["gap_key"] == (
-        f"span:{ctx['final_answer_span_id']}:source_quality_block"
+    assert block_gaps[0]["severity"] == "block"
+    assert block_gaps[0]["gap_key"] == (
+        f"span:{ctx['final_answer_span_id']}:entailment_block"
     )
-    reasons = _reason_codes_in_gap(b)
-    assert reasons == ["source_quality_unsuitable"]
+    # No source quality gap of either kind (no SQ row was seeded; but
+    # the Gate emits a source_quality_warning for missing assessment
+    # per 8.7G policy in the rejected-by-entailment branch — we accept
+    # either presence or absence of source_quality_warning, since this
+    # test focuses on the entailment axis).
+    # No CVE-lite gap.
+    assert _gaps_by_kind(gaps, "unverified_claim") == []
+    assert _gaps_by_kind(gaps, "missing_evidence") == []
+    # No source_quality_block (no SQ row with unsuitable was seeded).
+    assert _gaps_by_kind(gaps, "source_quality_block") == []
 
     # No published_answers v1 in the rejected branch.
     assert published is None
 
 
 # ===========================================================================
-# 6) contradiction_status='contradicted_by_stronger_source' -> block.
+# 2) verdict='not_supported' produces warning, decision stays approved.
 # ===========================================================================
-def test_contradicted_by_stronger_source_produces_block():
+def test_not_supported_is_warning_not_block():
     _skip_if_db_unreachable()
     engine = get_engine()
     with engine.begin() as conn:
         ctx = _seed_task_with_one_verified_span(conn)
-        _seed_source_quality_assessment(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            evidence_span_id=ctx["evidence_span_id"],
-            # overall_quality='adequate' is clean, so the block must come
-            # exclusively from the contradiction status.
-            overall_quality="adequate",
-            contradiction_status="contradicted_by_stronger_source",
-            version_no=1,
-        )
-
-    with engine.begin() as conn:
-        outcome = run_final_answer_gate(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            task_id=ctx["task_id"],
-        )
-
-    assert outcome["decision"] == "rejected"
-    assert outcome["reason_code"] == "source_quality_block"
-    assert outcome["published_answer_id"] is None
-
-    with engine.connect() as conn:
-        gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
-
-    block_gaps = _gaps_by_kind(gaps, "source_quality_block")
-    assert len(block_gaps) == 1
-    reasons = _reason_codes_in_gap(block_gaps[0])
-    assert reasons == ["source_quality_contradicted_by_stronger_source"]
-
-
-# ===========================================================================
-# 7) contradiction_status='conflicting_sources' -> block.
-# ===========================================================================
-def test_conflicting_sources_produces_block():
-    _skip_if_db_unreachable()
-    engine = get_engine()
-    with engine.begin() as conn:
-        ctx = _seed_task_with_one_verified_span(conn)
-        _seed_source_quality_assessment(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            evidence_span_id=ctx["evidence_span_id"],
-            overall_quality="adequate",
-            contradiction_status="conflicting_sources",
-            version_no=1,
-        )
-
-    with engine.begin() as conn:
-        outcome = run_final_answer_gate(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            task_id=ctx["task_id"],
-        )
-
-    assert outcome["decision"] == "rejected"
-    assert outcome["reason_code"] == "source_quality_block"
-
-    with engine.connect() as conn:
-        gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
-
-    block_gaps = _gaps_by_kind(gaps, "source_quality_block")
-    assert len(block_gaps) == 1
-    reasons = _reason_codes_in_gap(block_gaps[0])
-    assert reasons == ["source_quality_conflicting_sources"]
-
-
-# ===========================================================================
-# 8) Multiple assessments per evidence_span: latest version wins on block.
-#    v1='weak', v2='unsuitable' -> block.
-# ===========================================================================
-def test_latest_version_wins_block_after_weak():
-    _skip_if_db_unreachable()
-    engine = get_engine()
-    with engine.begin() as conn:
-        ctx = _seed_task_with_one_verified_span(conn)
-        _seed_source_quality_assessment(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            evidence_span_id=ctx["evidence_span_id"],
-            overall_quality="weak",
-            contradiction_status="no_known_contradiction",
-            version_no=1,
-        )
-        _seed_source_quality_assessment(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            evidence_span_id=ctx["evidence_span_id"],
-            overall_quality="unsuitable",
-            contradiction_status="no_known_contradiction",
-            version_no=2,
-        )
-
-    with engine.begin() as conn:
-        outcome = run_final_answer_gate(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            task_id=ctx["task_id"],
-        )
-
-    assert outcome["decision"] == "rejected"
-    assert outcome["reason_code"] == "source_quality_block"
-
-    with engine.connect() as conn:
-        gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
-    block_gaps = _gaps_by_kind(gaps, "source_quality_block")
-    assert len(block_gaps) == 1
-    reasons = _reason_codes_in_gap(block_gaps[0])
-    assert reasons == ["source_quality_unsuitable"]
-
-
-# ===========================================================================
-# 9) v1='unsuitable', v2='strong' -> latest wins, decision approved cleanly
-#    (no source quality gap at all).
-# ===========================================================================
-def test_latest_version_wins_clean_after_unsuitable():
-    _skip_if_db_unreachable()
-    engine = get_engine()
-    with engine.begin() as conn:
-        ctx = _seed_task_with_one_verified_span(conn)
-        _seed_source_quality_assessment(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            evidence_span_id=ctx["evidence_span_id"],
-            overall_quality="unsuitable",
-            contradiction_status="no_known_contradiction",
-            version_no=1,
-        )
-        _seed_source_quality_assessment(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            evidence_span_id=ctx["evidence_span_id"],
-            overall_quality="strong",
-            contradiction_status="no_known_contradiction",
-            version_no=2,
-        )
-
-        _seed_entailment_check_entailed(
+        _seed_entailment_check(
             conn,
             tenant_id=ctx["tenant_id"],
             project_id=ctx["project_id"],
@@ -1203,6 +875,7 @@ def test_latest_version_wins_clean_after_unsuitable():
             claim_logical_id=ctx["claim_logical_id"],
             claim_ledger_entry_id=ctx["claim_ledger_entry_id"],
             evidence_span_id=ctx["evidence_span_id"],
+            verdict="not_supported",
         )
 
     with engine.begin() as conn:
@@ -1213,151 +886,199 @@ def test_latest_version_wins_clean_after_unsuitable():
             task_id=ctx["task_id"],
         )
 
-    # Clean path: original 8.4 reason_code, no source quality gap.
     assert outcome["decision"] == "approved"
-    assert outcome["reason_code"] == "all_spans_verified"
+    assert outcome["reason_code"] == "all_spans_verified_with_warnings"
     assert outcome["published_answer_id"] is not None
-    assert outcome["coverage_gaps_emitted"] == 0
 
     with engine.connect() as conn:
         gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
+        published = _fetch_published(conn, task_id=ctx["task_id"])
+
+    warning_gaps = _gaps_by_kind(gaps, "entailment_warning")
+    assert len(warning_gaps) == 1
+    assert warning_gaps[0]["severity"] == "warn"
+    assert warning_gaps[0]["gap_key"] == (
+        f"span:{ctx['final_answer_span_id']}:entailment_warning"
+    )
+    assert _gaps_by_kind(gaps, "entailment_block") == []
+
+    assert published is not None
+    assert str(published["status"]) == "published"
+
+
+# ===========================================================================
+# 3) verdict='partially_supported' produces warning.
+# ===========================================================================
+def test_partially_supported_is_warning():
+    _skip_if_db_unreachable()
+    engine = get_engine()
+    with engine.begin() as conn:
+        ctx = _seed_task_with_one_verified_span(conn)
+        _seed_entailment_check(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            task_id=ctx["task_id"],
+            claim_logical_id=ctx["claim_logical_id"],
+            claim_ledger_entry_id=ctx["claim_ledger_entry_id"],
+            evidence_span_id=ctx["evidence_span_id"],
+            verdict="partially_supported",
+        )
+
+    with engine.begin() as conn:
+        outcome = run_final_answer_gate(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            task_id=ctx["task_id"],
+        )
+
+    assert outcome["decision"] == "approved"
+    assert outcome["reason_code"] == "all_spans_verified_with_warnings"
+    assert outcome["published_answer_id"] is not None
+
+    with engine.connect() as conn:
+        gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
+
+    warning_gaps = _gaps_by_kind(gaps, "entailment_warning")
+    assert len(warning_gaps) == 1
+    assert warning_gaps[0]["severity"] == "warn"
+    assert _gaps_by_kind(gaps, "entailment_block") == []
+
+
+# ===========================================================================
+# 4) verdict='uncertain' produces warning.
+# ===========================================================================
+def test_uncertain_is_warning():
+    _skip_if_db_unreachable()
+    engine = get_engine()
+    with engine.begin() as conn:
+        ctx = _seed_task_with_one_verified_span(conn)
+        _seed_entailment_check(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            task_id=ctx["task_id"],
+            claim_logical_id=ctx["claim_logical_id"],
+            claim_ledger_entry_id=ctx["claim_ledger_entry_id"],
+            evidence_span_id=ctx["evidence_span_id"],
+            verdict="uncertain",
+        )
+
+    with engine.begin() as conn:
+        outcome = run_final_answer_gate(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            task_id=ctx["task_id"],
+        )
+
+    assert outcome["decision"] == "approved"
+    assert outcome["reason_code"] == "all_spans_verified_with_warnings"
+
+    with engine.connect() as conn:
+        gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
+
+    warning_gaps = _gaps_by_kind(gaps, "entailment_warning")
+    assert len(warning_gaps) == 1
+    assert _gaps_by_kind(gaps, "entailment_block") == []
+
+
+# ===========================================================================
+# 5) latest entailment check missing -> warning, decision stays approved.
+# ===========================================================================
+def test_missing_check_is_warning():
+    _skip_if_db_unreachable()
+    engine = get_engine()
+    with engine.begin() as conn:
+        ctx = _seed_task_with_one_verified_span(conn)
+        # NO _seed_entailment_check call: the LEFT JOIN LATERAL in the
+        # Gate must return NULL for this (entry, span) pair, and the
+        # Gate must map that to a missing-check warning.
+
+    with engine.begin() as conn:
+        outcome = run_final_answer_gate(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            task_id=ctx["task_id"],
+        )
+
+    assert outcome["decision"] == "approved"
+    assert outcome["reason_code"] == "all_spans_verified_with_warnings"
+    assert outcome["published_answer_id"] is not None
+
+    with engine.connect() as conn:
+        gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
+
+    warning_gaps = _gaps_by_kind(gaps, "entailment_warning")
+    assert len(warning_gaps) == 1
+    assert warning_gaps[0]["severity"] == "warn"
+    assert _gaps_by_kind(gaps, "entailment_block") == []
+
+
+# ===========================================================================
+# 6) verdict='entailed' is clean: no entailment gap. Decision is approved.
+#    The Source Quality axis is also seeded clean ('adequate' +
+#    'no_known_contradiction'), so the reason_code reaches the original
+#    8.4 clean value 'all_spans_verified'.
+# ===========================================================================
+def test_entailed_clean_if_no_source_quality_warning():
+    _skip_if_db_unreachable()
+    engine = get_engine()
+    with engine.begin() as conn:
+        ctx = _seed_task_with_one_verified_span(conn)
+        _seed_entailment_check(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            task_id=ctx["task_id"],
+            claim_logical_id=ctx["claim_logical_id"],
+            claim_ledger_entry_id=ctx["claim_ledger_entry_id"],
+            evidence_span_id=ctx["evidence_span_id"],
+            verdict="entailed",
+        )
+        # Seed a clean source_quality_assessments so the SQ axis does
+        # NOT emit any warning, allowing us to assert the entailment
+        # axis cleanly.
+        _seed_source_quality_assessment(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            evidence_span_id=ctx["evidence_span_id"],
+            overall_quality="adequate",
+            contradiction_status="no_known_contradiction",
+        )
+
+    with engine.begin() as conn:
+        outcome = run_final_answer_gate(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            task_id=ctx["task_id"],
+        )
+
+    assert outcome["decision"] == "approved"
+    # Clean path: original 8.4 reason_code, no entailment gap, no SQ gap.
+    assert outcome["reason_code"] == "all_spans_verified"
+    assert outcome["published_answer_id"] is not None
+
+    with engine.connect() as conn:
+        gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
+
+    assert _gaps_by_kind(gaps, "entailment_block") == []
+    assert _gaps_by_kind(gaps, "entailment_warning") == []
     assert _gaps_by_kind(gaps, "source_quality_block") == []
     assert _gaps_by_kind(gaps, "source_quality_warning") == []
 
 
 # ===========================================================================
-# 10) v1='unknown', v2='unsuitable' -> latest wins, block fires.
+# 7) CVE-lite priority: unverified span produces 'unverified_spans_present',
+#    NOT 'entailment_block', even if a 'contradicted' entailment row
+#    exists for the linked evidence_span. Entailment is NOT consulted
+#    when any span is not verified-backed.
 # ===========================================================================
-def test_latest_version_wins_block_after_unknown():
-    _skip_if_db_unreachable()
-    engine = get_engine()
-    with engine.begin() as conn:
-        ctx = _seed_task_with_one_verified_span(conn)
-        _seed_source_quality_assessment(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            evidence_span_id=ctx["evidence_span_id"],
-            overall_quality="unknown",
-            contradiction_status="unchecked",
-            version_no=1,
-        )
-        _seed_source_quality_assessment(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            evidence_span_id=ctx["evidence_span_id"],
-            overall_quality="unsuitable",
-            contradiction_status="no_known_contradiction",
-            version_no=2,
-        )
-
-    with engine.begin() as conn:
-        outcome = run_final_answer_gate(
-            conn,
-            tenant_id=ctx["tenant_id"],
-            project_id=ctx["project_id"],
-            task_id=ctx["task_id"],
-        )
-
-    assert outcome["decision"] == "rejected"
-    assert outcome["reason_code"] == "source_quality_block"
-
-    with engine.connect() as conn:
-        gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
-    block_gaps = _gaps_by_kind(gaps, "source_quality_block")
-    assert len(block_gaps) == 1
-    reasons = _reason_codes_in_gap(block_gaps[0])
-    assert reasons == ["source_quality_unsuitable"]
-
-
-# ===========================================================================
-# 11) Multiple evidence_spans for the same final_answer_span: worst-on-block.
-#    One evidence_span 'strong', one 'unsuitable' -> block.
-# ===========================================================================
-def test_multiple_evidence_spans_one_block_rejects():
-    _skip_if_db_unreachable()
-    engine = get_engine()
-    with engine.begin() as conn:
-        tenant_id, project_id, user_id, task_id = _seeded_dev(conn)
-
-        # One logical claim, one verified_fact entry; two evidence_spans
-        # linked to that same entry. The Gate will see both evidence_spans
-        # as supporting the verified span.
-        es_a = _create_evidence_span(
-            conn, tenant_id=tenant_id, project_id=project_id, created_by=user_id
-        )
-        es_b = _create_evidence_span(
-            conn, tenant_id=tenant_id, project_id=project_id, created_by=user_id
-        )
-        lc, le = _create_logical_claim_with_verified_entry(
-            conn, tenant_id=tenant_id, project_id=project_id, task_id=task_id
-        )
-        _link_claim_to_span(
-            conn,
-            claim_logical_id=lc,
-            claim_ledger_entry_id=le,
-            evidence_span_id=es_a,
-        )
-        _link_claim_to_span(
-            conn,
-            claim_logical_id=lc,
-            claim_ledger_entry_id=le,
-            evidence_span_id=es_b,
-        )
-        draft_id, fas_id = _create_draft_with_span(
-            conn,
-            task_id=task_id,
-            claim_logical_id=lc,
-            claim_ledger_entry_id=le,
-        )
-
-        # es_a: strong (clean). es_b: unsuitable (block). Aggregation
-        # worst-on-block must reject.
-        _seed_source_quality_assessment(
-            conn,
-            tenant_id=tenant_id,
-            project_id=project_id,
-            evidence_span_id=es_a,
-            overall_quality="strong",
-            contradiction_status="no_known_contradiction",
-        )
-        _seed_source_quality_assessment(
-            conn,
-            tenant_id=tenant_id,
-            project_id=project_id,
-            evidence_span_id=es_b,
-            overall_quality="unsuitable",
-            contradiction_status="no_known_contradiction",
-        )
-
-    with engine.begin() as conn:
-        outcome = run_final_answer_gate(
-            conn,
-            tenant_id=tenant_id,
-            project_id=project_id,
-            task_id=task_id,
-        )
-
-    assert outcome["decision"] == "rejected"
-    assert outcome["reason_code"] == "source_quality_block"
-
-    with engine.connect() as conn:
-        gaps = _fetch_coverage_gaps(conn, draft_id=draft_id)
-    block_gaps = _gaps_by_kind(gaps, "source_quality_block")
-    assert len(block_gaps) == 1
-    # The block gap's details must reference the offending evidence_span.
-    reasons = _reason_codes_in_gap(block_gaps[0])
-    assert "source_quality_unsuitable" in reasons
-
-
-# ===========================================================================
-# 12) CVE-lite priority: an unverified span produces 'unverified_claim',
-#     NOT 'source_quality_block', even if the source quality on linked
-#     evidence is 'unsuitable'. Source quality is not consulted when any
-#     span is not verified-backed.
-# ===========================================================================
-def test_cve_priority_unverified_takes_precedence_over_source_quality():
+def test_cve_lite_unverified_has_priority_over_entailment_block():
     _skip_if_db_unreachable()
     engine = get_engine()
     with engine.begin() as conn:
@@ -1366,9 +1087,8 @@ def test_cve_priority_unverified_takes_precedence_over_source_quality():
             conn, tenant_id=tenant_id, project_id=project_id, created_by=user_id
         )
         # Create logical claim with v1 in state 'candidate' (NOT verified).
-        # The span will reference the v1 entry, but no v2 exists.
-        # latest_entry_state will be 'candidate', so the span is NOT
-        # verified-backed -> Branch C of the Gate.
+        # The span will reference v1, but no v2 exists; latest_entry_state
+        # will be 'candidate', so the span is NOT verified-backed.
         lc, le = _create_logical_claim_with_verified_entry(
             conn,
             tenant_id=tenant_id,
@@ -1388,15 +1108,17 @@ def test_cve_priority_unverified_takes_precedence_over_source_quality():
             claim_logical_id=lc,
             claim_ledger_entry_id=le,
         )
-        # Even with an 'unsuitable' source quality assessment for the
-        # backing evidence_span, the CVE-lite branch must win.
-        _seed_source_quality_assessment(
+        # Even with a 'contradicted' entailment check for this pair,
+        # the CVE-lite branch must win.
+        _seed_entailment_check(
             conn,
             tenant_id=tenant_id,
             project_id=project_id,
+            task_id=task_id,
+            claim_logical_id=lc,
+            claim_ledger_entry_id=le,
             evidence_span_id=es_id,
-            overall_quality="unsuitable",
-            contradiction_status="contradicted_by_stronger_source",
+            verdict="contradicted",
         )
 
     with engine.begin() as conn:
@@ -1409,7 +1131,7 @@ def test_cve_priority_unverified_takes_precedence_over_source_quality():
 
     assert outcome["decision"] == "rejected"
     # The critical invariant: reason_code is the CVE-lite reason, NOT
-    # 'source_quality_block'.
+    # 'entailment_block'.
     assert outcome["reason_code"] == "unverified_spans_present"
     assert outcome["published_answer_id"] is None
     assert outcome["spans_unverified"] == 1
@@ -1417,23 +1139,39 @@ def test_cve_priority_unverified_takes_precedence_over_source_quality():
     with engine.connect() as conn:
         gaps = _fetch_coverage_gaps(conn, draft_id=draft_id)
 
-    # An 'unverified_claim' gap was emitted; NO 'source_quality_*' gap.
+    # An 'unverified_claim' gap was emitted; NO entailment gap of any
+    # kind (Source Quality is also not consulted in this branch).
     unverified_gaps = _gaps_by_kind(gaps, "unverified_claim")
     assert len(unverified_gaps) == 1
     assert unverified_gaps[0]["gap_key"] == f"span:{fas_id}"
+    assert _gaps_by_kind(gaps, "entailment_block") == []
+    assert _gaps_by_kind(gaps, "entailment_warning") == []
     assert _gaps_by_kind(gaps, "source_quality_block") == []
     assert _gaps_by_kind(gaps, "source_quality_warning") == []
 
 
 # ===========================================================================
-# 13) Idempotency on redelivery: running the gate twice on the same draft
-#     produces the same decision and does NOT duplicate any gap or row.
+# 8) Entailment block priority: when entailment=contradicted AND
+#    source_quality=unsuitable on the same verified-backed span, the
+#    reason_code is 'entailment_block' (NOT 'source_quality_block').
+#    The Gate may emit both kinds of gaps for audit completeness, but
+#    the decision is driven by the entailment axis.
 # ===========================================================================
-def test_idempotent_on_redelivery_no_duplicate_gaps():
+def test_entailment_block_has_priority_over_source_quality_block():
     _skip_if_db_unreachable()
     engine = get_engine()
     with engine.begin() as conn:
         ctx = _seed_task_with_one_verified_span(conn)
+        _seed_entailment_check(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            task_id=ctx["task_id"],
+            claim_logical_id=ctx["claim_logical_id"],
+            claim_ledger_entry_id=ctx["claim_ledger_entry_id"],
+            evidence_span_id=ctx["evidence_span_id"],
+            verdict="contradicted",
+        )
         _seed_source_quality_assessment(
             conn,
             tenant_id=ctx["tenant_id"],
@@ -1444,25 +1182,295 @@ def test_idempotent_on_redelivery_no_duplicate_gaps():
         )
 
     with engine.begin() as conn:
-        outcome_1 = run_final_answer_gate(
+        outcome = run_final_answer_gate(
             conn,
             tenant_id=ctx["tenant_id"],
             project_id=ctx["project_id"],
             task_id=ctx["task_id"],
         )
 
+    # The reason_code is driven by the higher-priority axis.
+    assert outcome["decision"] == "rejected"
+    assert outcome["reason_code"] == "entailment_block"
+    assert outcome["published_answer_id"] is None
+
     with engine.connect() as conn:
-        gaps_1 = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
-        gate_count_1 = int(
-            conn.execute(
-                text(
-                    "SELECT COUNT(*) FROM final_gate_reports "
-                    "WHERE draft_final_answer_id = :did"
-                ),
-                {"did": ctx["draft_id"]},
-            ).scalar_one()
+        gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
+
+    # The entailment_block gap MUST be emitted (it drove the decision).
+    block_gaps = _gaps_by_kind(gaps, "entailment_block")
+    assert len(block_gaps) == 1
+    assert block_gaps[0]["severity"] == "block"
+    assert block_gaps[0]["gap_key"] == (
+        f"span:{ctx['final_answer_span_id']}:entailment_block"
+    )
+
+
+# ===========================================================================
+# 9) Source quality block still works when no entailment block fires.
+#    entailment=entailed (clean), source_quality=unsuitable -> reason_code
+#    'source_quality_block'.
+# ===========================================================================
+def test_source_quality_block_still_works_when_no_entailment_block():
+    _skip_if_db_unreachable()
+    engine = get_engine()
+    with engine.begin() as conn:
+        ctx = _seed_task_with_one_verified_span(conn)
+        _seed_entailment_check(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            task_id=ctx["task_id"],
+            claim_logical_id=ctx["claim_logical_id"],
+            claim_ledger_entry_id=ctx["claim_ledger_entry_id"],
+            evidence_span_id=ctx["evidence_span_id"],
+            verdict="entailed",
+        )
+        _seed_source_quality_assessment(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            evidence_span_id=ctx["evidence_span_id"],
+            overall_quality="unsuitable",
+            contradiction_status="no_known_contradiction",
         )
 
+    with engine.begin() as conn:
+        outcome = run_final_answer_gate(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            task_id=ctx["task_id"],
+        )
+
+    assert outcome["decision"] == "rejected"
+    assert outcome["reason_code"] == "source_quality_block"
+    assert outcome["published_answer_id"] is None
+
+    with engine.connect() as conn:
+        gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
+
+    sq_block_gaps = _gaps_by_kind(gaps, "source_quality_block")
+    assert len(sq_block_gaps) == 1
+    # No entailment gap when verdict='entailed' (clean entailment axis).
+    assert _gaps_by_kind(gaps, "entailment_block") == []
+    assert _gaps_by_kind(gaps, "entailment_warning") == []
+
+
+# ===========================================================================
+# 10) Source quality warning + entailment warning coexist on the same
+#     draft. Both gap rows are emitted; reason_code stays
+#     'all_spans_verified_with_warnings'; published_answers v1 is inserted.
+# ===========================================================================
+def test_source_quality_warning_and_entailment_warning_coexist():
+    _skip_if_db_unreachable()
+    engine = get_engine()
+    with engine.begin() as conn:
+        ctx = _seed_task_with_one_verified_span(conn)
+        _seed_entailment_check(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            task_id=ctx["task_id"],
+            claim_logical_id=ctx["claim_logical_id"],
+            claim_ledger_entry_id=ctx["claim_ledger_entry_id"],
+            evidence_span_id=ctx["evidence_span_id"],
+            verdict="uncertain",
+        )
+        _seed_source_quality_assessment(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            evidence_span_id=ctx["evidence_span_id"],
+            overall_quality="unknown",
+            contradiction_status="unchecked",
+        )
+
+    with engine.begin() as conn:
+        outcome = run_final_answer_gate(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            task_id=ctx["task_id"],
+        )
+
+    assert outcome["decision"] == "approved"
+    assert outcome["reason_code"] == "all_spans_verified_with_warnings"
+    assert outcome["published_answer_id"] is not None
+
+    with engine.connect() as conn:
+        gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
+
+    entailment_warns = _gaps_by_kind(gaps, "entailment_warning")
+    sq_warns = _gaps_by_kind(gaps, "source_quality_warning")
+    assert len(entailment_warns) == 1
+    assert len(sq_warns) == 1
+    assert entailment_warns[0]["gap_key"] == (
+        f"span:{ctx['final_answer_span_id']}:entailment_warning"
+    )
+    assert sq_warns[0]["gap_key"] == (
+        f"span:{ctx['final_answer_span_id']}:source_quality_warning"
+    )
+    # No block of either kind.
+    assert _gaps_by_kind(gaps, "entailment_block") == []
+    assert _gaps_by_kind(gaps, "source_quality_block") == []
+
+
+# ===========================================================================
+# 11) Latest version wins on the entailment axis.
+#     Case A: v1='entailed', v2='contradicted' -> block.
+#     Case B: v1='contradicted', v2='entailed' -> clean entailment axis.
+# ===========================================================================
+def test_latest_version_wins():
+    _skip_if_db_unreachable()
+    engine = get_engine()
+
+    # --- Case A: v1 entailed, v2 contradicted -> block ----------------------
+    with engine.begin() as conn:
+        ctx_a = _seed_task_with_one_verified_span(conn)
+        _seed_entailment_check(
+            conn,
+            tenant_id=ctx_a["tenant_id"],
+            project_id=ctx_a["project_id"],
+            task_id=ctx_a["task_id"],
+            claim_logical_id=ctx_a["claim_logical_id"],
+            claim_ledger_entry_id=ctx_a["claim_ledger_entry_id"],
+            evidence_span_id=ctx_a["evidence_span_id"],
+            verdict="entailed",
+            version_no=1,
+        )
+        _seed_entailment_check(
+            conn,
+            tenant_id=ctx_a["tenant_id"],
+            project_id=ctx_a["project_id"],
+            task_id=ctx_a["task_id"],
+            claim_logical_id=ctx_a["claim_logical_id"],
+            claim_ledger_entry_id=ctx_a["claim_ledger_entry_id"],
+            evidence_span_id=ctx_a["evidence_span_id"],
+            verdict="contradicted",
+            version_no=2,
+        )
+
+    with engine.begin() as conn:
+        outcome_a = run_final_answer_gate(
+            conn,
+            tenant_id=ctx_a["tenant_id"],
+            project_id=ctx_a["project_id"],
+            task_id=ctx_a["task_id"],
+        )
+    assert outcome_a["decision"] == "rejected"
+    assert outcome_a["reason_code"] == "entailment_block"
+
+    with engine.connect() as conn:
+        gaps_a = _fetch_coverage_gaps(conn, draft_id=ctx_a["draft_id"])
+    assert len(_gaps_by_kind(gaps_a, "entailment_block")) == 1
+
+    # --- Case B: v1 contradicted, v2 entailed -> clean entailment axis ------
+    with engine.begin() as conn:
+        ctx_b = _seed_task_with_one_verified_span(conn)
+        _seed_entailment_check(
+            conn,
+            tenant_id=ctx_b["tenant_id"],
+            project_id=ctx_b["project_id"],
+            task_id=ctx_b["task_id"],
+            claim_logical_id=ctx_b["claim_logical_id"],
+            claim_ledger_entry_id=ctx_b["claim_ledger_entry_id"],
+            evidence_span_id=ctx_b["evidence_span_id"],
+            verdict="contradicted",
+            version_no=1,
+        )
+        _seed_entailment_check(
+            conn,
+            tenant_id=ctx_b["tenant_id"],
+            project_id=ctx_b["project_id"],
+            task_id=ctx_b["task_id"],
+            claim_logical_id=ctx_b["claim_logical_id"],
+            claim_ledger_entry_id=ctx_b["claim_ledger_entry_id"],
+            evidence_span_id=ctx_b["evidence_span_id"],
+            verdict="entailed",
+            version_no=2,
+        )
+        # Seed clean SQ so the only relevant axis is entailment.
+        _seed_source_quality_assessment(
+            conn,
+            tenant_id=ctx_b["tenant_id"],
+            project_id=ctx_b["project_id"],
+            evidence_span_id=ctx_b["evidence_span_id"],
+            overall_quality="adequate",
+            contradiction_status="no_known_contradiction",
+        )
+
+    with engine.begin() as conn:
+        outcome_b = run_final_answer_gate(
+            conn,
+            tenant_id=ctx_b["tenant_id"],
+            project_id=ctx_b["project_id"],
+            task_id=ctx_b["task_id"],
+        )
+    assert outcome_b["decision"] == "approved"
+    # No entailment_block because the LATEST (v2) is 'entailed'.
+    assert outcome_b["reason_code"] != "entailment_block"
+
+    with engine.connect() as conn:
+        gaps_b = _fetch_coverage_gaps(conn, draft_id=ctx_b["draft_id"])
+    assert _gaps_by_kind(gaps_b, "entailment_block") == []
+    assert _gaps_by_kind(gaps_b, "entailment_warning") == []
+
+
+# ===========================================================================
+# 12) Read-only contract: the Gate must NEVER mutate claim_entailment_checks
+#     (or claim_ledger_entries). Pre/post snapshot is invariant.
+#     Combined with redelivery idempotency: a second invocation does not
+#     duplicate gaps and does not alter table counts.
+# ===========================================================================
+def test_no_mutation_of_claim_entailment_checks():
+    _skip_if_db_unreachable()
+    engine = get_engine()
+    with engine.begin() as conn:
+        ctx = _seed_task_with_one_verified_span(conn)
+        _seed_entailment_check(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            task_id=ctx["task_id"],
+            claim_logical_id=ctx["claim_logical_id"],
+            claim_ledger_entry_id=ctx["claim_ledger_entry_id"],
+            evidence_span_id=ctx["evidence_span_id"],
+            verdict="uncertain",
+        )
+
+    with engine.connect() as conn:
+        cec_count_before = _count_entailment_checks_for_task(
+            conn, task_id=ctx["task_id"]
+        )
+        cle_count_before = _count_ledger_entries_for_logical(
+            conn, claim_logical_id=ctx["claim_logical_id"]
+        )
+
+    # First Gate run.
+    with engine.begin() as conn:
+        outcome_1 = run_final_answer_gate(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            task_id=ctx["task_id"],
+        )
+    assert outcome_1["decision"] == "approved"
+
+    with engine.connect() as conn:
+        cec_count_after_1 = _count_entailment_checks_for_task(
+            conn, task_id=ctx["task_id"]
+        )
+        cle_count_after_1 = _count_ledger_entries_for_logical(
+            conn, claim_logical_id=ctx["claim_logical_id"]
+        )
+        gaps_after_1 = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
+
+    # Read-only invariant on claim_entailment_checks and ledger.
+    assert cec_count_after_1 == cec_count_before
+    assert cle_count_after_1 == cle_count_before
+
+    # Second Gate run (redelivery idempotency).
     with engine.begin() as conn:
         outcome_2 = run_final_answer_gate(
             conn,
@@ -1470,38 +1478,88 @@ def test_idempotent_on_redelivery_no_duplicate_gaps():
             project_id=ctx["project_id"],
             task_id=ctx["task_id"],
         )
+    assert outcome_2["decision"] == outcome_1["decision"] == "approved"
+    assert outcome_2["reason_code"] == outcome_1["reason_code"]
+    # Same final_gate_report_id (UNIQUE on draft_final_answer_id).
+    assert outcome_2["final_gate_report_id"] == outcome_1["final_gate_report_id"]
 
     with engine.connect() as conn:
-        gaps_2 = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
-        gate_count_2 = int(
-            conn.execute(
-                text(
-                    "SELECT COUNT(*) FROM final_gate_reports "
-                    "WHERE draft_final_answer_id = :did"
-                ),
-                {"did": ctx["draft_id"]},
-            ).scalar_one()
+        cec_count_after_2 = _count_entailment_checks_for_task(
+            conn, task_id=ctx["task_id"]
+        )
+        cle_count_after_2 = _count_ledger_entries_for_logical(
+            conn, claim_logical_id=ctx["claim_logical_id"]
+        )
+        gaps_after_2 = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
+
+    # Still no mutation on the read-only tables.
+    assert cec_count_after_2 == cec_count_before
+    assert cle_count_after_2 == cle_count_before
+
+    # No duplicate gaps after redelivery.
+    pairs_1 = {(str(g["kind"]), str(g["gap_key"])) for g in gaps_after_1}
+    pairs_2 = {(str(g["kind"]), str(g["gap_key"])) for g in gaps_after_2}
+    assert pairs_1 == pairs_2
+    assert len(gaps_after_1) == len(gaps_after_2)
+
+
+# ===========================================================================
+# 13) The final gate report payload must surface some entailment-related
+#     summary information after a 'contradicted' rejection. The exact
+#     shape of the JSONB payload is an implementation detail of
+#     8.8A-GATE-CODE-A; we assert leniently by requiring at least one
+#     observable signal: either a mention of 'entailment' in the
+#     serialized payload, OR an entailment_block gap row attached to
+#     the draft.
+# ===========================================================================
+def test_final_gate_report_payload_contains_entailment_summary():
+    _skip_if_db_unreachable()
+    engine = get_engine()
+    with engine.begin() as conn:
+        ctx = _seed_task_with_one_verified_span(conn)
+        _seed_entailment_check(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            task_id=ctx["task_id"],
+            claim_logical_id=ctx["claim_logical_id"],
+            claim_ledger_entry_id=ctx["claim_ledger_entry_id"],
+            evidence_span_id=ctx["evidence_span_id"],
+            verdict="contradicted",
         )
 
-    # Same decision both times.
-    assert outcome_1["decision"] == outcome_2["decision"] == "rejected"
-    assert (
-        outcome_1["reason_code"]
-        == outcome_2["reason_code"]
-        == "source_quality_block"
+    with engine.begin() as conn:
+        outcome = run_final_answer_gate(
+            conn,
+            tenant_id=ctx["tenant_id"],
+            project_id=ctx["project_id"],
+            task_id=ctx["task_id"],
+        )
+    assert outcome["decision"] == "rejected"
+    assert outcome["reason_code"] == "entailment_block"
+
+    with engine.connect() as conn:
+        report = _fetch_gate_report(conn, task_id=ctx["task_id"])
+        gaps = _fetch_coverage_gaps(conn, draft_id=ctx["draft_id"])
+
+    assert report is not None
+    assert str(report["decision"]) == "rejected"
+    assert str(report["reason_code"]) == "entailment_block"
+
+    payload = report.get("payload") or {}
+    assert isinstance(payload, dict)
+    assert "entailment" in payload
+
+    entailment = payload["entailment"]
+    assert entailment["policy_name"] == "mvp0_entailment_gate_policy"
+    assert entailment["policy_version"] == "0.1.0"
+    assert entailment["status"] == "blocked"
+    assert entailment["spans_with_block"] == 1
+    assert entailment["block_reason_counts"]["entailment_contradicted"] == 1
+
+    entailment_block_gaps = _gaps_by_kind(gaps, "entailment_block")
+    assert len(entailment_block_gaps) == 1
+    assert entailment_block_gaps[0]["gap_key"] == (
+        f"span:{ctx['final_answer_span_id']}:entailment_block"
     )
-
-    # No duplicate gate report.
-    assert gate_count_1 == 1
-    assert gate_count_2 == 1
-    assert outcome_1["final_gate_report_id"] == outcome_2["final_gate_report_id"]
-
-    # No duplicate gaps. Compare the set of (kind, gap_key) pairs across
-    # the two snapshots — they must be identical and have the same size.
-    pairs_1 = {(str(g["kind"]), str(g["gap_key"])) for g in gaps_1}
-    pairs_2 = {(str(g["kind"]), str(g["gap_key"])) for g in gaps_2}
-    assert pairs_1 == pairs_2
-    assert len(gaps_1) == len(gaps_2)
-
-    # Second invocation reports 0 NEW gaps emitted (all already present).
-    assert outcome_2["coverage_gaps_emitted"] == 0
+    assert entailment_block_gaps[0]["severity"] == "block"

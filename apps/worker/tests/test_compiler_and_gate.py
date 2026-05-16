@@ -591,7 +591,7 @@ def test_approved_scenario_publishes_answer():
                 text(
                     "SELECT COUNT(*) FROM coverage_gap_statements "
                     "WHERE draft_final_answer_id = :d "
-                    "AND kind <> 'source_quality_warning'"
+                    "AND kind NOT IN ('source_quality_warning', 'entailment_warning')"
                 ),
                 {"d": draft_id},
             ).scalar_one()
