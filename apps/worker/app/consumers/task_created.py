@@ -1,10 +1,13 @@
-"""task.created consumer (Phase 8.4, realigned + Phase 8.7E source quality).
+"""task.created consumer (Phase 8.4, realigned + Phase 8.7E source quality
++ Phase 8.8A claim entailment).
 
 Pipeline single-consumer. The 8.3 pipeline (extractor + CVE-lite -> analyzed_partial)
 is preserved. After 'task.analyzed_partial', a mock source quality assessment step
 (Phase 8.7E) is run, wrapped in a SAVEPOINT so its failure cannot block 8.4. Then
-the consumer continues in the same event loop with the 8.4 stage (compiler +
-final answer gate -> published or publication_held).
+a mock claim entailment check step (Phase 8.8A) is run, also wrapped in a
+SAVEPOINT so its failure cannot block 8.4 either. Then the consumer continues in
+the same event loop with the 8.4 stage (compiler + final answer gate -> published
+or publication_held).
 
 Terminality (Phase 8.4, FINAL):
   - blocked                                                             -> terminal
@@ -30,6 +33,7 @@ Audit sequence (with documents, approved scenario):
   task.cve_lite_completed
   task.analyzed_partial
   task.source_quality_assessed
+  task.entailment_checked
   task.compiling
   task.draft_compiled
   task.final_gate_started
@@ -44,8 +48,9 @@ Resume cases (NOT a fresh run): when the consumer enters with the task already
 in 'compiling' or 'analyzed_partial', the corresponding state-transition audit
 events are NOT re-emitted (they were emitted on the original run). The
 sub-pipeline functions are guarded by status conditions to keep audit history
-free of duplicates. The 8.7E step lives inside _run_8_3_extract_and_verify
-(fresh-run path only), so task.source_quality_assessed is not re-emitted on
+free of duplicates. Both the 8.7E and 8.8A steps live inside
+_run_8_3_extract_and_verify (fresh-run path only), so neither
+task.source_quality_assessed nor task.entailment_checked is re-emitted on
 resume either.
 
 Phase 8.7E invariants:
@@ -59,10 +64,24 @@ Phase 8.7E invariants:
   - No new Redis stream, no new consumer, no new dispatcher entry, no change to
     main.py, no change to Final Answer Gate, no change to Claim Ledger.
 
+Phase 8.8A invariants:
+  - The claim entailment step is invoked ONLY in the fresh-run path
+    (_run_8_3_extract_and_verify, AFTER _run_8_7_source_quality and BEFORE the
+    'analyzed_partial -> compiling' transition).
+  - Its failure is NEVER allowed to break the 8.4 pipeline: same SAVEPOINT
+    pattern as 8.7E. The aggregated audit event task.entailment_checked is
+    emitted with status='completed' on success and status='failed' on failure.
+  - The audit payload exposes aggregated counts only; it does NOT expose
+    individual claim_text, quote text, evidence_span_id, claim_ledger_entry_id,
+    or assessment_id values. Detailed inspection is via a future read API.
+  - No change to the Final Answer Gate in this block: claim_entailment_checks
+    rows are written but NOT consulted by the gate yet (that integration is the
+    next block, 8.8A-GATE).
+
 FK-safety (8.1d-patch1) and post-commit publish (8.1d) preserved.
 Idempotent under redelivery: every state transition is guarded by the current
 status; every INSERT in services uses ON CONFLICT DO NOTHING on UNIQUE
-constraints declared in 0004 / 0005 / 0007.
+constraints declared in 0004 / 0005 / 0007 / 0009.
 """
 from __future__ import annotations
 
@@ -77,6 +96,13 @@ from evidencefirst_shared.db.audit import audit_append
 from evidencefirst_shared.db.idempotency import begin_processing, mark_failed, mark_succeeded
 
 from ..db import transaction
+from ..services.claim_entailment_checker import (
+    DEFAULT_POLICY_NAME as CLAIM_ENTAILMENT_POLICY_NAME,
+    DEFAULT_POLICY_VERSION as CLAIM_ENTAILMENT_POLICY_VERSION,
+    SERVICE_NAME as CLAIM_ENTAILMENT_SERVICE_NAME,
+    SERVICE_VERSION as CLAIM_ENTAILMENT_SERVICE_VERSION,
+)
+from ..services.claim_entailment_orchestrator import run_claim_entailment_checks
 from ..services.compiler import run_compilation
 from ..services.cve_lite import run_cve_lite
 from ..services.extractor import run_extraction
@@ -400,6 +426,164 @@ def _run_8_7_source_quality(
 
 
 # ---------------------------------------------------------------------------
+# Phase 8.8A — claim entailment step (savepoint-wrapped)
+# ---------------------------------------------------------------------------
+def _run_8_8_claim_entailment(
+    conn: Connection,
+    *,
+    task_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    project_id: uuid.UUID,
+    consumer_name: str,
+) -> None:
+    """Run the mock claim entailment check step for the task.
+
+    Phase 8.8A (Block WORKER) integration. Mirror of 8.7E:
+    the orchestrator call is wrapped in a SAVEPOINT
+    (``conn.begin_nested()``) so that any exception raised inside the
+    orchestrator or by the underlying checker does NOT abort the
+    caller's outer transaction and does NOT break the 8.4 pipeline
+    that runs after this step.
+
+    Try/except scoping (same discipline as 8.7E):
+      The ``try`` covers ONLY the savepoint-wrapped call to
+      ``run_claim_entailment_checks``. The success ``audit_append`` is
+      emitted OUTSIDE the try: a failure there is a separate fault
+      and must NOT be reclassified as a claim-entailment failure
+      audit. If the success audit itself raises, the exception
+      propagates to the caller of this function (handle_task_created),
+      which already classifies any pipeline exception as
+      ``WORKER_TASK_CREATED_FAIL`` on the EPR row.
+
+    Identity in audit payload (decision):
+      The payload identifies the CHECKER (policy_name, policy_version,
+      service_name, service_version), not the orchestrator. The
+      checker is the authority on policy and service identity: it is
+      the component that produces verdicts and writes
+      claim_entailment_checks rows. The orchestrator is a fan-out
+      helper over (claim_ledger_entry_id, evidence_span_id) pairs and
+      has no semantic identity beyond that. This mirrors 8.7E (which
+      identifies the evaluator, not the source-quality orchestrator).
+
+    Side effects:
+      - On success: at most one INSERT per
+        (claim_ledger_entry_id, evidence_span_id) pair linked to the
+        task via claim_evidence_links into
+        ``claim_entailment_checks`` (idempotent across redelivery),
+        plus exactly one ``task.entailment_checked`` audit event on
+        the task's audit chain with ``status='completed'`` and
+        aggregated counts.
+      - On orchestrator failure: the SAVEPOINT is rolled back, so any
+        partial INSERT in ``claim_entailment_checks`` from this call
+        is discarded. The outer transaction is left usable, and
+        exactly one ``task.entailment_checked`` audit event is emitted
+        with ``status='failed'``. The exception is NOT re-raised; the
+        pipeline continues to 8.4.
+
+    Invariants:
+      - This function does NOT mutate ``task_masters.status``,
+        ``claim_ledger_entries``, ``final_gate_reports``,
+        ``published_answers``, ``source_loss_*``,
+        ``source_quality_assessments``, or any other domain table
+        outside of ``claim_entailment_checks`` (via the orchestrator).
+      - The audit payload exposes aggregated counts ONLY. It does NOT
+        expose claim_text, quote text, individual evidence_span_id
+        values, individual claim_ledger_entry_id values, or
+        individual claim_entailment_checks row ids. Detailed
+        inspection is via a future read API.
+      - No per-pair audit events are emitted: only the single
+        task-scoped aggregate.
+      - Stack traces are NEVER included in the audit payload on
+        failure: only ``error_type`` (the exception class name) is
+        recorded. Full diagnostics live in the structured log.
+      - The Final Answer Gate is NOT modified by this block: the
+        rows written here are NOT consumed by the Gate yet. That
+        integration belongs to the next block (8.8A-GATE).
+    """
+    try:
+        with conn.begin_nested():
+            counts = run_claim_entailment_checks(conn, task_id=task_id)
+    except Exception as exc:
+        # SAVEPOINT auto-rolled-back by the context manager: any partial
+        # claim_entailment_checks INSERT from this call is gone, and
+        # the outer transaction is usable again. We log the failure
+        # with full stack trace, then emit a structured 'failed' audit
+        # so the operator can observe the incident via the audit chain.
+        #
+        # We deliberately catch a broad Exception: the savepoint is
+        # precisely the mechanism that lets us safely absorb ANY
+        # exception here without poisoning the pipeline.
+        logger.exception(
+            "task_created.claim_entailment_failed",
+            task_id=str(task_id),
+            error_type=type(exc).__name__,
+        )
+        audit_append(
+            conn,
+            chain_scope="task",
+            tenant_id=tenant_id,
+            project_id=project_id,
+            task_id=task_id,
+            session_id=None,
+            event_type="task.entailment_checked",
+            actor_type="job",
+            actor_id=consumer_name,
+            redacted_payload={
+                "service_name": CLAIM_ENTAILMENT_SERVICE_NAME,
+                "service_version": CLAIM_ENTAILMENT_SERVICE_VERSION,
+                "policy_name": CLAIM_ENTAILMENT_POLICY_NAME,
+                "policy_version": CLAIM_ENTAILMENT_POLICY_VERSION,
+                "evaluated_target_kind": "claim_evidence_pair",
+                "status": "failed",
+                "error_type": type(exc).__name__,
+                "counts": {
+                    "status": "failed",
+                    "pairs_total": 0,
+                    "assessed_count": 0,
+                    "already_assessed_count": 0,
+                    "not_found_count": 0,
+                    "invalid_target_count": 0,
+                    "error_count": 1,
+                },
+            },
+            related_entity_type="task_masters",
+            related_entity_id=task_id,
+        )
+        # Do NOT re-raise: the savepoint + audit pair exists precisely
+        # to keep 8.4 running even if 8.8A fails. The pipeline
+        # continues from the caller's site.
+        return
+
+    # Success path: emit the aggregated audit OUTSIDE the try/except.
+    # A failure here is NOT a claim-entailment failure (the orchestrator
+    # already completed), so we deliberately let it propagate to
+    # handle_task_created, which will classify it as
+    # WORKER_TASK_CREATED_FAIL on the EPR row.
+    audit_append(
+        conn,
+        chain_scope="task",
+        tenant_id=tenant_id,
+        project_id=project_id,
+        task_id=task_id,
+        session_id=None,
+        event_type="task.entailment_checked",
+        actor_type="job",
+        actor_id=consumer_name,
+        redacted_payload={
+            "service_name": CLAIM_ENTAILMENT_SERVICE_NAME,
+            "service_version": CLAIM_ENTAILMENT_SERVICE_VERSION,
+            "policy_name": CLAIM_ENTAILMENT_POLICY_NAME,
+            "policy_version": CLAIM_ENTAILMENT_POLICY_VERSION,
+            "evaluated_target_kind": "claim_evidence_pair",
+            "status": "completed",
+            "counts": counts,
+        },
+        related_entity_type="task_masters",
+        related_entity_id=task_id,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 8.3 sub-pipeline (extract + cve_lite + analyzed_partial)
 # ---------------------------------------------------------------------------
 def _run_8_3_extract_and_verify(
@@ -506,8 +690,9 @@ def _run_8_3_extract_and_verify(
     if r is None:
         # The 'analyzing -> analyzed_partial' transition did not happen
         # on this call (concurrent execution / unexpected state). Do NOT
-        # emit the analyzed_partial audit and do NOT run the 8.7E step:
-        # both belong to the fresh run that produced the transition.
+        # emit the analyzed_partial audit and do NOT run the 8.7E /
+        # 8.8A steps: all three belong to the fresh run that produced
+        # the transition.
         return
     audit_append(
         conn,
@@ -534,11 +719,9 @@ def _run_8_3_extract_and_verify(
     )
 
     # Phase 8.7E: mock source quality assessment, AFTER task.analyzed_partial
-    # and BEFORE the 8.4 stage (which is invoked by the orchestrator
-    # _run_pipeline_with_docs after this function returns). The call is
-    # SAVEPOINT-wrapped so its failure does not abort the outer
-    # transaction; the aggregated task.source_quality_assessed audit is
-    # emitted either way.
+    # and BEFORE the 8.8A entailment step. The call is SAVEPOINT-wrapped
+    # so its failure does not abort the outer transaction; the aggregated
+    # task.source_quality_assessed audit is emitted either way.
     #
     # Resume safety: this point is reached ONLY when the
     # 'analyzing -> analyzed_partial' transition succeeded on THIS call
@@ -547,6 +730,34 @@ def _run_8_3_extract_and_verify(
     # _run_8_3_extract_and_verify (see _run_pipeline_with_docs), so the
     # 8.7E audit is never re-emitted on redelivery.
     _run_8_7_source_quality(
+        conn,
+        task_id=task_id,
+        tenant_id=tenant_id,
+        project_id=project_id,
+        consumer_name=consumer_name,
+    )
+
+    # Phase 8.8A: mock claim entailment check, AFTER
+    # task.source_quality_assessed and BEFORE the 8.4 stage (which is
+    # invoked by the orchestrator _run_pipeline_with_docs after this
+    # function returns). The call is SAVEPOINT-wrapped so its failure
+    # does not abort the outer transaction; the aggregated
+    # task.entailment_checked audit is emitted either way.
+    #
+    # Resume safety: same argument as 8.7E above. This point is reached
+    # ONLY in the fresh-run path where the
+    # 'analyzing -> analyzed_partial' transition succeeded on THIS
+    # call, so task.entailment_checked is emitted exactly once per
+    # task lifetime.
+    #
+    # Ordering rationale: the two steps (8.7E and 8.8A) are
+    # independent — neither depends on the other's output and neither
+    # mutates state the other reads. We run source quality first to
+    # match the audit chain order documented in PHASE_8_8A_PRE.md §8
+    # (analyzed_partial -> source_quality_assessed -> entailment_checked
+    # -> compiling), which mirrors the natural reading order ("source
+    # first, then claim-quote relation").
+    _run_8_8_claim_entailment(
         conn,
         task_id=task_id,
         tenant_id=tenant_id,
@@ -874,8 +1085,8 @@ def _run_pipeline_with_docs(
     current_status = _fetch_task_status(conn, task_id)
 
     # 8.3 stage runs from analyzing -> analyzed_partial. It also runs
-    # the 8.7E source quality step internally, AFTER task.analyzed_partial
-    # and BEFORE returning here.
+    # the 8.7E source quality step and the 8.8A claim entailment step
+    # internally, AFTER task.analyzed_partial and BEFORE returning here.
     if current_status == "analyzing":
         _run_8_3_extract_and_verify(
             conn,
@@ -888,8 +1099,8 @@ def _run_pipeline_with_docs(
 
     # 8.4 stage starts from analyzed_partial or RESUMES from compiling.
     # Resume runs do NOT enter _run_8_3_extract_and_verify above, so the
-    # 8.7E source quality audit is emitted exactly once per task lifetime
-    # in the fresh-run path.
+    # 8.7E and 8.8A audits are each emitted exactly once per task
+    # lifetime in the fresh-run path.
     if current_status in ("analyzed_partial", "compiling"):
         existing_report = _fetch_existing_gate_report_for_task(conn, task_id)
         if existing_report is None:

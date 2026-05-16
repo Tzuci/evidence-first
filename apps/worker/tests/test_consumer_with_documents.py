@@ -1,15 +1,16 @@
-"""Worker consumer tests for the with-docs branch (Phase 8.4 + Phase 8.7E).
+"""Worker consumer tests for the with-docs branch (Phase 8.4 + Phase 8.7E +
+Phase 8.8A).
 
 Coverage:
   - With-docs full pipeline (approved): task ends in status='published',
-    audit chain has the 14 worker events of the 8.7E approved sequence.
+    audit chain has the 15 worker events of the 8.8A approved sequence.
   - With-docs rejected zero-verified: task ends in status='analyzed_partial'
     with a final_gate_reports row, audit chain ends with task.publication_held.
   - No-docs branch invariato: task ends in status='blocked'.
   - Redelivery with fresh idempotency_key after the approved/rejected run
     completes returns 'skipped_terminal' and does not append any audit row.
 
-Phase 8.7E worker audit sequence (approved with-docs):
+Phase 8.8A worker audit sequence (approved with-docs):
   1  task.analyzing
   2  task.docs_loaded
   3  task.claims_extracted
@@ -19,13 +20,14 @@ Phase 8.7E worker audit sequence (approved with-docs):
   7  task.cve_lite_completed
   8  task.analyzed_partial
   9  task.source_quality_assessed
-  10 task.compiling
-  11 task.draft_compiled
-  12 task.final_gate_started
-  13 task.final_gate_completed
-  14 task.published
+  10 task.entailment_checked
+  11 task.compiling
+  12 task.draft_compiled
+  13 task.final_gate_started
+  14 task.final_gate_completed
+  15 task.published
 
-Phase 8.7E worker audit sequence (rejected zero-verified with-docs):
+Phase 8.8A worker audit sequence (rejected zero-verified with-docs):
   1  task.analyzing
   2  task.docs_loaded
   3  task.claims_extracted
@@ -35,11 +37,12 @@ Phase 8.7E worker audit sequence (rejected zero-verified with-docs):
   7  task.cve_lite_completed
   8  task.analyzed_partial
   9  task.source_quality_assessed
-  10 task.compiling
-  11 task.draft_compiled
-  12 task.final_gate_started
-  13 task.final_gate_completed
-  14 task.publication_held
+  10 task.entailment_checked
+  11 task.compiling
+  12 task.draft_compiled
+  13 task.final_gate_started
+  14 task.final_gate_completed
+  15 task.publication_held
 
 No-docs branch (invariato):
   1  task.analyzing
@@ -67,11 +70,11 @@ from evidencefirst_shared.db.audit import verify_task_audit_chain
 CONSUMER_NAME = "test_consumer_with_documents"
 
 
-# Phase 8.4 expected sequences. Audit rows for chain_scope='task' are listed
+# Phase 8.8A expected sequences. Audit rows for chain_scope='task' are listed
 # in the order they appear (chain_seq ASC). The two API-emitted events
 # (task.created, task.docs_attached) are NOT included here: these tests
 # exercise only the worker, so they assert on the worker subset.
-EXPECTED_PIPELINE_EVENTS_8_4_APPROVED: list[str] = [
+EXPECTED_PIPELINE_EVENTS_8_8A_APPROVED: list[str] = [
     "task.analyzing",
     "task.docs_loaded",
     "task.claims_extracted",
@@ -81,6 +84,7 @@ EXPECTED_PIPELINE_EVENTS_8_4_APPROVED: list[str] = [
     "task.cve_lite_completed",
     "task.analyzed_partial",
     "task.source_quality_assessed",
+    "task.entailment_checked",
     "task.compiling",
     "task.draft_compiled",
     "task.final_gate_started",
@@ -88,7 +92,7 @@ EXPECTED_PIPELINE_EVENTS_8_4_APPROVED: list[str] = [
     "task.published",
 ]
 
-EXPECTED_PIPELINE_EVENTS_8_4_REJECTED: list[str] = [
+EXPECTED_PIPELINE_EVENTS_8_8A_REJECTED: list[str] = [
     "task.analyzing",
     "task.docs_loaded",
     "task.claims_extracted",
@@ -98,6 +102,7 @@ EXPECTED_PIPELINE_EVENTS_8_4_REJECTED: list[str] = [
     "task.cve_lite_completed",
     "task.analyzed_partial",
     "task.source_quality_assessed",
+    "task.entailment_checked",
     "task.compiling",
     "task.draft_compiled",
     "task.final_gate_started",
@@ -470,7 +475,7 @@ def _verify_chain(task_id: uuid.UUID) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 1 — with-docs full 8.4 pipeline ends in 'published'
+# Test 1 — with-docs full 8.8A pipeline ends in 'published'
 # ---------------------------------------------------------------------------
 def test_worker_with_docs_runs_full_8_4_pipeline_to_published():
     tenant_id, project_id, _user_id, task_id = _setup_task_with_doc()
@@ -486,7 +491,7 @@ def test_worker_with_docs_runs_full_8_4_pipeline_to_published():
         assert _fetch_task_status(conn, task_id) == "published"
 
         worker_events = _fetch_worker_audit_event_types(conn, task_id)
-        assert worker_events == EXPECTED_PIPELINE_EVENTS_8_4_APPROVED
+        assert worker_events == EXPECTED_PIPELINE_EVENTS_8_8A_APPROVED
 
     _verify_chain(task_id)
 
@@ -510,7 +515,7 @@ def test_worker_with_docs_rejected_zero_verified_runs_full_8_4_to_publication_he
         assert _fetch_task_status(conn, task_id) == "analyzed_partial"
 
         worker_events = _fetch_worker_audit_event_types(conn, task_id)
-        assert worker_events == EXPECTED_PIPELINE_EVENTS_8_4_REJECTED
+        assert worker_events == EXPECTED_PIPELINE_EVENTS_8_8A_REJECTED
 
         gate_count = int(
             conn.execute(
@@ -561,7 +566,7 @@ def test_worker_with_docs_redelivery_with_new_idempotency_key_is_terminal():
     with engine.connect() as conn:
         audit_count_before = _audit_count(conn, task_id)
         assert _fetch_task_status(conn, task_id) == "published"
-        assert audit_count_before == len(EXPECTED_PIPELINE_EVENTS_8_4_APPROVED)
+        assert audit_count_before == len(EXPECTED_PIPELINE_EVENTS_8_8A_APPROVED)
 
     fresh_event = {
         "event_id": str(uuid.uuid4()),
@@ -600,7 +605,7 @@ def test_worker_with_docs_redelivery_after_rejected_is_terminal():
     with engine.connect() as conn:
         audit_count_before = _audit_count(conn, task_id)
         assert _fetch_task_status(conn, task_id) == "analyzed_partial"
-        assert audit_count_before == len(EXPECTED_PIPELINE_EVENTS_8_4_REJECTED)
+        assert audit_count_before == len(EXPECTED_PIPELINE_EVENTS_8_8A_REJECTED)
 
     fresh_event = {
         "event_id": str(uuid.uuid4()),
