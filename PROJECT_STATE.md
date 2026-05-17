@@ -1,6 +1,6 @@
 # PROJECT_STATE — Evidence-First MVP-0
 
-Documento di onboarding tecnico, una pagina, leggibile dal collaboratore al primo accesso senza dover leggere il codice. Riflette lo stato del repo al commit **Fase 8.7H** (chiusura della fase 8.7): `b70ef8fb394e0f28befdfd2b3a699c32a88e9914` ("Add phase 8.7 source quality realistic flow").
+Documento di onboarding tecnico, una pagina, leggibile dal collaboratore al primo accesso senza dover leggere il codice. Riflette lo stato del repo al commit **Fase 8.8A** (Claim Entailment Checker tecnicamente chiusa): `394257b141a2109c1aca0ad937ae775bf51bb143` ("Add claim entailment gate realistic flow").
 
 ---
 
@@ -8,26 +8,46 @@ Documento di onboarding tecnico, una pagina, leggibile dal collaboratore al prim
 
 Piattaforma multi-AI **evidence-first** ed **evidence-gated**.
 
-Il sistema è progettato per impedire che claim fattuali non supportati, contraddetti o basati su fonti inadeguate vengano pubblicati come affidabili. **Il progetto non promette di eliminare le allucinazioni in senso assoluto**: promette evidenze tracciabili, registrate nel Claim Ledger, verificate dal CVE-lite, valutate sul piano della qualità delle fonti, propagate via lifecycle e source-loss, **e consumate dal Final Answer Gate** prima di qualunque pubblicazione. La piattaforma rende visibili o blocca i claim non supportati, contraddetti o basati su fonti inadeguate prima della pubblicazione affidabile; non garantisce che un LLM non generi internamente output errati.
+Il sistema è progettato per impedire che claim fattuali non supportati, contraddetti o basati su fonti inadeguate vengano pubblicati come affidabili. **Il progetto non promette di eliminare le allucinazioni in senso assoluto**: promette evidenze tracciabili, registrate nel Claim Ledger, verificate dal CVE-lite, valutate sul piano della qualità delle fonti, **verificate anche sull'asse della relazione semantica claim ↔ evidence_span via Claim Entailment**, propagate via lifecycle e source-loss, **e consumate dal Final Answer Gate** prima di qualunque pubblicazione. La piattaforma rende visibili o blocca i claim non supportati, contraddetti o basati su fonti inadeguate prima della pubblicazione affidabile; non garantisce che un LLM non generi internamente output errati.
 
-In MVP-0 il nucleo evidence-gated è costruito **prima** della visione multi-AI. Provider AI reali, Verified Web Mode, Hybrid Mode, consensus engine, contradiction detector avanzato e critical reviewer sono fasi future. Il claim "evidence-gated" qui significa: esiste una base append-only verificabile end-to-end per draft/gate/published, una propagazione lifecycle e source-loss minimale per MVP-0, una superficie di osservabilità HTTP read-only sopra di essa, un primo Source Quality Evaluator deterministico mock (8.7) che scrive assessment append-only sulle fonti che supportano i claim, e una policy decisionale (8.7G) che fa consultare quegli assessment al Final Answer Gate per bloccare o segnalare warning su fonti inadeguate, **validata end-to-end da un realistic flow test (8.7H) che esercita sia il warning path sia il block path attraverso l'intera catena API → FakeRedis → dispatcher → consumer → servizi worker → DB → read API**.
+Nel MVP-0 il nucleo evidence-gated è costruito **prima** della visione multi-AI. Provider AI reali, Verified Web Mode, Hybrid Mode, consensus engine, contradiction detector avanzato e critical reviewer sono fasi future. Il claim "evidence-gated" qui significa: esiste una base append-only verificabile end-to-end per draft/gate/published, una propagazione lifecycle e source-loss minimale per MVP-0, una superficie di osservabilità HTTP read-only sopra di essa, un Source Quality Evaluator deterministico mock (8.7) che scrive assessment append-only sulle fonti che supportano i claim, una policy decisionale (8.7G) che fa consultare quegli assessment al Final Answer Gate per bloccare o segnalare warning su fonti inadeguate, validata end-to-end da un realistic flow test (8.7H), **e ora un Claim Entailment Checker (8.8A) deterministico mock che scrive append-only sul piano della relazione semantica claim ↔ quote, consumato dal Final Answer Gate con policy P1 (block solo su `contradicted`), e validato end-to-end da un realistic flow test (8.8A-GATE-FLOW) che esercita sia il warning path con il mock reale sia il block path tramite stub dell'orchestrator**.
+
+**Distinzioni semantiche da preservare in tutta la documentazione:**
+
+- **claim correctness ≠ evidence support ≠ CVE-lite verification ≠ source quality ≠ claim entailment ≠ final gate truth.**
+- Un link `claim_evidence_links` ben formato non implica supporto semantico.
+- CVE-lite (`verification_records`) verifica la presenza testuale della quote nel chunk e l'hash della quote; non valuta se la quote implichi il claim.
+- Source Quality (`source_quality_assessments`) valuta la fonte che ospita la quote, non la relazione claim ↔ quote.
+- **Claim Entailment (`claim_entailment_checks`) verifica se la quote implichi semanticamente (o sia compatibile con) il claim collegato**; non giudica la verità del claim nel mondo.
+- Il Final Answer Gate compone questi assi nella decisione di pubblicazione; non garantisce verità assoluta.
+
+Una fonte citata non implica un claim vero. Una quote presente non implica che la quote sostenga il claim.
 
 ---
 
-## Stato fase 8.7
+## Stato fase
 
-**Fase 8.7 chiusa.** Tutti i blocchi 8.7A–8.7H sono completati. Il prossimo blocco operativo è 8.8A (Claim Entailment Checker), o in alternativa un blocco infrastrutturale (retention 0009, RBAC/redaction, cursor pagination).
+| Fase | Descrizione | Stato |
+|---|---|---|
+| 8.7 | Source Quality (A–H) | **chiusa** |
+| 8.8A | Claim Entailment Checker | **tecnicamente chiusa** (mancano read API, report API, UI) |
+
+### Blocchi 8.8A
 
 | Blocco | Descrizione | Stato |
 |---|---|---|
-| 8.7A | `PHASE_8_7_PLAN.md` | done |
-| 8.7B | `migrations/0007_source_quality.sql` | done |
-| 8.7C | Shared schemas (codomini + Literal alias + `SourceQualityAssessmentRead`) | done |
-| 8.7D | Mock Source Quality Evaluator service | done |
-| 8.7E | Worker integration (W-A) — step in `task_created` con SAVEPOINT + audit aggregato | done |
-| 8.7F | Read API (due endpoint GET) | done |
-| 8.7G | Migration 0008 + Gate integration (policy P1+P3+P4) | done |
-| 8.7H | Realistic flow tests + docs finalization | **done** |
+| 8.8A-PRE | Analisi architetturale (`PHASE_8_8A_PRE.md`) | done |
+| 8.8A-SCHEMA | `migrations/0009_claim_entailment_checks.sql` + test migration | done |
+| 8.8A-SHARED | Estensione `packages/shared/evidencefirst_shared/schemas.py` con `ClaimEntailmentCheckRead` e `SOURCE_ENTAILMENT_VERDICT_VALUES` | done |
+| 8.8A-SERVICE | `apps/worker/app/services/claim_entailment_checker.py` + test (mock deterministic checker) | done |
+| 8.8A-ORCHESTRATOR | `apps/worker/app/services/claim_entailment_orchestrator.py` + test (task-level fan-out) | done |
+| 8.8A-WORKER | Integrazione in `apps/worker/app/consumers/task_created.py` (step SAVEPOINT + audit aggregato) + test | done |
+| 8.8A-GATE-PRE | Analisi policy gate (`PHASE_8_8A_GATE_PRE.md`) | done |
+| 8.8A-GATE-SCHEMA | `migrations/0010_coverage_gap_entailment.sql` + test migration | done |
+| 8.8A-GATE-CODE | Estensione `apps/worker/app/services/final_answer_gate.py` con branch entailment + test (13 scenari) | done |
+| 8.8A-GATE-FLOW | `tests/test_phase_8_8a_entailment_gate_flow.py` (warning + block path end-to-end) | done |
+
+**Cosa resta fuori dalla chiusura tecnica 8.8A:** read API claim-entailment, Anti-Hallucination Report API aggregata, UI dedicata.
 
 ---
 
@@ -43,151 +63,122 @@ In MVP-0 il nucleo evidence-gated è costruito **prima** della visione multi-AI.
 | `0006_lifecycle.sql` | applicata (Fase 8.5), immutabile |
 | `0007_source_quality.sql` | applicata (Fase 8.7B), immutabile |
 | `0008_coverage_gap_source_quality.sql` | applicata (Fase 8.7G), immutabile |
-| `0009_*` retention futura | numero da assegnare; retention reale distruttiva ancora non scritta |
+| `0009_claim_entailment_checks.sql` | **applicata (Fase 8.8A-SCHEMA), immutabile** |
+| `0010_coverage_gap_entailment.sql` | **applicata (Fase 8.8A-GATE-SCHEMA), immutabile** |
+| `0011_*` retention futura | numero da assegnare; retention reale distruttiva ancora non scritta |
 
-Nota: il numero `0008` è ora occupato da `coverage_gap_source_quality` (estensione del CHECK su `coverage_gap_statements.kind`). La retention futura distruttiva prenderà un numero successivo (provvisoriamente `0009_*`).
+**Nota di rinumerazione:** la retention futura distruttiva, già rinviata in 8.7G/H e 8.8A-SCHEMA, slitta ora a `0011_*` o successivo. NON è 0009: 0009 è occupato da `claim_entailment_checks` e 0010 da `coverage_gap_entailment`.
 
 ---
 
-## Cosa esiste oggi (Fasi 8.4 + 8.5 + 8.6 minima + 8.7A–H)
+## Cosa esiste oggi (Fasi 8.4 + 8.5 + 8.6 minima + 8.7A–H + 8.8A)
 
-### Base 8.4 (invariata nel comportamento; reason_code esteso in 8.7G)
+### Base 8.4 (invariata nel comportamento; reason_code esteso in 8.7G e 8.8A-GATE)
 
 - **DB foundation multi-tenant**: `tenants`, `users`, `projects`, `sessions`, `task_masters`, `event_processing_records`, `policy_versions`.
 - **Audit chain hash-linked, append-only, verificabile end-to-end** via `verify_audit_chain` / `verify_task_audit_chain`. Append-only enforced a DB tramite trigger comune `reject_modify_append_only`.
 - **Storage layer content-addressed, deduplicato, refcount-based**: `storage_blobs`, `storage_objects`. Dedup global concorrenza-safe via `INSERT ... ON CONFLICT DO NOTHING` sull'indice parziale `sb_global_uq`.
 - **Document store** con upload reale `.txt`/`.md`, chunking deterministico, `evidence_spans` minimali, `task_documents`. `evidence_spans` append-only.
 - **Claim Ledger append-only stretto**: `logical_claims`, `raw_claims`, `classified_claims`, `claim_ledger_entries`, `claim_lineage`, `claim_evidence_links`, `verification_records`. Supersede esclusivamente via `claim_lineage.relation_kind='supersedes'`.
-- **Extractor mock-driven**, **CVE-lite mock-driven**, **Compiler mock-driven**, **Final Answer Gate mock-driven (esteso in 8.7G)**.
+- **Extractor mock-driven**, **CVE-lite mock-driven**, **Compiler mock-driven**, **Final Answer Gate mock-driven (esteso in 8.7G e 8.8A-GATE)**.
 - **Worker single-consumer 8.4** per `task.created`, FK-safe, resume-safe, idempotente.
 - **Coerenza referenziale stretta a DB** tra `task_masters` ↔ `draft_final_answers` ↔ `final_gate_reports` ↔ `published_answers` via UNIQUE composite e FK composite.
 
 ### Fase 8.5 (invariata)
 
-**Schema (migration `0006_lifecycle.sql`).** Tre tabelle append-only:
-
-- `published_answer_lifecycle_events`: FK composita `(published_answer_id, task_id) → published_answers(id, task_id)`, `event_type ∈ {published, withdrawal_requested, withdrawn, superseded}`, UNIQUE `(published_answer_id, event_type, idempotency_key)`.
-- `source_loss_events`: FK `evidence_span_id → evidence_spans(id)` come granularità canonica, `loss_kind ∈ {source_deleted, source_access_lost, quote_mismatch, document_replaced, policy_retraction}`, UNIQUE `(evidence_span_id, loss_kind, idempotency_key)`.
-- `source_loss_propagation_records`: `propagation_kind ∈ {claim_marked_unverifiable, published_answer_impacted, no_claims_impacted, no_active_published_answers_impacted}`, `status ∈ {recorded, skipped, failed}`, idempotenza via partial unique indexes ristretti a `status IN ('recorded','skipped')`.
-
-**Servizi worker.**
-
-- `published_answer_lifecycle.apply_withdrawal`: unico scrittore autorizzato dei campi lifecycle di `published_answers` per il path di withdrawal.
-- `source_loss_propagator.propagate_source_loss`: risolve l'impact set da `evidence_span_id`, append `v(N+1)` `unverifiable / unsupported / source_lost` con lineage `supersedes`, registra `source_loss_propagation_records`.
-
-**Consumer e dispatcher.** `consumers/published_answer_withdrawal.py`, `consumers/source_loss.py`, `consumers/dispatch.py`. Worker multi-stream con gruppo `worker_default`.
-
-**API producer 8.5.** `POST /api/v1/published-answers/{published_answer_id}/withdrawal-requests`, `POST /api/v1/source-loss-events`.
+[Sezione invariata: `published_answer_lifecycle_events`, `source_loss_events`, `source_loss_propagation_records`, servizi `published_answer_lifecycle` e `source_loss_propagator`, consumer dedicati, due API producer. Vedi commit precedenti per il dettaglio.]
 
 ### Fase 8.6 minima (invariata)
 
-Quattro endpoint GET read-only di osservabilità su lifecycle e source-loss:
+[Sezione invariata: quattro endpoint GET read-only di osservabilità su lifecycle e source-loss.]
 
-- `GET /api/v1/published-answers/{published_answer_id}/lifecycle-events` (8.6A)
-- `GET /api/v1/source-loss-events/{source_loss_event_id}` (8.6B)
-- `GET /api/v1/source-loss-events/{source_loss_event_id}/propagation` (8.6C)
-- `GET /api/v1/tasks/{task_id}/source-loss-events` (8.6D)
+### Fase 8.7 — Source Quality (chiusa)
 
-Tutti read-only end-to-end, verificati da snapshot pre/post sui count.
+[Sezione invariata rispetto al post-8.7H. Tabella `source_quality_assessments` append-only, mock evaluator deterministic che produce sempre `overall_quality='unknown'` + `contradiction_status='unchecked'`, orchestrator chiamato in `task.created` dopo `analyzed_partial` (SAVEPOINT-protected, audit aggregato `task.source_quality_assessed`), due endpoint read 8.7F, Final Answer Gate consuma `source_quality_assessments` con policy P1+P3+P4, validato end-to-end da `tests/test_phase_8_7_source_quality_flow.py`. **Branch C' (`source_quality_block`) implementato e testato ma in produzione con mock attuale non si attiva spontaneamente.**]
 
-### Fase 8.7 — Source Quality (A–H implementate, fase chiusa)
+### Fase 8.8A — Claim Entailment (tecnicamente chiusa)
 
-Stato post-8.7H: lo strato di valutazione qualità delle fonti esiste come capability append-only e osservabile via HTTP, **è consumato dal Final Answer Gate** secondo la policy P1+P3+P4 (vedi §8.7G più sotto), **ed è validato end-to-end da un realistic flow test (8.7H) che esercita warning e block path attraverso l'intera catena API → FakeRedis → dispatcher → task.created consumer → source quality → final gate → read API**.
+**Schema (migration `0009_claim_entailment_checks.sql`).**
 
-**8.7B — Schema (`migrations/0007_source_quality.sql`).**
-
-- Tabella `source_quality_assessments` append-only (trigger `source_quality_assessments_append_only` su `reject_modify_append_only`).
-- CHECK `sqa_target_xor`: esattamente UNO tra `evidence_span_id`, `document_chunk_id`, `document_id` non-null per riga.
-- Nove CHECK enum sui codomini: `source_type`, `source_role`, `authority_level`, `independence_level`, `freshness`, `relevance`, `extract_quality`, `contradiction_status`, `overall_quality`.
-- `confidence` `DOUBLE PRECISION` in `[0.0, 1.0]` o NULL.
-- Sei partial unique indexes (tre versioning + tre idempotency, uno per target kind): `sqa_evidence_version_uq`, `sqa_chunk_version_uq`, `sqa_document_version_uq`, `sqa_evidence_idem_uq`, `sqa_chunk_idem_uq`, `sqa_document_idem_uq`.
+- Tabella `claim_entailment_checks` append-only (trigger `claim_entailment_checks_append_only` su `reject_modify_append_only`).
+- Granularità: per coppia `(claim_ledger_entry_id, evidence_span_id)`. `claim_logical_id` denormalizzato per FK composita `cec_entry_logical_consistency` verso `claim_ledger_entries(id, claim_logical_id)`.
+- CHECK enum su `verdict`: codominio fisso a 5 valori — **`entailed`, `partially_supported`, `not_supported`, `contradicted`, `uncertain`**.
+- CHECK su `confidence` in `[0.0, 1.0]` o NULL.
+- CHECK `version_no >= 1`.
+- UNIQUE `cec_entry_span_version_uq (claim_ledger_entry_id, evidence_span_id, version_no)` per versioning.
+- UNIQUE `cec_entry_span_idem_uq (claim_ledger_entry_id, evidence_span_id, idempotency_key)` per idempotenza applicativa.
+- Indici di lookup su `task_id`, `claim_logical_id`, `evidence_span_id`, `verdict`.
 - FK con `ON DELETE RESTRICT`.
-- `policy_name` e `policy_version` come stringhe opache (nessun FK a `policy_versions`).
-- Indici di lookup su `tenant_id`, `project_id`, target per granularità, `overall_quality`, `source_role`, `freshness`.
 
-**8.7C — Codomini shared (`packages/shared/evidencefirst_shared/schemas.py`).**
+**Shared schema (`packages/shared/evidencefirst_shared/schemas.py`).**
 
-- Nove tuple `SOURCE_QUALITY_*_VALUES` che rispecchiano esattamente i CHECK enum di 0007.
-- Nove `Literal` alias (`SourceQualitySourceType`, `SourceQualitySourceRole`, …) per consumer che vogliono tipizzazione stretta.
-- `SourceQualityAssessmentRead` con campi quality come `str` per coerenza con gli altri Read model (l'enforcement resta a DB level).
+- Tupla `SOURCE_ENTAILMENT_VERDICT_VALUES` che mirror esattamente il CHECK enum di 0009.
+- `Literal` alias `ClaimEntailmentVerdict` per consumer con tipizzazione stretta.
+- `ClaimEntailmentCheckRead` model usato dai test e (futuro) read API.
 
-**8.7D — Mock Source Quality Evaluator (`apps/worker/app/services/source_quality_evaluator.py`).**
+**Mock checker (`apps/worker/app/services/claim_entailment_checker.py`).**
 
-- Deterministico, mock-driven. Nessun provider AI, nessuna web search, nessuna euristica reale.
-- Identità: `SERVICE_NAME="mock_source_quality_evaluator"`, `SERVICE_VERSION="0.1.0"`, `DEFAULT_POLICY_NAME="mvp0_mock_source_quality"`, `DEFAULT_POLICY_VERSION="0.1.0"`.
-- Politica mock fissa: tutti gli evidence_span ricevono `overall_quality='unknown'`, `contradiction_status='unchecked'`, `confidence=0.5`, e le altre dimensioni fissate (vedi `PHASE_8_7_PLAN.md`). **Il mock evaluator è ancora deterministico e produce sempre `unknown` + `unchecked`**; non emette mai `unsuitable`, `weak`, `strong`, `adequate`, né valori reali di `contradiction_status`.
-- Idempotenza per `(target_kind, target_id, idempotency_key)` con short-circuit `STATUS_ALREADY_ASSESSED`; doppia protezione via SAVEPOINT su `IntegrityError` (race) con recovery SELECT.
-- Canonical scope: l'INSERT scrive `tenant_id`/`project_id` letti dal target row, non quelli passati dal caller.
-- Non emette mai `audit_records`. Non muta `claim_ledger_entries`, `claim_lineage`, `claim_evidence_links`, `verification_records`, `final_gate_reports`, `published_answers`, `source_loss_*`, `published_answer_lifecycle_events`.
+- Deterministico, mock-driven. Nessun provider AI, nessuna web search, nessun NLI reale, nessun embedding.
+- Identità: `SERVICE_NAME="mvp0_mock_entailment_checker"`, `SERVICE_VERSION="0.1.0"`, `DEFAULT_POLICY_NAME="mvp0_mock_entailment"`, `DEFAULT_POLICY_VERSION="0.1.0"`.
+- Tre regole deterministiche, primo match vince:
+  1. **Containment normalizzato** (claim ⊆ quote o quote ⊆ claim, lowercase + whitespace collapsed) → `entailed`, `confidence=0.8`.
+  2. **Numeric mismatch** (entrambi i testi hanno numeri AND i set differiscono) → `not_supported`, `confidence=0.6`.
+  3. **Default** → `uncertain`, `confidence=0.5`.
+- **Il mock NON produce mai `contradicted` né `partially_supported`**: questi verdict sono riservati a checker reali futuri o a seed di test fixtures (stub).
+- Ogni riga scritta porta `payload.mock=true` e `payload.semantic_warning="mvp0 heuristic; not a real NLI/LLM entailment model"`.
+- `version_no` fissato a 1 in MVP-0. Una collisione su `cec_entry_span_version_uq` con idempotency_key diversa → `status='error'`, `error_code='entailment_version_conflict'`. Mai mascherata.
+- Idempotenza via SAVEPOINT + recovery SELECT su `IntegrityError`.
+- Canonical scope: `tenant_id`/`project_id`/`task_id`/`claim_logical_id` letti dal target row, non dal caller.
+- Non emette mai `audit_records`. Non muta `claim_ledger_entries`, `claim_lineage`, `claim_evidence_links`, `verification_records`, `source_quality_assessments`, `final_gate_reports`, `published_answers`, `source_loss_*`, `published_answer_lifecycle_events`.
 
-**8.7E — Worker integration (`apps/worker/app/services/source_quality_orchestrator.py` + integrazione in `apps/worker/app/consumers/task_created.py`).**
+**Orchestrator (`apps/worker/app/services/claim_entailment_orchestrator.py`).**
 
-- Orchestrator `run_source_quality_assessment(conn, task_id)` chiama `assess_source_quality` per ogni `evidence_span_id` linkato ai claim del task con idempotency key deterministica `task:{task_id}:span:{evidence_span_id}:v1`.
-- Lo step viene eseguito **solo nel fresh-run path**, dentro `_run_8_3_extract_and_verify`, **dopo `task.analyzed_partial`** e **prima di `task.compiling`**.
-- La chiamata è incapsulata in `conn.begin_nested()` (SAVEPOINT): un fallimento NON aborta la transazione esterna e NON blocca la pipeline 8.4.
-- Un singolo audit aggregato `task.source_quality_assessed` viene emesso con `status='completed'` (success) o `status='failed'` (rollback savepoint + audit).
+- Task-level fan-out: per ogni `(claim_ledger_entry_id, evidence_span_id)` DISTINCT derivato da `claim_evidence_links JOIN logical_claims` sul task, chiama il checker una volta.
+- Idempotency key deterministica: **`task:{task_id}:entry:{claim_ledger_entry_id}:span:{evidence_span_id}:v1`**.
+- Conta esiti: `pairs_total`, `assessed_count`, `already_assessed_count`, `not_found_count`, `invalid_target_count`, `error_count`.
+- Status retornati: `completed` (anche con zero pair) o `not_found` (task inesistente).
+- Non emette audit. Non muta `task_masters`.
 
-**8.7F — Read API (`apps/api/app/routes/source_quality.py`).**
+**Worker integration (`apps/worker/app/consumers/task_created.py`).**
 
-Due endpoint GET read-only, registrati in `apps/api/app/main.py`:
+- Nuovo step `_run_8_8_claim_entailment` SAVEPOINT-protected, dopo `_run_8_7_source_quality` e prima del `_advance_to_compiling`.
+- Emette un singolo audit aggregato **`task.entailment_checked`** con `status='completed'` o `status='failed'`, payload contiene counts e identità del checker.
+- Audit chain con documenti (approved scenario) ora a **15 eventi** (vedi sotto).
+- Failure 8.8A NON blocca 8.4: SAVEPOINT rollback + audit `failed`, pipeline prosegue.
+- Resume da `compiling` o `analyzed_partial` non re-esegue lo step.
 
-- `GET /api/v1/evidence-spans/{evidence_span_id}/source-quality`
-- `GET /api/v1/tasks/{task_id}/source-quality`
+**Final Answer Gate integration (`apps/worker/app/services/final_answer_gate.py`).**
 
-Invarianti: read-only end-to-end, JSONB `payload` esposto verbatim (nessuna RBAC redaction in MVP-0), pagination via `limit` (no cursor), N+1 query per il task endpoint accettato per MVP-0.
+Il Gate consulta `claim_entailment_checks` come asse decisionale, applicato dopo CVE-lite e prima di Source Quality.
 
-**8.7G — Source Quality consumata dal Final Answer Gate.**
+Mapping verdict → comportamento (policy MVP-0 P1, identità `mvp0_entailment_gate_policy` v0.1.0):
 
-Migration `0008_coverage_gap_source_quality.sql` (applicata) estende il CHECK su `coverage_gap_statements.kind` da quattro a sei valori:
+- `contradicted` → **block**. Reason code `entailment_block`. Gap `coverage_gap_statements.kind='entailment_block'`, severity `block`, `gap_key=f'span:{final_answer_span_id}:entailment_block'`.
+- `not_supported` / `partially_supported` / `uncertain` / latest mancante → **warning**. Gap `kind='entailment_warning'`, severity `warn`, `gap_key=f'span:{final_answer_span_id}:entailment_warning'`. Decision invariata.
+- `entailed` → **clean** lato entailment (può comunque essere bloccato da Source Quality o downstream).
 
-- valori preesistenti (da 0005): `unverified_claim`, `missing_evidence`, `out_of_scope`, `source_loss`;
-- valori aggiunti in 0008: **`source_quality_block`**, **`source_quality_warning`**.
+Aggregazione tra più pair `(entry, span)` di supporto allo stesso `final_answer_span`: **worst-on-block, any-on-warn**.
 
-Il Final Answer Gate (`apps/worker/app/services/final_answer_gate.py`) consuma `source_quality_assessments` come terzo asse decisionale, dopo:
+**Priorità decisionale Gate (post-8.8A-GATE):**
 
-1. **Branch A — zero spans**: invariato. `decision='rejected'`, `reason_code='no_verified_claims'`, gap `kind='missing_evidence'`, `gap_key='no_verified_claims'`.
-2. **Branch C — unverified_spans_present**: invariato. Se almeno uno span non è verified-backed, `decision='rejected'`, `reason_code='unverified_spans_present'`, un gap `kind='unverified_claim'` per ciascuno span scoperto. **Source Quality NON è consultata in questo branch** (priorità *CVE-lite > Source Quality*).
-3. **Phase 8.7G — applicata solo quando tutti gli span sono verified-backed.** Per ogni span verified-backed, il Gate consulta la `source_quality_assessments` **latest assoluta** per ciascun `evidence_span_id` di supporto. Aggregazione per span: **worst-on-block, any-on-warn**.
+1. `no_verified_claims` (zero spans)
+2. `unverified_spans_present` (CVE-lite priority)
+3. **`entailment_block`** (8.8A-GATE, nuovo)
+4. `source_quality_block` (8.7G, abbassato di un livello)
+5. `approved_with_warnings` (reason_code `all_spans_verified_with_warnings`, semantica estesa: warning entailment e/o warning source quality)
+6. `approved_clean` (reason_code `all_spans_verified`)
 
-Policy MVP-0 implementata = **P1 + P3 + P4**:
+Quando un draft attiva sia `entailment_block` sia `source_quality_block` sugli stessi span, il `reason_code` è `entailment_block` ma **entrambi i kind di gap sono emessi** per completezza audit. Il Gate è read-only su `claim_entailment_checks` (zero mutazioni).
 
-- **Block**: `overall_quality='unsuitable'`; `contradiction_status ∈ {contradicted_by_stronger_source, conflicting_sources}`.
-- **Warning**: `overall_quality ∈ {weak, unknown}`; `contradiction_status='unchecked'`; latest mancante.
-- **Clean**: `overall_quality ∈ {strong, adequate}` AND `contradiction_status='no_known_contradiction'`.
+**Realistic flow validato (`tests/test_phase_8_8a_entailment_gate_flow.py`).**
 
-Branch decisionali post-8.7G:
+Due test end-to-end indipendenti che esercitano l'intera catena `API HTTP → FakeRedis → dispatcher → task.created consumer → servizi worker → DB → read API`:
 
-- **Branch C' — source_quality_block**: `decision='rejected'`, `reason_code='source_quality_block'`, gap `kind='source_quality_block'` severity='block', nessun published_answer.
-- **Branch B' — all_spans_verified_with_warnings**: `decision='approved'`, `reason_code='all_spans_verified_with_warnings'`, gap `kind='source_quality_warning'` severity='warn', published_answer v1 inserito.
-- **Branch B — all_spans_verified**: invariato 8.4.
+- **Warning flow** (`test_phase_8_8a_entailment_warning_flow_end_to_end`): pipeline normale con mock checker reale. Verdict possibili: `entailed` (containment) o `uncertain`/`not_supported` (altre regole). Final Answer Gate approved con `reason_code='all_spans_verified_with_warnings'`. Gap di tipo `entailment_warning` e/o `source_quality_warning`. `published_answers` v1 inserito.
 
-**Comportamento con il mock evaluator attuale.** Il mock 8.7D scrive sempre `overall_quality='unknown'` e `contradiction_status='unchecked'`. Conseguenza: ogni task verified-backed entra nel **Branch B'** e raggiunge `published` come terminale, con un `coverage_gap_statements` di tipo `source_quality_warning` per span. **Il `Branch C'` (source_quality_block) è implementato e testato, ma in produzione con il mock attuale non si attiva spontaneamente**: il mock non emette `unsuitable`, `contradicted_by_stronger_source`, né `conflicting_sources`. Il branch è attivato dal realistic flow test 8.7H tramite uno stub dell'orchestrator (vedi sotto).
+- **Block flow** (`test_phase_8_8a_entailment_block_flow_end_to_end`): monkeypatch del simbolo `_wapp.consumers.task_created.run_claim_entailment_checks` con uno stub che inserisce v1 di `claim_entailment_checks` con `verdict='contradicted'` per ogni pair, e ritorna il dict counts canonico atteso dal consumer. Lo stub è necessario perché **il mock checker reale non emette mai `contradicted`**. Final Answer Gate rejected con `reason_code='entailment_block'`. Gap `entailment_block` severity='block'. `task.publication_held` come evento terminale. Nessun `published_answer`. GET `/published-answer` ritorna 404 RESOURCE_NOT_FOUND con `details.resource='published_answers'`.
 
-**8.7H — Realistic flow test + chiusura formale fase 8.7.**
-
-Nuovo file di test root-level: **`tests/test_phase_8_7_source_quality_flow.py`**. Due funzioni di test end-to-end indipendenti che esercitano l'intera catena API → FakeRedis → dispatcher → `task.created` consumer → servizi worker (extractor + CVE-lite + 8.7E source quality + compiler + Final Answer Gate) → DB → read API 8.7F + endpoint 8.4 di lettura. Il worker viene caricato sotto un alias namespace `_wapp` per evitare la collisione con il package `app` dell'API (entrambi sono package top-level letteralmente chiamati `app`); Redis è una `FakeRedis` minima che cattura solo `xadd`.
-
-**Scenario warning flow** (`test_phase_8_7_source_quality_warning_flow_end_to_end`):
-
-- Setup: tenant `dev` + user `dev@local` seedati direttamente in DB; project + document (`.txt` con frasi contenenti cifre, perché l'extractor mock-driven richiede digit per emettere raw_claim) + task creati via API HTTP (`POST /api/v1/projects`, `POST /api/v1/projects/{id}/documents`, `POST /api/v1/tasks`).
-- Pipeline drive: `_dispatch.handle_event(event, redis_consumer_name='realistic_8_7h_warning')`.
-- Mock source quality evaluator → ogni evidence_span linkato ai claim del task riceve una v1 con `overall_quality='unknown'` + `contradiction_status='unchecked'`.
-- Final Answer Gate → `decision='approved'`, `reason_code='all_spans_verified_with_warnings'`.
-- Coverage gaps → almeno una riga `kind='source_quality_warning'` severity='warn', `gap_key=f'span:{span_id}:source_quality_warning'`, `details.reasons` include `source_quality_unknown` e/o `source_quality_contradiction_unchecked`. Nessun `source_quality_block`, nessun `unverified_claim`.
-- `published_answers` v1 con `status='published'`.
-- Verifica read API: `GET /api/v1/tasks/{id}/final-gate-report` 200 con `coverage_gap_statements` di kind `source_quality_warning`; `GET /api/v1/tasks/{id}/published-answer` 200; `GET /api/v1/tasks/{id}/source-quality` 200 con `summary.latest_overall_quality_counts.unknown >= 1`; `GET /api/v1/evidence-spans/{es_id}/source-quality` 200 con `latest_assessment.overall_quality='unknown'`.
-- Verifica audit chain end-to-end: `task.source_quality_assessed` strettamente tra `task.analyzed_partial` e `task.compiling`; `task.published` come evento terminale; `verify_task_audit_chain` ok.
-
-**Scenario block flow** (`test_phase_8_7_source_quality_block_flow_end_to_end`):
-
-- Setup analogo + monkeypatch del simbolo `_wapp.consumers.task_created.run_source_quality_assessment` con uno **stub orchestrator** che, per ogni evidence_span linkato al task, inserisce una riga v1 in `source_quality_assessments` con `overall_quality='unsuitable'`, `evaluator_name='test_source_quality_evaluator'`, e ritorna il dict counts canonico atteso dal consumer (`status='completed'`, `spans_total=N`, ecc.). Lo stub è necessario perché **il mock evaluator reale non produce `unsuitable` spontaneamente**.
-- Pipeline drive: `_dispatch.handle_event(event, redis_consumer_name='realistic_8_7h_block')`.
-- Final Answer Gate → `decision='rejected'`, `reason_code='source_quality_block'`.
-- Coverage gaps → almeno una riga `kind='source_quality_block'` severity='block', `gap_key=f'span:{span_id}:source_quality_block'`, `details.reasons` include `source_quality_unsuitable`. Nessun `source_quality_warning`, nessun `unverified_claim`.
-- Task terminale: `status='analyzed_partial'`, audit terminale = `task.publication_held`. **Nessun `task.published`**. Nessun `published_answers` v1.
-- Verifica read API: `GET /api/v1/tasks/{id}/final-gate-report` 200 con `decision='rejected'` e `coverage_gap_statements` di kind `source_quality_block`; `GET /api/v1/tasks/{id}/published-answer` **404 RESOURCE_NOT_FOUND** con `details.resource='published_answers'`; `GET /api/v1/tasks/{id}/source-quality` 200 con `summary.latest_overall_quality_counts.unsuitable >= 1`.
-
-Il test valida l'intera catena: API HTTP → FakeRedis → dispatcher → `task.created` consumer → source quality (mock o stub) → final gate → read API. **Branch C' viene attivato nel realistic test esclusivamente tramite stub dell'orchestrator** perché il mock evaluator reale produce solo `unknown`+`unchecked`; questa proprietà del mock è preservata e non viene alterata dal test.
+**Branch entailment_block in produzione mock-driven.** Il branch è implementato, testato a livello unit (13 scenari di `test_final_answer_gate_entailment.py` con seed diretto) e a livello realistic flow end-to-end (via stub orchestrator). Ma **in produzione con il mock attuale il branch resta dormiente**: il mock non produce `contradicted` spontaneamente. Si attiverà naturalmente con un checker reale (NLI/LLM) o con il Contradiction Detector reale (8.8C).
 
 ---
 
@@ -212,7 +203,7 @@ Il test valida l'intera catena: API HTTP → FakeRedis → dispatcher → `task.
 | `GET /api/v1/claims/{logical_id}/history` | Storia di un logical claim | 8.3 |
 | `GET /api/v1/claims/{logical_id}/evidence` | Aggregato latest + links + verifications | 8.3 |
 | `GET /api/v1/tasks/{id}/draft` | Draft v1 + spans | 8.4 |
-| `GET /api/v1/tasks/{id}/final-gate-report` | Gate report + coverage gaps (include `source_quality_*`) | 8.4 (esteso 8.7G) |
+| `GET /api/v1/tasks/{id}/final-gate-report` | Gate report + coverage gaps (include `source_quality_*` e ora `entailment_*`) | 8.4 (esteso 8.7G + 8.8A-GATE) |
 | `GET /api/v1/tasks/{id}/published-answer` | Published answer per task | 8.4 |
 | `GET /api/v1/published-answers/{id}` | Published answer per id | 8.4 |
 | `POST /api/v1/published-answers/{published_answer_id}/withdrawal-requests` | Producer asincrono di withdrawal | 8.5 |
@@ -220,74 +211,67 @@ Il test valida l'intera catena: API HTTP → FakeRedis → dispatcher → `task.
 | `GET /api/v1/published-answers/{published_answer_id}/lifecycle-events` | Read lifecycle events di un published_answer | 8.6A |
 | `GET /api/v1/source-loss-events/{source_loss_event_id}` | Read single source_loss_event | 8.6B |
 | `GET /api/v1/source-loss-events/{source_loss_event_id}/propagation` | Read propagation records di un source_loss_event | 8.6C |
-| `GET /api/v1/tasks/{task_id}/source-loss-events` | Read task-level source-loss listing (S1 ∪ S2) | 8.6D |
+| `GET /api/v1/tasks/{task_id}/source-loss-events` | Read task-level source-loss listing | 8.6D |
 | `GET /api/v1/evidence-spans/{evidence_span_id}/source-quality` | Read source quality assessments per evidence_span | 8.7F |
 | `GET /api/v1/tasks/{task_id}/source-quality` | Read task-level source quality summary | 8.7F |
 | `GET /health/live` / `/health/db` / `/health/queue` / `/health/storage` / `/health/ready` | Health checks | 8.1+ |
 
-L'endpoint `/final-gate-report` non è stato riscritto in 8.7G/H: continua a esporre i `coverage_gap_statements` collegati al draft, e quei `coverage_gap_statements` possono avere `kind ∈ {source_quality_block, source_quality_warning}` in aggiunta ai kind preesistenti.
+**Importante — cosa NON esiste ancora:**
+
+- **NON esiste** `GET /api/v1/tasks/{id}/claim-entailment` (read API per claim_entailment_checks). Da implementare in un blocco read API dedicato (provvisoriamente 8.8A-READ).
+- **NON esiste** `GET /api/v1/claims/{logical_id}/entailment-checks`.
+- **NON esiste** un endpoint Anti-Hallucination Report API aggregato (8.8E, rinviato).
+- **NON esiste** un endpoint dedicato per il payload entailment del Final Answer Gate: i dati sono accessibili via `GET /api/v1/tasks/{task_id}/final-gate-report`, che ora può restituire `coverage_gap_statements` con `kind ∈ {entailment_block, entailment_warning}` e un `payload.entailment` summary nel gate report.
+
+L'endpoint `/final-gate-report` non è stato riscritto in 8.8A-GATE: continua a esporre i `coverage_gap_statements` collegati al draft. Quei gap possono ora avere `kind ∈ {entailment_block, entailment_warning, source_quality_block, source_quality_warning, unverified_claim, missing_evidence, out_of_scope, source_loss}`. Il `payload` del gate report include una sezione `entailment` con counts e identità della policy.
 
 ---
 
-## Pipeline 8.4 / 8.7 (validata end-to-end dal test 8.7H)
+## Pipeline 8.4 / 8.7 / 8.8A (validata end-to-end dai realistic flow test)
 
-### Task con documenti, approved scenario (mock attuale = warning flow)
+### Task con documenti, approved scenario (mock attuale → warning flow, 15 eventi worker-side)
 
-`task.created` → `task.docs_attached` (API) → `task.analyzing` → `task.docs_loaded` → `task.claims_extracted` → `task.claims_classified` → `task.claims_ledger_initialized` → `task.cve_lite_started` → `task.cve_lite_completed` → `task.analyzed_partial` → `task.source_quality_assessed` → `task.compiling` → `task.draft_compiled` → `task.final_gate_started` → `task.final_gate_completed` → `task.published`.
+1. `task.analyzing`
+2. `task.docs_loaded`
+3. `task.claims_extracted`
+4. `task.claims_classified`
+5. `task.claims_ledger_initialized`
+6. `task.cve_lite_started`
+7. `task.cve_lite_completed`
+8. `task.analyzed_partial`
+9. `task.source_quality_assessed`
+10. **`task.entailment_checked`** (8.8A, nuovo)
+11. `task.compiling`
+12. `task.draft_compiled`
+13. `task.final_gate_started`
+14. `task.final_gate_completed`
+15. `task.published` (oppure `task.publication_held` se rejected)
 
-`reason_code='all_spans_verified_with_warnings'` (mock evaluator → ogni span emette `source_quality_warning` con reasons `source_quality_unknown` + `source_quality_contradiction_unchecked`). `published_answers` v1 inserito.
+Con il mock attuale: `reason_code='all_spans_verified_with_warnings'`, gap `source_quality_warning` per span, eventuali gap `entailment_warning` se il mock entailment ha emesso `uncertain`/`not_supported`. `published_answers` v1 inserito.
 
-### Task con documenti, rejected zero-verified (invariato)
+### Task con documenti, rejected zero-verified
 
-Identica fino a `task.final_gate_completed`, poi `task.publication_held`. `reason_code='no_verified_claims'`. Gap `kind='missing_evidence'`. Source Quality NON consultata (Branch A).
+Identica fino a `task.final_gate_completed`, poi `task.publication_held`. `reason_code='no_verified_claims'`. Gap `kind='missing_evidence'`. Source Quality NON consultata. Entailment NON consultato (Branch A).
 
-### Task con documenti, rejected unverified spans (invariato)
+### Task con documenti, rejected unverified spans
 
-Identica al rejected zero-verified, ma con `reason_code='unverified_spans_present'` e un gap `kind='unverified_claim'` per ogni span scoperto. Source Quality NON consultata (priorità CVE-lite, Branch C).
+Identica al rejected zero-verified, ma con `reason_code='unverified_spans_present'` e un gap `kind='unverified_claim'` per ogni span scoperto. Source Quality NON consultata. Entailment NON consultato (priorità CVE-lite, Branch C).
 
-### Task con documenti, rejected source_quality_block (Branch C' 8.7G; oggi attivabile solo via stub dell'orchestrator)
+### Task con documenti, rejected entailment_block (Branch entailment 8.8A-GATE; oggi attivabile solo via stub dell'orchestrator)
 
-Identica al rejected, ma con `reason_code='source_quality_block'` e almeno un gap `kind='source_quality_block'`. **Implementato e testato end-to-end nel realistic flow 8.7H tramite stub dell'orchestrator**; in produzione con il mock evaluator attuale non si attiva spontaneamente. Si attiverà naturalmente con un evaluator reale che produca `overall_quality='unsuitable'` o `contradiction_status ∈ {contradicted_by_stronger_source, conflicting_sources}`.
+Identica al rejected, con `reason_code='entailment_block'` e almeno un gap `kind='entailment_block'`. Eventuali gap `source_quality_*` emessi in parallelo per audit completeness (ma il reason_code resta `entailment_block`). **Implementato e testato end-to-end nel realistic flow 8.8A-GATE-FLOW tramite stub dell'orchestrator**; in produzione con il mock attuale non si attiva spontaneamente. Si attiverà naturalmente con un checker reale che produca `verdict='contradicted'`.
+
+### Task con documenti, rejected source_quality_block (Branch C' 8.7G; oggi attivabile solo via stub dell'orchestrator SQ)
+
+Identica al rejected, con `reason_code='source_quality_block'` e almeno un gap `kind='source_quality_block'`. Reached solo quando nessun entailment block fire (priorità: entailment > source quality). Eventuali gap `entailment_warning` emessi in parallelo.
 
 ### Task senza documenti (invariato)
 
-`task.created` (API) → `task.analyzing` → `task.blocked`. Lo step source quality NON viene eseguito.
+`task.created` (API) → `task.analyzing` → `task.blocked`. Step source quality e step entailment NON vengono eseguiti.
 
 ---
 
-## Semantica lifecycle e source loss (Fase 8.5, invariata)
-
-[Sezione invariata rispetto al post-8.7G. Withdrawal asincrona via API + consumer + `apply_withdrawal`; source loss INSERT immediato + pubblicazione `source_loss.detected`; propagazione soft via `source_loss_propagation_records`; nessuna estensione di `task_masters.status`; audit chain verificabile end-to-end.]
-
----
-
-## Semantica Source Quality (Fase 8.7, finale post-8.7H)
-
-Distinzioni fondative, valide per chiunque legga, consumi o veda emergere `source_quality_assessments` come gap:
-
-- **source quality ≠ claim correctness.** Un claim può essere falso anche se la fonte è autorevole; un claim può essere corretto anche se la fonte è debole. Una fonte citata NON implica claim vero.
-- **source quality ≠ evidence support.** Un legame `claim_evidence_links` ben formato non implica qualità della fonte.
-- **source quality ≠ verification outcome.** `verification_records.outcome='pass'` significa "CVE-lite passato", non "fonte affidabile".
-- **source quality ≠ source loss.** La perdita di fonte (8.5) è un evento; la qualità (8.7) è un giudizio strutturale sulla fonte presente.
-- **source quality ≠ publication eligibility.** L'eligibility è composta da correctness, evidence support, source quality e policy gate: quattro assi separati. La 8.7G aggiunge il terzo asse alla decisione del Gate; non collassa i quattro.
-
-Stato corrente dell'evaluator:
-
-- L'evaluator è un **mock deterministico** (`mock_source_quality_evaluator` v0.1.0, policy `mvp0_mock_source_quality` v0.1.0).
-- Tutte le righe scritte oggi hanno `overall_quality='unknown'` e `contradiction_status='unchecked'` con `confidence=0.5`.
-- Gli endpoint read 8.7F espongono il payload JSONB **verbatim**, senza RBAC e senza redaction.
-- Il valore `unknown` NON deve essere interpretato come approvazione forte: significa letteralmente "il sistema oggi non sa, e non finge di sapere". Il Gate lo tratta come **warning**, non come clean: un task verified-backed con mock attuale viene pubblicato con `reason_code='all_spans_verified_with_warnings'` e un `coverage_gap_statements` di tipo `source_quality_warning` per span.
-
-Stato corrente del Final Answer Gate (post-8.7G/H):
-
-- **Source Quality è consumata dal Final Answer Gate** secondo la policy P1+P3+P4 (block su `unsuitable`/`contradicted_by_stronger_source`/`conflicting_sources`; warning su `weak`/`unknown`/`unchecked`/missing; clean altrimenti).
-- La priorità *CVE-lite > Source Quality* è invariante: uno span non verified-backed produce `unverified_spans_present` indipendentemente dalla qualità delle fonti di supporto.
-- L'identità della policy è stampata nel `details` di ogni gap source_quality come `{"policy": {"name": "mvp0_source_quality_gate_policy", "version": "0.1.0"}}`.
-- **Validato end-to-end** dal realistic flow test 8.7H sia per il warning path (Branch B') sia per il block path (Branch C', tramite stub dell'orchestrator).
-
----
-
-## Final Answer Gate — regole di verifica (post-8.7G, validate da 8.7H)
+## Final Answer Gate — branch e priorità (post-8.8A-GATE)
 
 Uno span è **verified-backed** se e solo se esiste almeno un `final_answer_span_claim_links` tale che:
 
@@ -296,80 +280,83 @@ link.claim_ledger_entry_id == latest_entry_id_for(claim_logical_id)
 AND latest_entry_state_for(claim_logical_id) == 'verified_fact'
 ```
 
-Branch decisionali:
+Branch decisionali in ordine di priorità:
 
-| Condizione del draft | `decision` | `reason_code` | Coverage gap | `published_answers` |
+| Condizione del draft | `decision` | `reason_code` | Coverage gap (kind) | `published_answers` |
 |---|---|---|---|---|
-| Zero spans | `rejected` | `no_verified_claims` | `kind='missing_evidence'`, `gap_key='no_verified_claims'` | assente |
-| Almeno uno span non verified-backed (priorità CVE-lite) | `rejected` | `unverified_spans_present` | un gap `kind='unverified_claim'` per ogni span scoperto | assente |
-| Tutti verified-backed + almeno uno span ha source_quality block | `rejected` | `source_quality_block` | un gap `kind='source_quality_block'` per span bloccato + eventuali `source_quality_warning` per gli altri | assente |
-| Tutti verified-backed + almeno uno span ha source_quality warning (no block) | `approved` | `all_spans_verified_with_warnings` | un gap `kind='source_quality_warning'` per span con warning | v1 con `status='published'` |
-| Tutti verified-backed + nessun warning | `approved` | `all_spans_verified` | nessuno | v1 con `status='published'` |
+| Zero spans | `rejected` | `no_verified_claims` | `missing_evidence`, `gap_key='no_verified_claims'` | assente |
+| Almeno uno span non verified-backed (priorità CVE-lite) | `rejected` | `unverified_spans_present` | un `unverified_claim` per ogni span scoperto | assente |
+| Tutti verified-backed + almeno uno span con entailment block | `rejected` | `entailment_block` | `entailment_block` per span bloccato + eventuali `entailment_warning` + eventuali `source_quality_*` (audit) | assente |
+| Tutti verified-backed + nessun entailment block + almeno uno span con source_quality block | `rejected` | `source_quality_block` | `source_quality_block` per span bloccato + eventuali `source_quality_warning` + eventuali `entailment_warning` (audit) | assente |
+| Tutti verified-backed + nessun block + almeno uno warning (entailment OR source quality) | `approved` | `all_spans_verified_with_warnings` | `entailment_warning` e/o `source_quality_warning` per span con warning | v1 con `status='published'` |
+| Tutti verified-backed + nessun warning su entrambi gli assi | `approved` | `all_spans_verified` | nessuno | v1 con `status='published'` |
 
 ### Convenzione errori
 
-`ErrorCode.NOT_PUBLISHED` non esiste in MVP-0. Per le GET su task esistente non ancora pubblicato si restituisce `RESOURCE_NOT_FOUND` con `details.resource='published_answers'`. Per task inesistente: `details.resource='task_masters'`. Convenzione confermata dal block flow 8.7H, che riceve 404 RESOURCE_NOT_FOUND con `details.resource='published_answers'` dopo il `source_quality_block`.
+`ErrorCode.NOT_PUBLISHED` non esiste in MVP-0. Per le GET su task esistente non ancora pubblicato si restituisce `RESOURCE_NOT_FOUND` con `details.resource='published_answers'`. Per task inesistente: `details.resource='task_masters'`.
 
 ---
 
-## Test (post-8.7H)
+## Test (post-8.8A-GATE-FLOW)
 
-Test plan implementato per la fase 8.7:
+Test plan implementato:
 
-- **Unit / integration**:
-  - `apps/worker/tests/test_source_quality_evaluator_service.py` (14 scenari, 8.7D)
-  - `apps/worker/tests/test_source_quality_orchestrator.py` (7 scenari, 8.7E)
-  - `apps/worker/tests/test_task_created_source_quality_step.py` (4 scenari, 8.7E)
-  - `apps/worker/tests/test_consumer_with_documents.py` (sequenza 14 eventi post-8.7E)
-  - `apps/api/tests/test_source_quality_read_endpoint.py` (read API 8.7F)
-  - `apps/worker/tests/test_final_answer_gate_source_quality.py` (13 scenari, 8.7G)
-  - `apps/worker/tests/test_compiler_and_gate.py` e `test_extractor_and_cve_lite.py` allineati al nuovo reason_code di default (`all_spans_verified_with_warnings`)
-- **Realistic flow (8.7H, root-level)**:
-  - **`tests/test_phase_8_7_source_quality_flow.py`** — due test end-to-end:
-    - `test_phase_8_7_source_quality_warning_flow_end_to_end` — copre il warning flow: mock source quality → `overall_quality='unknown'` + `contradiction_status='unchecked'` → Final Answer Gate approved con `reason_code='all_spans_verified_with_warnings'` → `source_quality_warning` gap → `published_answers` v1.
-    - `test_phase_8_7_source_quality_block_flow_end_to_end` — copre il block flow: orchestrator stub nel consumer → `source_quality_assessments` con `overall_quality='unsuitable'` → Final Answer Gate rejected con `reason_code='source_quality_block'` → `source_quality_block` gap → `task.publication_held` → nessun `published_answer`.
+- **Migration**: `tests/test_migration_0009_claim_entailment_checks.py` e `tests/test_migration_0010_coverage_gap_entailment.py`.
+- **Service**: `apps/worker/tests/test_claim_entailment_checker_service.py` (8 scenari principali + defensive coverage).
+- **Orchestrator**: `apps/worker/tests/test_claim_entailment_orchestrator.py` (9 scenari).
+- **Worker integration**: `apps/worker/tests/test_task_created_entailment_step.py` (4 scenari: audit position, popolamento checks, resume non re-emette, failure SAVEPOINT).
+- **Worker pipeline aggregata**: `apps/worker/tests/test_consumer_with_documents.py` aggiornato per la sequenza a **15 eventi** (approved + rejected scenarios).
+- **Gate**: `apps/worker/tests/test_final_answer_gate_entailment.py` (13 scenari: contradicted/not_supported/partially_supported/uncertain/missing → policy, priorità CVE-lite > entailment, priorità entailment > source_quality, coesistenza warning, latest version wins, read-only contract, payload entailment).
+- **Realistic flow end-to-end** (root): `tests/test_phase_8_8a_entailment_gate_flow.py` (2 test: warning flow con mock reale, block flow via stub orchestrator).
 
-Tutti i test sono passing al commit `b70ef8f` post-8.7H.
+**Risultati riportati:**
+
+- `tests/test_phase_8_8a_entailment_gate_flow.py`: 2 passed.
+- Root tests: 162 passed.
+- Worker tests: 143 passed.
+- Commit: `394257b Add claim entailment gate realistic flow`.
 
 ---
 
 ## Cosa è ancora rinviato (non implementato) — debiti tecnici e roadmap
 
-### Anti-Hallucination roadmap (post-chiusura 8.7)
+### Anti-Hallucination roadmap (post-chiusura tecnica 8.8A)
 
-**Disclaimer.** La piattaforma non elimina le allucinazioni in senso assoluto. Impedisce o rende visibili claim non supportati, contraddetti o basati su fonti inadeguate prima della pubblicazione affidabile. I componenti elencati di seguito sono **ancora mancanti** in MVP-0 post-8.7H:
+**Disclaimer.** Il sistema è progettato per impedire che claim fattuali non supportati, contraddetti o basati su fonti inadeguate vengano pubblicati come affidabili. Non elimina le allucinazioni in senso assoluto.
 
-- **8.8A — Claim Entailment Checker.** Verifica che l'evidence quote effettivamente implichi (o sia compatibile con) il claim, non solo che sia testualmente presente. **Mancante.**
-- **8.8B — Citation-to-Claim Validator.** Verifica che il claim citi le evidenze giuste, non evidenze "vicine" che non lo supportano. **Mancante.**
-- **8.8C — Contradiction Detector reale.** Detector reale di contraddizioni tra claim o tra fonti (oggi `contradiction_records` placeholder, `contradiction_status='unchecked'` per costruzione del mock). Quando attivato, sostituirà le `unchecked` con valori reali e attiverà naturalmente il `Branch C'` del Gate. **Mancante.**
-- **8.8D — Final Answer Sentence Gate.** Gate a livello frase nel published_answer, non solo a livello span verified-backed. **Mancante.**
-- **8.8E — Anti-Hallucination Report API.** Endpoint aggregato che riporta su un singolo published_answer tutti gli assi (entailment, citation, contradiction, source quality). **Mancante.**
-- **8.9 — External Verification / Web-RAG controllato.** Verifica esterna su fonti web in modalità controllata (Verified Web Mode), non più solo closed corpus. **Mancante.**
-- **9.0 — Multi-agent consensus + adversarial review reale.** Provider AI reali, consensus engine, critical reviewer adversariale.
+Componenti **ancora mancanti** dopo la chiusura tecnica di 8.8A:
 
-Il prossimo blocco operativo consigliato è **8.8A-PRE / Claim Entailment Checker**.
+- **8.8A-READ** — Read API per `claim_entailment_checks` (`GET /api/v1/tasks/{id}/claim-entailment` e/o `GET /api/v1/claims/{logical_id}/entailment-checks`). **Mancante.**
+- **8.8B — Citation-to-Claim Validator.** Verifica che il claim citi le evidenze corrette, non evidenze "vicine" che non lo supportano. **Mancante.**
+- **8.8C — Contradiction Detector reale.** Detector reale di contraddizioni tra claim o tra fonti (oggi il mock entailment non emette `contradicted` spontaneamente). Quando attivato, il Branch entailment_block del Gate si attiverà naturalmente. **Mancante.**
+- **8.8D — Final Answer Sentence Gate.** Gate a livello frase del published_answer. **Mancante.**
+- **8.8E — Anti-Hallucination Report API.** Endpoint aggregato che espone, per un published_answer, lo stato di tutti gli assi (entailment, citation, contradiction, source quality, source loss). **Mancante.**
+- **8.9 — External Verification / Web-RAG controllato.** Verifica esterna su fonti web in modalità controllata. **Mancante.**
+- **9.0 — Multi-agent consensus + adversarial review reale.** Provider AI reali, consensus engine, critical reviewer adversariale. **Mancante.**
 
 ### Altri debiti tecnici
 
-- **Backfill source quality per task pre-8.7E.** I task processati prima dell'integrazione 8.7E non hanno righe in `source_quality_assessments`. Il Gate per tali task emette warning `source_quality_missing_assessment` su ogni span (senza bloccare). Non esiste backfill script.
-- **Recompile/v2 dopo source_quality_block.** Un task bloccato da `source_quality_block` non ha oggi un path applicativo per ritentare con un draft v2 (il compiler emette solo v1). Rejected è terminale per quel task.
-- **`coverage_gap_statements` senza trigger append-only.** La tabella non ha un trigger `reject_modify_append_only`. 8.7G rispetta operativamente l'invariante insert-only, ma non c'è enforcement a DB.
-- **`conflicting_sources` come block è un compromesso.** Sarebbe semanticamente più corretto un "hold for human review", ma `task_masters.status` non si estende.
-- **Retention reale distruttiva** (`0009_*` da scrivere). Le tabelle 8.5/8.7 crescono senza pruning.
-- **RBAC / redaction** sui payload JSONB esposti dagli endpoint read 8.6/8.7F e sulle `details` dei `coverage_gap_statements`.
+- **NLI reale per Claim Entailment.** Il mock entailment è un'euristica deterministica a 3 regole sintattiche e NON è un modello NLI reale. Un futuro checker reale richiederà bump di `policy_version` (`mvp0_entailment_gate_policy` → futuro) e probabile re-run del corpus storico.
+- **Mock entailment non emette `contradicted` né `partially_supported`.** Branch `entailment_block` dormiente in produzione mock; attivato solo via stub nei test.
+- **Backfill claim_entailment_checks per task pre-8.8A-WORKER.** I task processati prima dell'integrazione 8.8A nel consumer non hanno righe in `claim_entailment_checks`. Il Gate per tali task emette warning `entailment_missing_check` su ogni span (senza bloccare). Nessun backfill script.
+- **Backfill source quality per task pre-8.7E.** Analogo per Source Quality.
+- **Recompile/v2 dopo entailment_block o source_quality_block.** Un task bloccato non ha oggi un path applicativo per ritentare con un draft v2 (il compiler emette solo v1). Rejected è terminale per quel task.
+- **`coverage_gap_statements` senza trigger append-only.** La tabella non ha un trigger `reject_modify_append_only`. 8.7G/8.8A rispettano operativamente l'invariante insert-only, ma non c'è enforcement a DB.
+- **Retention reale distruttiva** (`0011_*` da scrivere). Le tabelle 8.5/8.7/8.8A crescono senza pruning.
+- **RBAC / redaction** sui payload JSONB esposti dagli endpoint read 8.6/8.7F e sulle `details` dei `coverage_gap_statements` (incluse le nuove `entailment_*`).
 - **Provider AI reali, Verified Web Mode, Hybrid Mode.** MVP-0 gira con `PROVIDERS_ENABLED=mock` e `MAX_COST_PER_TASK=0`.
 - **Renderer ed export** Markdown/HTML/PDF/DOCX/JSON-LD.
 - **Auth reale.**
 - **DLQ esplicita per il worker.**
-- **UI completa.** In particolare nessuna UI ancora espone i nuovi gap source_quality.
+- **UI completa.** Nessuna UI espone ancora i nuovi gap `entailment_*` né i gap `source_quality_*`.
 - **OCR / parsing PDF, vector store cloud, storage S3 / GCS / Azure operativo.**
-- **Cursor pagination** sugli endpoint read 8.6/8.7F.
-- **Stretch 8.6** `GET /api/v1/published-answers/{id}/source-loss-impact` — opzionale, non implementato.
-- **Worker main loop reale negli end-to-end test.** I realistic flow 8.5/8.6/8.7H usano FakeRedis e invocano `dispatch.handle_event` direttamente.
-- **N+1 nel task endpoint 8.7F**: accettato per MVP-0.
-- **Calibrazione futura della policy 8.7G con evaluator reale.** P2 (block su `weak`) è oggi scartata; potrebbe diventare difendibile con un evaluator reale + P5 (disclosure). La policy versionata (`mvp0_source_quality_gate_policy` v0.1.0) abilita un bump futuro tracciabile.
-- **"unknown" non significa "approvato".** Il Gate oggi lo tratta correttamente come warning; un futuro consumatore esterno (UI, report) deve continuare a presentarlo come incertezza, non come approvazione. **Una fonte citata non implica un claim vero**: la qualità della fonte e la correttezza del claim restano assi separati.
-- **Branch C' (source_quality_block)** è implementato e testato end-to-end (via stub orchestrator in 8.7H), ma con il mock evaluator attuale **non si attiva spontaneamente in produzione**: serve un evaluator reale che emetta `unsuitable` / `contradicted_by_stronger_source` / `conflicting_sources` (8.8C).
+- **Cursor pagination** sugli endpoint read 8.6/8.7F (e futuri 8.8A-READ).
+- **Worker main loop reale negli end-to-end test.** I realistic flow 8.5/8.6/8.7H/8.8A-GATE-FLOW usano FakeRedis e invocano `dispatch.handle_event` direttamente.
+- **Calibrazione futura della policy 8.8A-GATE con checker reale.** P2 (`not_supported → block`) è oggi scartata; potrebbe diventare difendibile con un checker reale + P5 (disclosure). La policy è versionata (`mvp0_entailment_gate_policy` v0.1.0) per abilitare un bump futuro tracciabile.
+- **Confondere "entailed" mock con verità del claim resta scorretto.** Il Gate oggi tratta correttamente le dimensioni come ortogonali; un futuro consumatore esterno (UI, report) deve continuare a presentare entailment come "supporto semantico claim ↔ quote", NON come verità del claim. **Una fonte citata non implica un claim vero. Una quote presente non implica che la quote sostenga il claim.**
+- **Branch `entailment_block`** è implementato e testato end-to-end (via stub orchestrator), ma con il mock checker attuale **non si attiva spontaneamente in produzione**: serve un checker reale che emetta `verdict='contradicted'` (8.8C o successive).
+- **Crescita del Final Answer Gate.** Post-8.8A-GATE il file ha sei branch + due LATERAL JOIN. Refactor in modulo policy separato rinviato a blocco dedicato.
+- **`evaluator` NLI reale non esiste**; il mock heuristic non sostituisce un NLI semantico.
 
 ---
 
@@ -378,26 +365,28 @@ Il prossimo blocco operativo consigliato è **8.8A-PRE / Claim Entailment Checke
 - Nessun provider AI reale, nessun riferimento operativo a OpenAI, Anthropic, Google o altri provider esterni nel codice di MVP-0.
 - `PROVIDERS_ENABLED=mock`, `MAX_COST_PER_TASK=0`.
 - Closed Corpus only.
-- SQLAlchemy 2.0 Core: `Connection`, non `Engine.execute`.
-- Migration applicate (0001–0008) sono immutabili. Modifiche schema solo via nuove migration.
+- SQLAlchemy 2.0 Core: `Connection`, non `Engine.execute`. Query SQL con bound params.
+- Migration applicate (0001–0010) sono immutabili. Modifiche schema solo via nuove migration.
 - Test rerun-safe con UUID/hash/marker unici per invocazione.
-- Append-only enforced a DB su `audit_records`, `evidence_spans`, `claim_ledger_entries`, `final_answer_spans`, `final_gate_reports`, `published_answer_lifecycle_events`, `source_loss_events`, `source_loss_propagation_records`, `source_quality_assessments`.
-- Endpoint API 8.6/8.7F read-only.
-- Final Answer Gate (8.7G): consultazione read-only di `source_quality_assessments`; nessuna mutazione su quella tabella né su `claim_ledger_entries`/`claim_lineage`.
+- Append-only enforced a DB su `audit_records`, `evidence_spans`, `claim_ledger_entries`, `final_answer_spans`, `final_gate_reports`, `published_answer_lifecycle_events`, `source_loss_events`, `source_loss_propagation_records`, `source_quality_assessments`, **`claim_entailment_checks`**.
+- Endpoint API 8.6/8.7F read-only. Read API claim-entailment NON ancora esposta.
+- Final Answer Gate (8.7G + 8.8A-GATE): consultazione read-only di `source_quality_assessments` e `claim_entailment_checks`; nessuna mutazione su quelle tabelle né su `claim_ledger_entries`/`claim_lineage`.
 
 ---
 
 ## Prossimo passo
 
-**Fase 8.7 chiusa al commit `b70ef8f`.** Il prossimo blocco operativo consigliato è:
+**Fase 8.8A tecnicamente chiusa al commit `394257b`.** Il prossimo blocco operativo consigliato è uno dei seguenti, in ordine di valore architetturale:
 
-- **8.8A-PRE / Claim Entailment Checker** — apertura della fase 8.8 anti-hallucination con il primo entailment checker reale (oltre la CVE-lite di sola presenza testuale). Vedi `PHASE_8_7_PLAN.md §13` per la roadmap completa.
+- **8.8A-READ** — Read API per `claim_entailment_checks` (`GET /api/v1/tasks/{id}/claim-entailment` task-level summary + per-span breakdown; opzionale `GET /api/v1/claims/{logical_id}/entailment-checks`). Read-only, JSONB verbatim, no RBAC in MVP-0.
+- **8.8B-REPORT** — Anti-Hallucination Report API aggregato (`GET /api/v1/tasks/{id}/anti-hallucination-report` o `GET /api/v1/published-answers/{id}/anti-hallucination-report`) che compone i quattro assi (entailment, source quality, source loss, CVE-lite verification) in un singolo payload.
+- **UI-PRE** — Apertura della fase UI con un primo design dedicato per esporre coverage gaps (`entailment_*`, `source_quality_*`, `unverified_claim`, `missing_evidence`) e per distinguere visivamente i quattro assi anti-allucinazione.
 
 Direzioni complementari (sempre da decidere con prompt dedicato):
 
-- **0009_* retention** una volta deciso il perimetro distruttivo.
+- **0011_* retention** una volta deciso il perimetro distruttivo.
 - **RBAC e redaction** dei JSONB esposti dagli endpoint read 8.6/8.7F e dei `details` dei `coverage_gap_statements`.
 - **Cursor pagination** sugli endpoint read.
-- **Stretch 8.6**: `GET /api/v1/published-answers/{id}/source-loss-impact`.
 - **Smoke test end-to-end con Redis reale** e worker main loop reale.
-- **Trigger append-only** su `coverage_gap_statements` (oggi insert-only operativo, non enforced a DB).
+- **Trigger append-only** su `coverage_gap_statements`.
+- **8.8C — Contradiction Detector reale** per attivare spontaneamente il Branch `entailment_block` (e popolare `source_quality_assessments.contradiction_status` con valori reali).

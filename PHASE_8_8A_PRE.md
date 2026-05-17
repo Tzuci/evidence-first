@@ -1,5 +1,63 @@
 # PHASE_8_8A_PRE — Claim Entailment Checker (analisi architetturale pre-codice)
 
+> ## Stato post-implementazione (aggiornato dopo il blocco 8.8A-DOC-B)
+>
+> **Commit tecnico di chiusura della fase 8.8A:** `394257b141a2109c1aca0ad937ae775bf51bb143` ("Add claim entailment gate realistic flow").
+>
+> Il presente documento è nato come **piano pre-codice** della sotto-fase 8.8A. Il corpo storico che segue (§1–§15) descrive l'analisi decisionale antecedente all'implementazione e viene preservato integralmente come traccia documentale del ragionamento. Le sezioni che parlano al futuro ("non scritto", "da scrivere in 8.8A-CODE", "prossima migration disponibile: 0009", "Gate non consuma ancora entailment") riflettono lo stato del repository al momento in cui questo piano è stato redatto e **non descrivono lo stato corrente**. Lo stato corrente vive in `PROJECT_STATE.md`, che è la fonte documentale autoritativa post-394257b.
+>
+> ### Blocchi 8.8A completati
+>
+> Tutti i blocchi della sotto-fase 8.8A sono tecnicamente chiusi al commit 394257b:
+>
+> - **8.8A-PRE** — questo documento (piano pre-codice).
+> - **8.8A-SCHEMA** — `migrations/0009_claim_entailment_checks.sql` + `tests/test_migration_0009_claim_entailment_checks.py`.
+> - **8.8A-SHARED** — `packages/shared/evidencefirst_shared/schemas.py` esteso con `SOURCE_ENTAILMENT_VERDICT_VALUES`, `ClaimEntailmentVerdict` Literal alias, `ClaimEntailmentCheckRead`.
+> - **8.8A-SERVICE** — `apps/worker/app/services/claim_entailment_checker.py` (mock heuristic checker MVP-0) + `apps/worker/tests/test_claim_entailment_checker_service.py`.
+> - **8.8A-ORCHESTRATOR** — `apps/worker/app/services/claim_entailment_orchestrator.py` + `apps/worker/tests/test_claim_entailment_orchestrator.py`.
+> - **8.8A-WORKER** — integrazione in `apps/worker/app/consumers/task_created.py` con audit aggregato `task.entailment_checked` SAVEPOINT-protetto, `apps/worker/tests/test_task_created_entailment_step.py`, e `apps/worker/tests/test_consumer_with_documents.py` aggiornato a 15 eventi worker-side.
+> - **8.8A-GATE-PRE** — `PHASE_8_8A_GATE_PRE.md` (analisi decisionale pre-Gate, vedi documento dedicato).
+> - **8.8A-GATE-SCHEMA** — `migrations/0010_coverage_gap_entailment.sql` + `tests/test_migration_0010_coverage_gap_entailment.py`.
+> - **8.8A-GATE-CODE** — estensione di `apps/worker/app/services/final_answer_gate.py` per consumare `claim_entailment_checks` + `apps/worker/tests/test_final_answer_gate_entailment.py` (13 scenari). I test 8.7G di Source Quality e i test del compiler/gate sono stati riallineati per riflettere il nuovo branch.
+> - **8.8A-GATE-FLOW** — `tests/test_phase_8_8a_entailment_gate_flow.py` (warning path + block path end-to-end).
+>
+> ### Decisioni finali effettivamente adottate
+>
+> Le opzioni analizzate nel corpo storico hanno prodotto le seguenti decisioni operative, oggi implementate:
+>
+> - **Opzione A — nuova tabella append-only `claim_entailment_checks`** (vedi §6 storico): adottata. Migration `0009_claim_entailment_checks.sql` applicata. Granularità `(claim_ledger_entry_id, evidence_span_id)`, versionata, idempotente, append-only via trigger comune `reject_modify_append_only()`.
+> - **Codominio `verdict`** (vedi §3.1 storico): adottato con cinque valori — `entailed`, `partially_supported`, `not_supported`, `contradicted`, `uncertain`. Il codominio è stampato a DB nel CHECK `cec_verdict_chk` ed esposto a Python come tupla `SOURCE_ENTAILMENT_VERDICT_VALUES` e come `Literal` alias `ClaimEntailmentVerdict` in `packages/shared/evidencefirst_shared/schemas.py`.
+> - **Mock checker MVP-0** (vedi §10 storico): adottato con tre regole deterministiche applicate in ordine, primo match vince:
+>   - Rule 1 — containment normalizzato (lowercase + whitespace collapsed; claim ⊆ quote o quote ⊆ claim) → `entailed`, confidence 0.8.
+>   - Rule 2 — numeric mismatch (entrambi i testi hanno numeri AND i set differiscono) → `not_supported`, confidence 0.6.
+>   - Default → `uncertain`, confidence 0.5.
+>   - **Il mock NON emette mai `contradicted` né `partially_supported`**: questi due verdict sono riservati a checker reali futuri (8.9+) o a seed di test fixtures. Ogni riga emessa porta `payload.mock = true` e `payload.semantic_warning = "mvp0 heuristic; not a real NLI/LLM entailment model"`.
+> - **Pipeline integration point** (vedi §8 storico): adottata la **Possibilità 2** — nuovo step `_run_8_8_claim_entailment` in `apps/worker/app/consumers/task_created.py`, **dopo** `_run_8_7_source_quality` e **prima** di `_advance_to_compiling`. SAVEPOINT-wrapped, audit aggregato unico `task.entailment_checked` con `status ∈ {completed, failed}`, idempotente, non-blocking sul mock. La sequenza audit worker-side passa da 14 a 15 eventi.
+> - **Policy del Final Answer Gate** (vedi anche `PHASE_8_8A_GATE_PRE.md` §6): adottata **P1 / P4** in MVP-0. `contradicted` blocca; `not_supported`, `partially_supported`, `uncertain` e check mancante producono warning; `entailed` clean. Identità della policy: `mvp0_entailment_gate_policy` v0.1.0. Versionata per consentire un futuro bump a P2 quando un checker reale (NLI/LLM) sarà disponibile.
+> - **Priorità Gate** (invariante critica, testata): `no_verified_claims > unverified_spans_present > entailment_block > source_quality_block > approved_with_warnings > approved_clean`. **CVE-lite > Claim Entailment > Source Quality**. Quando entailment_block e source_quality_block fioccano sullo stesso draft, il reason_code è `entailment_block` ma entrambe le tipologie di gap vengono emesse per audit completo.
+> - **Nuovi `coverage_gap_statements.kind`** (vedi `PHASE_8_8A_GATE_PRE.md` §8): adottati `entailment_block` (severity `block`) e `entailment_warning` (severity `warn`). Migration `0010_coverage_gap_entailment.sql` applicata. `gap_key` deterministico: `f'span:{final_answer_span_id}:entailment_{block,warning}'`.
+> - **Nuovo `final_gate_reports.reason_code`**: adottato `entailment_block`. Riusato `all_spans_verified_with_warnings` (già esistente da 8.7G) per approved con warning misti — nessuna proliferazione di reason_code per asse.
+> - **No mutation Claim Ledger**: il Gate consulta `claim_entailment_checks` in sola lettura; non muta `claim_ledger_entries`, non crea v(N+1) `unverifiable` su `not_supported`, non aggiunge stati come `entailment_failed`. Verificato dal test 12 di `test_final_answer_gate_entailment.py` via pre/post snapshot.
+> - **No API read entailment**: nessuna read API esposta in 8.8A. L'osservabilità per ora vive nei `coverage_gap_statements` e nel `final_gate_reports.payload`. Le due read API previste (`/claims/{logical_id}/entailment-checks`, `/tasks/{task_id}/entailment`) sono rinviate al blocco 8.8A-READ (futuro).
+> - **Block path validato via stub**: il branch `entailment_block` è dormiente in produzione con il mock attuale (il mock non emette `contradicted`). Nel realistic flow `tests/test_phase_8_8a_entailment_gate_flow.py::test_phase_8_8a_entailment_block_flow_end_to_end` il branch è attivato via monkeypatch del simbolo `_wapp.consumers.task_created.run_claim_entailment_checks` con uno stub che inserisce `verdict='contradicted'` per ogni pair. Pattern mirror del block flow 8.7H.
+>
+> ### Note sulle frasi storiche da non leggere come stato corrente
+>
+> Le frasi seguenti, presenti nel corpo storico, riflettono lo stato pre-implementazione e sono state superate dalle decisioni elencate sopra:
+>
+> - "**8.8A — Claim Entailment Checker. Mancante.**" (§1.5 storico) → oggi 8.8A è tecnicamente chiusa.
+> - "**prossima migration disponibile: 0009**" (§1.1 storico) → oggi 0009 e 0010 sono applicate; la prossima migration disponibile è **0011** o successiva.
+> - "**retention futura 0010**" (varie sezioni) → oggi 0010 è occupata da `coverage_gap_entailment`. La retention futura distruttiva slitta a **0011 o successivo**.
+> - "**Il Gate NON consulta `claim_entailment_checks`**" (vista nel piano pre-codice e ripresa anche da PHASE_8_8A_GATE_PRE §1.4) → oggi il Final Answer Gate consuma `claim_entailment_checks` in sola lettura secondo la policy `mvp0_entailment_gate_policy` v0.1.0.
+> - "**file da creare nei blocchi successivi**" (§14.3 storico) → oggi tutti i file elencati sono presenti nel repository.
+> - "**non scritto (8.8A-CODE)**" nel Riepilogo deliverable (§15 storico) → oggi tutti i deliverable elencati sono in stato **done**, fatta eccezione per le read API entailment (rinviate a 8.8A-READ) e per l'aggiornamento documentale di `README.md` (oggetto del blocco corrente 8.8A-DOC-B).
+>
+> ### Promessa anti-allucinazione (invariata)
+>
+> Il sistema è progettato per impedire che claim fattuali non supportati, contraddetti o basati su fonti inadeguate vengano pubblicati come affidabili. **Non promette di eliminare le allucinazioni in senso assoluto.** Una fonte citata non implica un claim vero; una quote presente non implica che la quote sostenga il claim; un verdict `entailed` del mock non significa che il claim sia vero nel mondo, ma solo che la quote contiene testualmente il claim o gli è equivalente sotto la normalizzazione del mock. L'unico verdict che blocca in MVP-0 è `contradicted`, che il mock heuristic attuale non è in grado di emettere.
+
+---
+
 Documento **decisionale e di piano** per l'apertura della Fase 8.8 dell'Evidence-First MVP-0. Questo blocco è **solo analisi e progettazione**: non scrive codice applicativo, non scrive migration, non scrive test implementativi. Il solo deliverable è questo documento.
 
 **Commit di partenza implicito**: stato post-8.7H al main attuale `b3231a51290777c53e73c38c2e835e5149efc78e` ("Close phase 8.7 source quality"). Lo stato tecnico di riferimento è quello descritto in `PROJECT_STATE.md` e `PHASE_8_7_PLAN.md` al commit `b70ef8fb394e0f28befdfd2b3a699c32a88e9914` ("Add phase 8.7 source quality realistic flow").
@@ -25,7 +83,9 @@ Tutto ciò che segue è riassunto direttamente dai file letti (`PROJECT_STATE.md
 | `0007_source_quality.sql` | applicata (8.7B), immutabile | `source_quality_assessments` append-only, codomini codificati. |
 | `0008_coverage_gap_source_quality.sql` | applicata (8.7G), immutabile | estende `coverage_gap_statements.kind` da quattro a sei valori (`unverified_claim`, `missing_evidence`, `out_of_scope`, `source_loss`, `source_quality_block`, `source_quality_warning`). |
 
-**Conseguenza per la numerazione**: la prossima migration disponibile è **0009**. La retention futura distruttiva, già rinviata in 8.7G/H, slitterà a 0010 (o successivo) se 0009 viene assegnato a 8.8A.
+**Conseguenza per la numerazione (storica, pre-implementazione)**: la prossima migration disponibile è **0009**. La retention futura distruttiva, già rinviata in 8.7G/H, slitterà a 0010 (o successivo) se 0009 viene assegnato a 8.8A.
+
+> **Aggiornamento post-implementazione**: 0009 è stata assegnata a `claim_entailment_checks` e 0010 a `coverage_gap_entailment`. La retention futura distruttiva slitta a **0011 o successivo**.
 
 ### 1.2 Pipeline worker corrente (`apps/worker/app/consumers/task_created.py`)
 
@@ -51,6 +111,8 @@ task.created (event)
 
 Lo step 8.7E è incapsulato in `conn.begin_nested()` (vedi `_run_8_7_source_quality` in `task_created.py`); audit aggregato `task.source_quality_assessed` emesso una sola volta per task, success o failure. Resume da `analyzed_partial`/`compiling` NON re-esegue 8.7E.
 
+> **Aggiornamento post-implementazione**: la sequenza ora ha 15 eventi worker-side con `task.entailment_checked` inserito tra `task.source_quality_assessed` e `task.compiling`. Stesso pattern SAVEPOINT di 8.7E.
+
 ### 1.3 Final Answer Gate corrente (`apps/worker/app/services/final_answer_gate.py`)
 
 Branch decisionali post-8.7G (validati end-to-end da 8.7H):
@@ -70,6 +132,8 @@ AND latest_entry_state_for(claim_logical_id) == 'verified_fact'
 ```
 
 **Priorità invariante**: CVE-lite > Source Quality. Il Gate consulta `source_quality_assessments` solo quando ogni span è verified-backed.
+
+> **Aggiornamento post-implementazione**: il Gate è stato esteso in 8.8A-GATE-CODE per consumare anche `claim_entailment_checks`. La priorità diventa **CVE-lite > Claim Entailment > Source Quality**. Sono stati aggiunti il branch `entailment_block` (reason_code) e i gap kind `entailment_block` / `entailment_warning`. Vedi `PHASE_8_8A_GATE_PRE.md` per i dettagli e `apps/worker/tests/test_final_answer_gate_entailment.py` per la copertura test (13 scenari).
 
 ### 1.4 Read API 8.7F
 
@@ -91,6 +155,8 @@ Dal `PHASE_8_7_PLAN.md §13` (anti-allucinazione roadmap), componenti **dichiara
 - 9.0 — Multi-agent consensus + adversarial review reale. Mancante.
 
 Questo blocco apre la prima voce della lista.
+
+> **Aggiornamento post-implementazione**: 8.8A è tecnicamente chiusa al commit 394257b. Restano mancanti: read API entailment task-level (rinviata a 8.8A-READ), Anti-Hallucination Report API aggregata (8.8B-REPORT), Citation-to-Claim Validator (8.8B), Contradiction Detector reale (8.8C), Final Answer Sentence Gate (8.8D), External Verification / Web-RAG (8.9), Multi-agent consensus reale (9.0), UI, RBAC/redaction, retention distruttiva.
 
 ---
 
@@ -128,6 +194,8 @@ Conseguenza: **un claim non implicato dalla quote o addirittura contraddetto dal
 
 Questo è il primo buco anti-allucinazione lasciato aperto dalla pipeline 8.7. Il Claim Entailment Checker (8.8A) chiude esattamente questo buco.
 
+> **Aggiornamento post-implementazione**: il buco è oggi parzialmente coperto in MVP-0. Con il mock heuristic attuale, il claim B ("company is financially healthy") riceverebbe verdict `uncertain` (default), il claim C anche, e il claim D verdict `not_supported` (numeric mismatch tra "37%" e "declined") o `uncertain`. **Nessuno di questi blocca in MVP-0**: il Gate emette `entailment_warning`, ma il task raggiunge comunque `published`. Solo `contradicted` blocca, e il mock non lo emette. Con un checker reale futuro (NLI/LLM, fase 8.9+) il branch `entailment_block` si attiverà in produzione e la calibrazione potrà passare a P2 (`not_supported → block`) tramite bump di `policy_version`.
+
 ### 2.3 Cosa il Claim Entailment Checker NON è
 
 Per evitare confusione con i blocchi successivi (8.8B/C/D):
@@ -156,6 +224,8 @@ Questo codomino è esplicitamente **diverso** da:
 - `verification_records.outcome ∈ {pass, fail, inconclusive}` (CVE-lite parla di hash/substring),
 - `claim_ledger_entries.state ∈ {candidate, verified_fact, ..., unverifiable, rejected}` (parla dello stato del claim nel Ledger),
 - `source_quality_assessments.contradiction_status ∈ {no_known_contradiction, contradicted_by_stronger_source, conflicting_sources, unchecked}` (parla del rapporto della fonte con altre fonti, non claim ↔ quote).
+
+> **Aggiornamento post-implementazione**: il codominio è stato adottato esattamente come proposto. È stampato a DB nel CHECK `cec_verdict_chk` della migration 0009 e riflesso a Python in `SOURCE_ENTAILMENT_VERDICT_VALUES` e `ClaimEntailmentVerdict` Literal alias in `packages/shared/evidencefirst_shared/schemas.py`. Il mock checker MVP-0 emette soltanto `entailed`, `not_supported`, `uncertain`; `partially_supported` e `contradicted` sono riservati a checker reali futuri o a seed di test fixtures.
 
 ### 3.2 Distinzioni invariate
 
@@ -200,6 +270,8 @@ Motivazione:
 - Source Quality interviene quando i due assi precedenti sono passati: la fonte è strutturalmente adeguata?
 
 Questa è una proposta operativa. La motivazione è che claim-quote semantic mismatch è un errore più grave (anti-allucinazione diretta) di una source weak/unknown (warning informativo). 8.8A-CODE non implementa il Gate; lo motiva qui per fissare il design.
+
+> **Aggiornamento post-implementazione**: la priorità è stata adottata esattamente come proposta e oggi è invariante critica testata. Vedi `apps/worker/tests/test_final_answer_gate_entailment.py` scenari 7 (CVE-lite > Entailment), 8 (Entailment > Source Quality), 9 (Source Quality block residuale).
 
 ---
 
@@ -283,6 +355,8 @@ Motivazione sintetica:
 4. Costi accettabili: una migration in più, una nuova SELECT nel Final Answer Gate, una nuova route read API futura. Tutti gli altri blocchi 8.8x potranno consumare la tabella senza ulteriori cambi schema.
 
 La scelta è coerente con la motivazione tecnica del 8.7B (vedi `PHASE_8_7_PLAN.md §4`, Opzione A implementata): "lo strato in tabella propria offre la massima separazione semantica e auditabilità".
+
+> **Aggiornamento post-implementazione**: l'Opzione A è stata adottata. Vedi `migrations/0009_claim_entailment_checks.sql`.
 
 ---
 
@@ -379,6 +453,8 @@ BEFORE UPDATE OR DELETE ON claim_entailment_checks
 FOR EACH ROW EXECUTE FUNCTION reject_modify_append_only();
 ```
 
+> **Aggiornamento post-implementazione**: la forma effettivamente applicata in `migrations/0009_claim_entailment_checks.sql` è funzionalmente identica al candidato qui sopra. Vedi il file di migration per il testo definitivo.
+
 ### 7.1 Note di disegno
 
 - **`tenant_id` NOT NULL, `project_id` NULLABLE**: stesso pattern di `source_quality_assessments`. Permette check su artefatti senza progetto (improbabile in MVP-0 ma coerente).
@@ -404,6 +480,8 @@ task:{task_id}:entry:{claim_ledger_entry_id}:span:{evidence_span_id}:v1
 ```
 Il `:v1` è un version-tag globale del formato. Bumparlo (a `:v2`) forzerebbe nuova append su redelivery, utile in caso di rilascio di un checker reale che vuole "rivalutare" il corpus storico.
 
+> **Aggiornamento post-implementazione**: il format è stato adottato esattamente come proposto. Vedi `_build_idempotency_key()` in `apps/worker/app/services/claim_entailment_orchestrator.py` e il test `test_deterministic_idempotency_key` in `apps/worker/tests/test_claim_entailment_orchestrator.py`.
+
 ### 7.3 FK opzionali da NON aggiungere ora
 
 Per minimizzare la superficie e mantenere il disegno simmetrico a 0007:
@@ -417,6 +495,8 @@ Vedi §11.
 ### 7.4 Numerazione migration
 
 **Proposta: 0009** per `claim_entailment_checks`. La retention futura distruttiva slitta a 0010 o successivo. Coerente con la nota già presente in `PROJECT_STATE.md`.
+
+> **Aggiornamento post-implementazione**: 0009 è stata effettivamente assegnata a `claim_entailment_checks`. 0010 è stata poi assegnata a `coverage_gap_entailment` (estensione del CHECK su `coverage_gap_statements.kind` con `entailment_block` e `entailment_warning`, vedi §9.6 e `PHASE_8_8A_GATE_PRE.md` §8.2). La retention futura distruttiva slitta a **0011 o successivo**.
 
 ---
 
@@ -498,11 +578,21 @@ L'ordine 8.7E → 8.8A è motivato da:
 - "valuta prima la fonte, poi la coerenza claim↔quote": lettura naturale per un operatore.
 - Coerenza con la priorità del Gate proposta in §4.1, che è CVE-lite > Entailment > Source Quality: la priorità del Gate non deve coincidere con l'ordine di scrittura nella pipeline, quindi la scelta è puramente cosmetica e si privilegia la simmetria con 8.7E.
 
+> **Aggiornamento post-implementazione**: la Possibilità 2 è stata adottata. Vedi `_run_8_8_claim_entailment` in `apps/worker/app/consumers/task_created.py`. Sequenza audit a 15 eventi worker-side, con `task.entailment_checked` strettamente tra `task.source_quality_assessed` e `task.compiling`. SAVEPOINT-protetto, audit aggregato unico, no mutation cross-tabella. Il counts dict include `pairs_total`, `assessed_count`, `already_assessed_count`, `not_found_count`, `invalid_target_count`, `error_count`. Audit identifica il **checker** (non l'orchestrator) tramite `service_name=mvp0_mock_entailment_checker`, `policy_name=mvp0_mock_entailment` — stessa scelta semantica di 8.7E.
+
 ---
 
 ## 9. Policy Gate candidata
 
 **8.8A-PRE non implementa il Gate.** Definisce solo come il Final Answer Gate userà l'entailment in futuro (8.8A-CODE o 8.8A-GATE, da decidere se in due sotto-blocchi).
+
+> **Aggiornamento post-implementazione**: l'implementazione del Gate è oggetto del blocco 8.8A-GATE-CODE (vedi `PHASE_8_8A_GATE_PRE.md`). Il presente §9 è stato superato dalle decisioni più granulari adottate in 8.8A-GATE-PRE. Sintesi delle decisioni effettivamente in vigore:
+> - **Policy adottata**: P1 / P4 in MVP-0 (qui chiamata "P-block-lazy"): solo `contradicted` blocca; `not_supported`, `partially_supported`, `uncertain`, missing → warning; `entailed` clean. Identità della policy: `mvp0_entailment_gate_policy` v0.1.0.
+> - **Priorità Gate**: `no_verified_claims > unverified_spans_present > entailment_block > source_quality_block > approved_with_warnings > approved_clean`. CVE-lite > Entailment > Source Quality.
+> - **Nuovi reason_code**: aggiunto soltanto `entailment_block`. Riusato `all_spans_verified_with_warnings` per approved con warning misti — nessuna proliferazione.
+> - **Nuovi `coverage_gap_statements.kind`**: `entailment_block` (severity `block`) e `entailment_warning` (severity `warn`), introdotti dalla migration 0010.
+> - **Aggregazione per span**: worst-on-block, any-on-warn (pattern 8.7G).
+> - **Audit completeness**: quando il Gate rifiuta per `entailment_block`, emette comunque tutti i gap rilevanti (entailment + source_quality), anche se il reason_code finale è guidato dall'asse a priorità più alta.
 
 ### 9.1 Politica proposta MVP-0
 
@@ -529,6 +619,8 @@ Decisione operativa importante. Il prompt avverte: "non bloccare tutto il sistem
 
 `contradicted` resta block anche in MVP-0 perché un checker mock che riesce a dire "contradicted" lo fa solo con segnali forti (es. numeri opposti esplicitamente), e quei casi sono effettivamente da bloccare.
 
+> **Aggiornamento post-implementazione**: P-block-lazy è stata adottata. Nota di precisione: il mock attuale **non emette mai `contradicted`** — quindi il branch `entailment_block` è dormiente in produzione mock-driven. È attivabile via stub orchestrator nei realistic flow test.
+
 ### 9.3 Nuovi `final_gate_reports.reason_code` candidati
 
 - `entailment_block` (per il caso `contradicted` o `not_supported` in P-block-strict),
@@ -549,6 +641,8 @@ Pattern identico al 0008.
 - `f'span:{final_answer_span_id}:entailment_warning'`
 
 Compatibile con l'UNIQUE composito `(draft_final_answer_id, kind, gap_key)` di 0005.
+
+> **Aggiornamento post-implementazione**: la migration è `migrations/0010_coverage_gap_entailment.sql`, applicata. Vedi `tests/test_migration_0010_coverage_gap_entailment.py` per la copertura (11 scenari).
 
 ### 9.5 Priorità di emissione nel Gate
 
@@ -571,6 +665,8 @@ Se 0009 viene usato per `claim_entailment_checks`, **0010** servirà per estende
 
 Alternativa: una sola migration 0009 che crea la tabella E estende il CHECK. Sconsigliato perché mescola due cambi concettualmente distinti. Meglio due migration sequenziali (0009 schema, 0010 gap kind extension), 8.8A-CODE le farà a coppia.
 
+> **Aggiornamento post-implementazione**: due migration separate (0009 + 0010) adottate. Retention distruttiva slitta a 0011 o successivo.
+
 ---
 
 ## 10. Mock checker MVP-0
@@ -584,6 +680,8 @@ Alternativa: una sola migration 0009 che crea la tabella E estende il CHECK. Sco
 - **Deterministico** per stessa coppia (claim, quote).
 - **Testabile** unit + realistic flow.
 - **Esplicito** sulla propria natura mock: ogni riga scritta porta `payload.mock = true` e `payload.semantic_warning = "entailment_mock_is_not_real_semantic_judgement"`. Mirror del 8.7D.
+
+> **Aggiornamento post-implementazione**: la stringa di semantic_warning effettivamente emessa dal mock è `"mvp0 heuristic; not a real NLI/LLM entailment model"`. Vedi la costante `_SEMANTIC_WARNING` in `apps/worker/app/services/claim_entailment_checker.py`. La semantica del warning è la stessa proposta qui; il wording finale è stato scelto come più diretto.
 
 ### 10.2 Euristica proposta per il mock
 
@@ -604,6 +702,13 @@ Se sia claim sia quote contengono numeri e contengono parole-chiave di direzione
 #### Default
 
 Se nessuna delle tre regole si applica, **verdict = `uncertain`**, `confidence = 0.5`. Rationale: `"mock_heuristic_no_signal"`.
+
+> **Aggiornamento post-implementazione**: l'euristica adottata è una variante semplificata di quella proposta, con tre rami invece di quattro:
+> - **Rule 1 — Containment match**: claim ⊆ quote o quote ⊆ claim dopo normalizzazione (lowercase + whitespace collapsed) → `entailed`, confidence **0.8** (più alta della proposta originale a 0.7, scelta per esprimere maggiore confidenza nella regola più forte).
+> - **Rule 2 — Numeric mismatch**: BOTH claim e quote contengono numeri AND `set(claim_numbers) != set(quote_numbers)` → `not_supported`, confidence 0.6. È simmetrica rispetto alla proposta (la proposta originale richiedeva solo "claim ha numero, numero non in quote"; l'implementazione finale richiede che entrambi i testi abbiano numeri, riducendo i falsi positivi quando la quote non riporta cifre).
+> - **Default**: `uncertain`, confidence 0.5.
+>
+> La Regola 3 della proposta (opposite-direction keywords) è stata scartata in implementazione: troppo fragile sintatticamente, rischio elevato di falsi positivi, e l'output `uncertain` (default) copre già il caso. Conseguenza: il mock NON emette mai `contradicted` né `partially_supported`. Vedi `_apply_mock_heuristic()` in `apps/worker/app/services/claim_entailment_checker.py` per il testo finale.
 
 ### 10.3 Cosa il mock NON è
 
@@ -626,6 +731,8 @@ Con il mock attuale:
 - Quando l'extractor estrae sentence con numeri diversi dalla quote (caso teorico, perché in 8.3 l'extractor crea raw_claim DALLA stessa quote, quindi i numeri coincidono di default) → `not_supported`.
 
 **Conseguenza pratica**: con la pipeline 8.3 attuale, il mock entailment produrrà quasi sempre `entailed`. Il Branch entailment-block del Gate sarà raramente attivato in produzione (analogo a Branch C' di Source Quality oggi). Sarà attivabile nel realistic flow 8.8A-CODE solo via stub dell'orchestrator (pattern 8.7H), oppure quando un Citation-to-Claim Validator (8.8B) o un human review introdurranno claim disaccoppiati dalla quote.
+
+> **Aggiornamento post-implementazione**: comportamento confermato. Il realistic flow `tests/test_phase_8_8a_entailment_gate_flow.py::test_phase_8_8a_entailment_warning_flow_end_to_end` accetta che lo stato dell'asse entailment sia **clean o warnings** (asserzione `ent_status in ("clean", "warnings")`): in pratica, con extractor mock-driven e containment rule, il verdict è quasi sempre `entailed` per tutte le pair, l'asse entailment risulta clean, e il reason_code di approved `all_spans_verified_with_warnings` è dovuto soltanto ai warning di Source Quality (`overall_quality='unknown'`). Il block path è validato via stub orchestrator nel test `test_phase_8_8a_entailment_block_flow_end_to_end`.
 
 ---
 
@@ -652,6 +759,11 @@ Endpoint **da progettare per blocchi successivi**, non da implementare ora.
 - Nessuna RBAC redaction in MVP-0 (debito noto, ereditato da 8.6 / 8.7F).
 - Pagination via `limit` (no cursor).
 - JSONB `payload` verbatim.
+
+> **Aggiornamento post-implementazione**: nessuna read API entailment è stata esposta in 8.8A. Le due API previste in §11.1 restano da implementare nel blocco **8.8A-READ** (futuro). Osservabilità corrente:
+> - I `coverage_gap_statements` di kind `entailment_block` / `entailment_warning` sono restituiti dall'endpoint esistente `GET /api/v1/tasks/{task_id}/final-gate-report`, embeddati nel campo `coverage_gap_statements`.
+> - Il `final_gate_reports.payload` include una sezione `entailment` con `policy_name`, `policy_version`, `status` ∈ {clean, warnings, blocked}, `spans_with_block`, `spans_with_warnings`, `block_reason_counts`, `warning_reason_counts`.
+> - Non esiste ancora un endpoint che esponga claim_entailment_checks raw per task o per logical_claim.
 
 ---
 
@@ -719,6 +831,8 @@ Mirror dei 13 scenari di `test_final_answer_gate_source_quality.py`:
 Mirror del 8.7H realistic flow:
 - **Warning flow**: pipeline normale con mock → `verdict='entailed'` predominante (vedi §10.5) → published.
 - **Block flow**: stub dell'orchestrator inserisce `verdict='contradicted'` su uno span → Gate rejected con `reason_code='entailment_block'` → `task.publication_held`.
+
+> **Aggiornamento post-implementazione**: tutti i test plan sono stati implementati. Esito finale al commit 394257b: `tests/test_phase_8_8a_entailment_gate_flow.py`: 2 passed; root tests: 162 passed; worker tests: 143 passed. Vedi i file di test elencati nello status box in testa al documento per i percorsi effettivi.
 
 ---
 
@@ -802,6 +916,12 @@ Questi file non vanno necessariamente creati nello stesso blocco. La raccomandaz
 - Tutti i test (vedi §12).
 - Aggiornamento `PROJECT_STATE.md`, `README.md`, `PHASE_8_8_PLAN.md` (nuovo).
 
+> **Aggiornamento post-implementazione**: tutti i file elencati sopra sono stati creati al commit 394257b, **fatta eccezione per i seguenti, ancora da realizzare**:
+> - `apps/api/app/routes/entailment.py` — read API (rinviata a 8.8A-READ).
+> - Registrazione router in `apps/api/app/main.py` — rinviata a 8.8A-READ.
+> - `PHASE_8_8_PLAN.md` (nuovo) — non creato; il piano della fase 8.8 vive distribuito tra `PHASE_8_8A_PRE.md` (questo), `PHASE_8_8A_GATE_PRE.md` e `PROJECT_STATE.md`. Un eventuale `PHASE_8_8_PLAN.md` aggregato sarà creato quando le sotto-fasi 8.8B/C/D/E entreranno in fase di pianificazione.
+> - Nota: la tupla shared è stata effettivamente nominata `SOURCE_ENTAILMENT_VERDICT_VALUES` (non `CLAIM_ENTAILMENT_VERDICT_VALUES` come anticipato in §14.3) per coerenza con la specifica del blocco 8.8A-SHARED. Vedi `packages/shared/evidencefirst_shared/schemas.py`.
+
 ### 14.4 Vincoli sempre validi
 
 - Nessun provider AI reale. `PROVIDERS_ENABLED=mock`. `MAX_COST_PER_TASK=0`.
@@ -815,17 +935,19 @@ Questi file non vanno necessariamente creati nello stesso blocco. La raccomandaz
 
 ## 15. Riepilogo deliverable
 
-| Item | Stato |
+| Item | Stato (post-394257b) |
 |---|---|
-| `PHASE_8_8A_PRE.md` | questo documento |
-| nuove migration | non scritte (8.8A-CODE) |
-| nuovo service mock | non scritto (8.8A-CODE) |
-| nuovo orchestrator | non scritto (8.8A-CODE) |
-| integration in `task_created.py` | non scritta (8.8A-CODE) |
-| extension del Gate | non scritta (8.8A-CODE) |
-| nuove read API | non scritte (8.8A-CODE) |
-| test (migration / service / orchestrator / worker / Gate / realistic) | non scritti (8.8A-CODE) |
-| documentazione `PROJECT_STATE.md` / `README.md` / `PHASE_8_8_PLAN.md` | non aggiornata (8.8A-DOC) |
+| `PHASE_8_8A_PRE.md` | done — questo documento, aggiornato col box "Stato post-implementazione" |
+| nuove migration | **done** — `migrations/0009_claim_entailment_checks.sql`, `migrations/0010_coverage_gap_entailment.sql` |
+| nuovo service mock | **done** — `apps/worker/app/services/claim_entailment_checker.py` |
+| nuovo orchestrator | **done** — `apps/worker/app/services/claim_entailment_orchestrator.py` |
+| integration in `task_created.py` | **done** — `_run_8_8_claim_entailment` + audit `task.entailment_checked` |
+| extension del Gate | **done** — `apps/worker/app/services/final_answer_gate.py` esteso con branch entailment |
+| nuove read API | **rinviato a 8.8A-READ** |
+| test (migration / service / orchestrator / worker / Gate / realistic) | **done** — vedi status box in testa al documento |
+| documentazione `PROJECT_STATE.md` | done (blocco 8.8A-DOC-A) |
+| documentazione `README.md` | done (blocco 8.8A-DOC-B, contestuale a questo aggiornamento) |
+| `PHASE_8_8_PLAN.md` aggregato | non realizzato; piano vive in `PHASE_8_8A_PRE.md`, `PHASE_8_8A_GATE_PRE.md`, `PROJECT_STATE.md` |
 
 ---
 
@@ -848,6 +970,14 @@ FILE_DA_FARE_PROSSIMO_BLOCCO
 - **8.8A-FLOW** (realistic flow test end-to-end mirror 8.7H): da affrontare DOPO 8.8A-READ.
 - **8.8A-DOC** (aggiornamento `PROJECT_STATE.md` / `README.md` / `PHASE_8_8_PLAN.md` per chiudere 8.8A): finalizzazione della sotto-fase.
 
+> **Aggiornamento post-implementazione**: il piano di sotto-blocchi sopra è stato eseguito in un ordine leggermente diverso da quello previsto:
+> - 8.8A-SCHEMA, 8.8A-SHARED, 8.8A-SERVICE, 8.8A-ORCHESTRATOR, 8.8A-WORKER (chiusura della parte di scrittura) → done.
+> - 8.8A-GATE-PRE → done (documento dedicato).
+> - 8.8A-GATE-SCHEMA, 8.8A-GATE-CODE, 8.8A-GATE-FLOW → done.
+> - 8.8A-DOC-A (`PROJECT_STATE.md`) → done.
+> - 8.8A-DOC-B (`PHASE_8_8A_PRE.md` + `README.md`) → questo blocco corrente.
+> - **8.8A-READ** (read API entailment) e **8.8B-REPORT** (Anti-Hallucination Report API aggregata) sono i candidati naturali per il prossimo blocco.
+
 RISCHI_RESIDUI
 - L'entailment mock NON è semantica reale: tre regole sintattiche su containment + numeri non si avvicinano a NLI vero. `payload.mock = true` da onorare in tutti i consumatori.
 - Senza LLM/embedding/NLI reale, il checker resta euristico; un futuro checker reale (8.9 o successive) richiederà bump di policy_version e probabile re-run del corpus storico.
@@ -857,3 +987,10 @@ RISCHI_RESIDUI
 - Numerazione migration: 0009 (`claim_entailment_checks`) + 0010 (`coverage_gap_entailment`) → retention futura slitta a 0011 o successivo. Coerente con quanto già rinviato in 8.7G/H.
 - Una quote presente non implica che la quote sostenga il claim, e una fonte citata non implica un claim vero. Disclaimer da preservare in tutti i docs.
 - Tutti i rischi ereditati da 8.7G/H restano invariati: no Contradiction Detector reale, no Final Answer Sentence Gate, no Anti-Hallucination Report API, no External Verification, RBAC/redaction non implementata, retention distruttiva non implementata, append-only trigger su `coverage_gap_statements` mancante, payload JSONB esposti verbatim.
+
+> **Aggiornamento post-implementazione dei rischi residui**: tutti i rischi elencati sopra restano validi al commit 394257b. Aggiungere:
+> - **API read entailment task-level mancante**: nessun `/api/v1/tasks/{task_id}/entailment` esposto. Diagnostica entailment oggi possibile solo via `/final-gate-report` (coverage_gap_statements) o via accesso diretto al DB. Rinviato a 8.8A-READ.
+> - **Anti-Hallucination Report API mancante**: nessuna API aggregata che riporti, per un singolo published_answer, gli outcome di CVE-lite + Source Quality + Entailment. Rinviato a 8.8B-REPORT.
+> - **UI mancante**: nessuna interfaccia utente espone i nuovi gap entailment.
+> - **Mock NON produce `contradicted` né `partially_supported`**: in produzione mock-driven il branch `entailment_block` è dormiente. Il block path è validato esclusivamente via stub dell'orchestrator nel realistic flow test.
+> - **`payload.mock` non discrimina nelle decisioni Gate**: il Gate lo legge e lo stampa in `coverage_gap_statements.details` per audit, ma non lo usa per cambiare il verdict né il reason_code. Scelta consapevole MVP-0.
