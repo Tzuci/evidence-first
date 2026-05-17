@@ -7,6 +7,7 @@ from evidencefirst_shared.errors import install_normalized_error_handler
 
 from .routes import answers as answers_routes
 from .routes import audit as audit_routes
+from .routes import claim_entailment as claim_entailment_routes
 from .routes import claims as claims_routes
 from .routes import documents as documents_routes
 from .routes import health as health_routes
@@ -37,6 +38,7 @@ def create_app() -> FastAPI:
     app.include_router(lifecycle_events_routes.router)
     app.include_router(task_source_loss_routes.router)
     app.include_router(source_quality_routes.router)
+    app.include_router(claim_entailment_routes.router)
 
     return app
 
