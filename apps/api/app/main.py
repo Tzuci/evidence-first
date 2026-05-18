@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from evidencefirst_shared.errors import install_normalized_error_handler
 
 from .routes import answers as answers_routes
+from .routes import anti_hallucination_report as anti_hallucination_report_routes
 from .routes import audit as audit_routes
 from .routes import claim_entailment as claim_entailment_routes
 from .routes import claims as claims_routes
@@ -39,6 +40,7 @@ def create_app() -> FastAPI:
     app.include_router(task_source_loss_routes.router)
     app.include_router(source_quality_routes.router)
     app.include_router(claim_entailment_routes.router)
+    app.include_router(anti_hallucination_report_routes.router)
 
     return app
 
