@@ -1,10 +1,10 @@
-"""API routes for Phase 8.8B-REPORT-CODE-A — Anti-Hallucination Report (read-only).
+"""API routes for Phase 8.8B-REPORT — Anti-Hallucination Report (read-only).
 
 Endpoint exposed by this module:
 
-  GET /api/v1/tasks/{task_id}/anti-hallucination-report      (Phase 8.8B-REPORT-CODE-A)
+  GET /api/v1/tasks/{task_id}/anti-hallucination-report      (Phase 8.8B-REPORT-CODE-A + CODE-B)
 
-Strict invariants (Phase 8.8B-REPORT-CODE-A — first read-only skeleton):
+Strict invariants (Phase 8.8B-REPORT — read-only aggregated view):
 
   - This endpoint is COMPLETELY read-only. It MUST NOT:
       * INSERT / UPDATE / DELETE any row in any table;
@@ -32,16 +32,17 @@ Strict invariants (Phase 8.8B-REPORT-CODE-A — first read-only skeleton):
           PHASE_8_8B_REPORT_PRE.md (e.g. "not_ready" when neither a
           gate report nor a published answer exist);
         * ``gate.decision`` and ``gate.reason_code`` set to None;
-        * ``claims`` and ``evidence`` left as empty lists in CODE-A
-          (claim-level aggregation arrives in CODE-B);
+        * ``claims`` and ``evidence`` populated in CODE-B (one entry
+          per logical_claim of the task; one entry per evidence_span
+          attached via task_documents);
         * ``axis_summary.final_gate`` derived from
           ``coverage_gap_statements`` collected on the latest draft;
         * ``axis_summary.cve_lite``, ``axis_summary.source_quality``,
-          ``axis_summary.claim_entailment`` initialized with zeroed
-          counters (claim-level aggregation arrives in CODE-B);
-        * ``mock_indicators`` reflect what we already know from
-          ``draft_final_answers.compiler_name`` plus the MVP-0 fallback
-          values for the remaining axes;
+          ``axis_summary.claim_entailment`` populated in CODE-B from
+          claim-level aggregation;
+        * ``mock_indicators`` reflect provenance from real rows where
+          present, plus the MVP-0 fallback values for axes with no
+          data yet;
         * ``limitations`` is always populated with the disclaimers
           documented in PHASE_8_8B_REPORT_PRE.md §9.
 
@@ -57,26 +58,36 @@ Semantic notes (preserved verbatim from PHASE_8_8B_REPORT_PRE.md):
   - The JSONB payload is exposed verbatim; RBAC / redaction is a known
     debt.
 
-CODE-A explicitly DOES NOT yet implement:
+CODE-B (this block) implements:
   - claim-level entries in ``claims``;
   - evidence rows in ``evidence``;
-  - CVE-lite verification record aggregation;
-  - Source Quality latest-per-target aggregation;
-  - Claim Entailment latest-per-pair aggregation;
-  - realistic flow tests on the aggregated axes.
+  - CVE-lite verification record aggregation (per latest entry);
+  - Source Quality latest-per-target aggregation (over spans linked
+    to claims);
+  - Claim Entailment latest-per-pair aggregation (over (entry, span)
+    pairs derived from claim_evidence_links);
+  - axis_summary completed for cve_lite / source_quality /
+    claim_entailment, with missing_count semantics restricted to
+    claim-linked spans / pairs (PHASE_8_8B_REPORT_PRE.md §5.2).
 
-These arrive in 8.8B-REPORT-CODE-B.
+CODE-B explicitly DOES NOT:
+  - alter the Final Answer Gate or any worker code;
+  - introduce new tables or migrations;
+  - compute or expose lifecycle / source-loss event details
+    (deferred);
+  - apply RBAC / redaction to JSONB payload content (deferred).
 """
 from __future__ import annotations
 
 import datetime as _dt_mod
 import json
 import uuid
-from typing import Any
+from typing import Any, Iterable
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection
+from sqlalchemy.types import Uuid as _SAUuid
 
 from evidencefirst_shared.errors import ErrorCode, NormalizedError
 
@@ -94,6 +105,19 @@ router = APIRouter(prefix="/api/v1", tags=["anti-hallucination-report"])
 # in the future, its compiler_name will differ and
 # ``uses_mock_compiler`` will flip to False without further changes.
 _MOCK_COMPILER_NAME = "mvp0_compiler_v1"
+
+# Identity of the mock CVE-lite check (see
+# apps/worker/app/services/cve_lite.py). verification_records with
+# check_kind='cve_lite' AND check_name == this value are mock-driven.
+_MOCK_CVE_LITE_CHECK_NAME = "quote_hash_and_substring_v1"
+
+# Identity of the mock claim entailment checker (see
+# apps/worker/app/services/claim_entailment_checker.py).
+_MOCK_ENTAILMENT_CHECKER_NAME = "mvp0_mock_entailment_checker"
+
+# Identity of the mock source quality evaluator (see
+# apps/worker/app/services/source_quality_evaluator.py).
+_MOCK_SOURCE_QUALITY_EVALUATOR_NAME = "mock_source_quality_evaluator"
 
 
 # Mapping from coverage_gap_statements.kind to the report's derived
@@ -123,6 +147,30 @@ _COVERAGE_GAP_SEVERITY_RANK: dict[str, int] = {
     "info": 2,
 }
 _COVERAGE_GAP_SEVERITY_FALLBACK_RANK = 99
+
+
+# Source Quality codomain values (mirrors 0007 CHECK + shared
+# constants). Hardcoded here so the route module does not import any
+# additional shared symbol just for the counters; kept in sync with the
+# DB CHECK by the same review discipline that maintains
+# evidencefirst_shared.schemas.
+_SOURCE_QUALITY_OVERALL_QUALITY_VALUES = (
+    "strong",
+    "adequate",
+    "weak",
+    "unsuitable",
+    "unknown",
+)
+
+# Claim Entailment verdict codomain (mirrors 0009 CHECK + shared
+# constants).
+_CLAIM_ENTAILMENT_VERDICT_VALUES = (
+    "entailed",
+    "partially_supported",
+    "not_supported",
+    "contradicted",
+    "uncertain",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +231,20 @@ def _row_dict(row: Any) -> dict[str, Any]:
     makes it trivial to switch to a different driver in the future.
     """
     return dict(row._mapping)
+
+
+def _is_payload_mock(payload: Any) -> bool:
+    """Return True iff the JSONB ``payload`` dict has ``mock: true``.
+
+    Defensive against the payload arriving as a JSON-encoded string
+    (some driver/pool combinations) or as ``None``. Any non-bool value
+    at the ``mock`` key is treated as False — we only flag a row as
+    mock if the writer made a deliberate, explicit assertion.
+    """
+    obj = _normalize_jsonb(payload)
+    if not isinstance(obj, dict):
+        return False
+    return obj.get("mock") is True
 
 
 # ---------------------------------------------------------------------------
@@ -514,17 +576,753 @@ def _derive_publication_status(
 
 
 # ---------------------------------------------------------------------------
-# axis_summary.final_gate
+# CODE-B: SELECTs for claim-level aggregation
 # ---------------------------------------------------------------------------
+def _select_logical_claims(
+    conn: Connection, task_id: uuid.UUID
+) -> list[dict[str, Any]]:
+    """Return the ``logical_claims`` rows for the task in deterministic order.
+
+    Ordering: ``created_at ASC, id ASC`` — matches the convention used
+    by the compiler when iterating verified claims
+    (``compiler._select_verified_latest_for_task``) and by the claim
+    read API (``GET /api/v1/tasks/{id}/claims``). This keeps the report
+    consistent with the rest of the surface area.
+    """
+    rows = conn.execute(
+        text(
+            """
+            SELECT
+              id,
+              tenant_id,
+              project_id,
+              task_id,
+              canonical_claim_text,
+              canonical_claim_hash,
+              created_at
+            FROM logical_claims
+            WHERE task_id = :task_id
+            ORDER BY created_at ASC, id ASC
+            """
+        ),
+        {"task_id": task_id},
+    ).fetchall()
+    return [_row_dict(r) for r in rows]
+
+
+def _select_ledger_entries_for_logical_ids(
+    conn: Connection, logical_ids: list[uuid.UUID]
+) -> list[dict[str, Any]]:
+    """Return ledger entries for the given logical_ids, ordered for
+    latest-per-logical_id picking.
+
+    Ordering: ``claim_logical_id ASC, version_no DESC, created_at DESC,
+    id DESC``. The downstream helper ``_latest_ledger_by_logical_id``
+    walks this list and picks the FIRST row per ``claim_logical_id`` —
+    which by the ordering is the latest.
+
+    Empty input → empty output, no SQL roundtrip. SQLAlchemy's
+    ``bindparam(expanding=True, type_=Uuid())`` is used for the
+    IN-list to handle large fanouts safely; the typed bindparam also
+    cooperates with the psycopg 3 driver under both UUID and string
+    inputs.
+    """
+    if not logical_ids:
+        return []
+    stmt = text(
+        """
+        SELECT
+          id,
+          claim_logical_id,
+          version_no,
+          state,
+          support_scope,
+          user_provided_dependency,
+          human_review_required,
+          human_review_status,
+          transition_reason,
+          payload,
+          created_at
+        FROM claim_ledger_entries
+        WHERE claim_logical_id IN :logical_ids
+        ORDER BY claim_logical_id ASC,
+                 version_no DESC,
+                 created_at DESC,
+                 id DESC
+        """
+    ).bindparams(
+        bindparam("logical_ids", expanding=True, type_=_SAUuid())
+    )
+    rows = conn.execute(stmt, {"logical_ids": list(logical_ids)}).fetchall()
+    return [_row_dict(r) for r in rows]
+
+
+def _latest_ledger_by_logical_id(
+    rows: list[dict[str, Any]],
+) -> dict[uuid.UUID, dict[str, Any]]:
+    """Pick the first row per ``claim_logical_id``.
+
+    Caller MUST have fetched ``rows`` with the ordering produced by
+    ``_select_ledger_entries_for_logical_ids`` (``claim_logical_id
+    ASC, version_no DESC, created_at DESC, id DESC``): under that
+    ordering the first row encountered for each ``claim_logical_id``
+    is the absolute latest. Doing the latest-pick in Python keeps the
+    SQL simple and readable in MVP-0 (numbers of claims per task are
+    bounded).
+    """
+    out: dict[uuid.UUID, dict[str, Any]] = {}
+    for r in rows:
+        lid = uuid.UUID(str(r["claim_logical_id"]))
+        if lid in out:
+            continue
+        out[lid] = r
+    return out
+
+
+def _select_claim_evidence_links(
+    conn: Connection, entry_ids: list[uuid.UUID]
+) -> list[dict[str, Any]]:
+    """Return ``claim_evidence_links`` rows targeting the given ledger
+    entries.
+
+    Only links with a non-null ``evidence_span_id`` are returned (the
+    CHECK ``cel_origin_xor`` makes the second branch
+    ``retrieved_source_span_id`` mutually exclusive, and the
+    closed-corpus pipeline does not exercise it in MVP-0).
+
+    Ordering: ``claim_ledger_entry_id ASC, evidence_span_id ASC, id
+    ASC`` — deterministic so the response's ``evidence_links`` array
+    stays stable across invocations.
+    """
+    if not entry_ids:
+        return []
+    stmt = text(
+        """
+        SELECT
+          id,
+          claim_logical_id,
+          claim_ledger_entry_id,
+          evidence_span_id,
+          link_role,
+          created_at
+        FROM claim_evidence_links
+        WHERE claim_ledger_entry_id IN :entry_ids
+          AND evidence_span_id IS NOT NULL
+        ORDER BY claim_ledger_entry_id ASC,
+                 evidence_span_id ASC,
+                 id ASC
+        """
+    ).bindparams(
+        bindparam("entry_ids", expanding=True, type_=_SAUuid())
+    )
+    rows = conn.execute(stmt, {"entry_ids": list(entry_ids)}).fetchall()
+    return [_row_dict(r) for r in rows]
+
+
+def _select_evidence_for_task(
+    conn: Connection, task_id: uuid.UUID
+) -> list[dict[str, Any]]:
+    """Return every ``evidence_spans`` row attached to the task via
+    ``task_documents``.
+
+    The chain is:
+        task_documents
+          -> uploaded_documents
+          -> document_versions (any kind; MVP-0 uses 'parsed')
+          -> document_chunks
+          -> evidence_spans
+
+    Ordering follows PHASE_8_8B_REPORT_PRE.md §5.1 verbatim:
+    ``document_id ASC, chunk_index ASC, char_start ASC, evidence_spans.id
+    ASC``. The chosen ordering reconstructs a document-reading order
+    that is intuitive for UI consumers without forcing them to perform
+    a second sort.
+    """
+    rows = conn.execute(
+        text(
+            """
+            SELECT
+              es.id              AS evidence_span_id,
+              es.document_chunk_id AS document_chunk_id,
+              es.quote           AS quote,
+              es.quote_hash      AS quote_hash,
+              ud.id              AS document_id,
+              ud.filename        AS document_filename,
+              dc.chunk_index     AS chunk_index,
+              es.char_start      AS char_start
+            FROM task_documents td
+            JOIN uploaded_documents ud  ON ud.id = td.document_id
+            JOIN document_versions  dv  ON dv.document_id = ud.id
+            JOIN document_chunks    dc  ON dc.document_version_id = dv.id
+            JOIN evidence_spans     es  ON es.document_chunk_id = dc.id
+            WHERE td.task_id = :task_id
+            ORDER BY ud.id ASC,
+                     dc.chunk_index ASC,
+                     es.char_start ASC,
+                     es.id ASC
+            """
+        ),
+        {"task_id": task_id},
+    ).fetchall()
+    return [_row_dict(r) for r in rows]
+
+
+def _select_cve_lite_records(
+    conn: Connection, entry_ids: list[uuid.UUID]
+) -> list[dict[str, Any]]:
+    """Return ``verification_records`` rows of kind 'cve_lite' for the
+    given ledger entries.
+
+    Ordering: ``claim_ledger_entry_id ASC, id ASC``. The UNIQUE
+    constraint ``(claim_ledger_entry_id, check_kind, check_name)`` on
+    verification_records (0004) guarantees at most one CVE-lite row
+    per ledger entry, so this ordering is sufficient for
+    determinism without picking a "latest".
+    """
+    if not entry_ids:
+        return []
+    stmt = text(
+        """
+        SELECT
+          id,
+          claim_logical_id,
+          claim_ledger_entry_id,
+          check_kind,
+          check_name,
+          outcome,
+          payload,
+          created_at
+        FROM verification_records
+        WHERE check_kind = 'cve_lite'
+          AND claim_ledger_entry_id IN :entry_ids
+        ORDER BY claim_ledger_entry_id ASC, id ASC
+        """
+    ).bindparams(
+        bindparam("entry_ids", expanding=True, type_=_SAUuid())
+    )
+    rows = conn.execute(stmt, {"entry_ids": list(entry_ids)}).fetchall()
+    return [_row_dict(r) for r in rows]
+
+
+def _select_source_quality_rows(
+    conn: Connection, evidence_span_ids: list[uuid.UUID]
+) -> list[dict[str, Any]]:
+    """Return ALL ``source_quality_assessments`` for the given
+    evidence spans, ordered for latest-per-target picking.
+
+    Ordering: ``evidence_span_id ASC, version_no DESC, created_at
+    DESC, id DESC``. The caller (``_latest_source_quality_by_span``)
+    walks this list and picks the FIRST row per ``evidence_span_id``
+    — under the ordering, that is the absolute latest at DB level
+    (matches the Final Answer Gate's read semantics; see
+    PHASE_8_8B_REPORT_PRE.md §5.3).
+
+    The query filters by ``evidence_span_id`` only; rows targeting
+    document_chunk_id or document_id are excluded because the report
+    aggregates Source Quality on the span axis.
+    """
+    if not evidence_span_ids:
+        return []
+    stmt = text(
+        """
+        SELECT
+          id,
+          tenant_id,
+          project_id,
+          evidence_span_id,
+          version_no,
+          overall_quality,
+          contradiction_status,
+          evaluator_name,
+          evaluator_version,
+          policy_name,
+          policy_version,
+          payload,
+          created_at
+        FROM source_quality_assessments
+        WHERE evidence_span_id IN :span_ids
+        ORDER BY evidence_span_id ASC,
+                 version_no DESC,
+                 created_at DESC,
+                 id DESC
+        """
+    ).bindparams(
+        bindparam("span_ids", expanding=True, type_=_SAUuid())
+    )
+    rows = conn.execute(stmt, {"span_ids": list(evidence_span_ids)}).fetchall()
+    return [_row_dict(r) for r in rows]
+
+
+def _latest_source_quality_by_span(
+    rows: list[dict[str, Any]],
+) -> dict[uuid.UUID, dict[str, Any]]:
+    """Pick the first row per ``evidence_span_id``.
+
+    Same first-wins-by-prior-ordering pattern as
+    ``_latest_ledger_by_logical_id``.
+    """
+    out: dict[uuid.UUID, dict[str, Any]] = {}
+    for r in rows:
+        sid = uuid.UUID(str(r["evidence_span_id"]))
+        if sid in out:
+            continue
+        out[sid] = r
+    return out
+
+
+def _select_entailment_rows(
+    conn: Connection, entry_ids: list[uuid.UUID]
+) -> list[dict[str, Any]]:
+    """Return ALL ``claim_entailment_checks`` for the given ledger
+    entries, ordered for latest-per-pair picking.
+
+    Ordering: ``claim_ledger_entry_id ASC, evidence_span_id ASC,
+    version_no DESC, created_at DESC, id DESC``. The caller
+    (``_latest_entailment_by_pair``) walks this list and picks the
+    FIRST row per ``(claim_ledger_entry_id, evidence_span_id)`` pair.
+
+    We over-fetch by entry_id only (no explicit pair filter at SQL
+    level) and let the caller filter by the set of relevant pairs in
+    Python: this avoids constructing a tuple-IN filter at the
+    SQLAlchemy boundary while keeping the query simple. In MVP-0 the
+    number of pairs per task is bounded.
+    """
+    if not entry_ids:
+        return []
+    stmt = text(
+        """
+        SELECT
+          id,
+          tenant_id,
+          project_id,
+          task_id,
+          claim_logical_id,
+          claim_ledger_entry_id,
+          evidence_span_id,
+          version_no,
+          verdict,
+          confidence,
+          checker_name,
+          checker_version,
+          policy_name,
+          policy_version,
+          payload,
+          created_at
+        FROM claim_entailment_checks
+        WHERE claim_ledger_entry_id IN :entry_ids
+        ORDER BY claim_ledger_entry_id ASC,
+                 evidence_span_id ASC,
+                 version_no DESC,
+                 created_at DESC,
+                 id DESC
+        """
+    ).bindparams(
+        bindparam("entry_ids", expanding=True, type_=_SAUuid())
+    )
+    rows = conn.execute(stmt, {"entry_ids": list(entry_ids)}).fetchall()
+    return [_row_dict(r) for r in rows]
+
+
+def _latest_entailment_by_pair(
+    rows: list[dict[str, Any]],
+) -> dict[tuple[uuid.UUID, uuid.UUID], dict[str, Any]]:
+    """Pick the first row per ``(claim_ledger_entry_id,
+    evidence_span_id)`` pair.
+
+    Same first-wins-by-prior-ordering pattern as
+    ``_latest_ledger_by_logical_id``.
+    """
+    out: dict[tuple[uuid.UUID, uuid.UUID], dict[str, Any]] = {}
+    for r in rows:
+        eid = uuid.UUID(str(r["claim_ledger_entry_id"]))
+        sid = uuid.UUID(str(r["evidence_span_id"]))
+        key = (eid, sid)
+        if key in out:
+            continue
+        out[key] = r
+    return out
+
+
+# ---------------------------------------------------------------------------
+# CODE-B: per-claim builders
+# ---------------------------------------------------------------------------
+def _build_evidence_link_view(link: dict[str, Any]) -> dict[str, Any]:
+    """Serialize one ``claim_evidence_links`` row for the report.
+
+    Only the fields needed by UI consumers are surfaced. The
+    ``claim_logical_id`` is implicit from the enclosing claim entry,
+    so we do not duplicate it here.
+    """
+    return {
+        "claim_evidence_link_id": _uuid_str(link["id"]),
+        "evidence_span_id": _uuid_str(link["evidence_span_id"]),
+        "link_role": link["link_role"],
+    }
+
+
+def _build_cve_lite_view(record: dict[str, Any]) -> dict[str, Any]:
+    """Serialize one CVE-lite ``verification_records`` row for the report."""
+    return {
+        "verification_record_id": _uuid_str(record["id"]),
+        "claim_ledger_entry_id": _uuid_str(record["claim_ledger_entry_id"]),
+        "outcome": record["outcome"],
+        "check_name": record["check_name"],
+    }
+
+
+def _build_source_quality_view(
+    *,
+    evidence_span_id: uuid.UUID,
+    latest_assessment: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Serialize one source-quality slot in a claim's ``source_quality``
+    list.
+
+    When ``latest_assessment`` is None the slot reports a "missing"
+    state with nulls in every detail field; the caller increments the
+    axis_summary ``missing_count`` accordingly.
+
+    ``mock`` is derived from ``payload.mock`` when an assessment is
+    present, falling back to None when missing (we cannot assert mock
+    on a non-existent row).
+    """
+    if latest_assessment is None:
+        return {
+            "evidence_span_id": _uuid_str(evidence_span_id),
+            "latest_assessment_id": None,
+            "overall_quality": None,
+            "contradiction_status": None,
+            "evaluator_name": None,
+            "policy_name": None,
+            "policy_version": None,
+            "mock": None,
+        }
+    return {
+        "evidence_span_id": _uuid_str(evidence_span_id),
+        "latest_assessment_id": _uuid_str(latest_assessment["id"]),
+        "overall_quality": latest_assessment["overall_quality"],
+        "contradiction_status": latest_assessment["contradiction_status"],
+        "evaluator_name": latest_assessment["evaluator_name"],
+        "policy_name": latest_assessment["policy_name"],
+        "policy_version": latest_assessment["policy_version"],
+        "mock": _is_payload_mock(latest_assessment.get("payload")),
+    }
+
+
+def _build_entailment_view(
+    *,
+    claim_ledger_entry_id: uuid.UUID,
+    evidence_span_id: uuid.UUID,
+    latest_check: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Serialize one entailment slot in a claim's ``entailment`` list.
+
+    When ``latest_check`` is None the slot reports a "missing" state
+    with nulls in every detail field; the caller increments the
+    axis_summary ``missing_count`` accordingly.
+
+    ``confidence`` is coerced to float when present (the DB column is
+    DOUBLE PRECISION). ``mock`` follows the same rule as source
+    quality: True / False only when a row is present and the
+    ``payload.mock`` flag is explicit; None when the check is missing.
+    """
+    if latest_check is None:
+        return {
+            "claim_ledger_entry_id": _uuid_str(claim_ledger_entry_id),
+            "evidence_span_id": _uuid_str(evidence_span_id),
+            "latest_check_id": None,
+            "verdict": None,
+            "confidence": None,
+            "checker_name": None,
+            "policy_name": None,
+            "policy_version": None,
+            "mock": None,
+        }
+    confidence_raw = latest_check.get("confidence")
+    confidence = (
+        float(confidence_raw) if confidence_raw is not None else None
+    )
+    return {
+        "claim_ledger_entry_id": _uuid_str(claim_ledger_entry_id),
+        "evidence_span_id": _uuid_str(evidence_span_id),
+        "latest_check_id": _uuid_str(latest_check["id"]),
+        "verdict": latest_check["verdict"],
+        "confidence": confidence,
+        "checker_name": latest_check["checker_name"],
+        "policy_name": latest_check["policy_name"],
+        "policy_version": latest_check["policy_version"],
+        "mock": _is_payload_mock(latest_check.get("payload")),
+    }
+
+
+def _build_claim_items(
+    *,
+    logical_claims: list[dict[str, Any]],
+    latest_entry_by_logical: dict[uuid.UUID, dict[str, Any]],
+    links_by_entry: dict[uuid.UUID, list[dict[str, Any]]],
+    cve_records_by_entry: dict[uuid.UUID, list[dict[str, Any]]],
+    latest_sq_by_span: dict[uuid.UUID, dict[str, Any]],
+    latest_ce_by_pair: dict[
+        tuple[uuid.UUID, uuid.UUID], dict[str, Any]
+    ],
+) -> list[dict[str, Any]]:
+    """Assemble the ``claims`` array of the report.
+
+    One entry per ``logical_claim`` of the task. For each:
+      - ``latest_entry_id`` / ``latest_state`` from the latest
+        ``claim_ledger_entries`` row by ``(version_no DESC, created_at
+        DESC, id DESC)``; null when no ledger entry exists yet (pre-CVE
+        tasks).
+      - ``support_scope`` mirrors the latest ledger entry; null when
+        absent.
+      - ``claim_type`` is left at None in CODE-B because logical_claims
+        does NOT persist a claim_type column at DB level — the value
+        lives on ``classified_claims`` which is keyed by raw_claim and
+        is out of scope for this aggregation. A future block may join
+        classified_claims for a richer surface.
+      - ``evidence_links``: structural links scoped to the latest
+        ledger entry. Links pointing at older entries are NOT
+        surfaced; the report follows the same latest-entry semantics
+        used by the Final Answer Gate.
+      - ``cve_lite``: every CVE-lite verification_record attached to
+        the latest entry.
+      - ``source_quality``: one slot per linked evidence_span_id with
+        the latest assessment (or a missing slot).
+      - ``entailment``: one slot per (latest_entry, evidence_span)
+        pair with the latest check (or a missing slot).
+    """
+    items: list[dict[str, Any]] = []
+    for lc in logical_claims:
+        lid = uuid.UUID(str(lc["id"]))
+        latest_entry = latest_entry_by_logical.get(lid)
+        if latest_entry is None:
+            latest_entry_id: uuid.UUID | None = None
+            latest_entry_id_str: str | None = None
+            latest_state: str | None = None
+            support_scope: str | None = None
+        else:
+            latest_entry_id = uuid.UUID(str(latest_entry["id"]))
+            latest_entry_id_str = str(latest_entry_id)
+            latest_state = latest_entry.get("state")
+            support_scope = latest_entry.get("support_scope")
+
+        links: list[dict[str, Any]] = (
+            links_by_entry.get(latest_entry_id, [])
+            if latest_entry_id is not None
+            else []
+        )
+        cve_records: list[dict[str, Any]] = (
+            cve_records_by_entry.get(latest_entry_id, [])
+            if latest_entry_id is not None
+            else []
+        )
+
+        # source_quality: one slot per linked evidence_span_id; latest
+        # assessment if present, else a missing slot.
+        sq_views: list[dict[str, Any]] = []
+        seen_span_ids: set[uuid.UUID] = set()
+        for link in links:
+            ev_id_raw = link["evidence_span_id"]
+            if ev_id_raw is None:
+                continue
+            ev_id = uuid.UUID(str(ev_id_raw))
+            if ev_id in seen_span_ids:
+                # Two links pointing to the same evidence_span for the
+                # same latest_entry would produce duplicate slots
+                # otherwise. Dedup defensively.
+                continue
+            seen_span_ids.add(ev_id)
+            sq_views.append(
+                _build_source_quality_view(
+                    evidence_span_id=ev_id,
+                    latest_assessment=latest_sq_by_span.get(ev_id),
+                )
+            )
+
+        # entailment: one slot per (latest_entry, evidence_span) pair.
+        ce_views: list[dict[str, Any]] = []
+        if latest_entry_id is not None:
+            seen_pairs: set[tuple[uuid.UUID, uuid.UUID]] = set()
+            for link in links:
+                ev_id_raw = link["evidence_span_id"]
+                if ev_id_raw is None:
+                    continue
+                ev_id = uuid.UUID(str(ev_id_raw))
+                pair_key = (latest_entry_id, ev_id)
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                ce_views.append(
+                    _build_entailment_view(
+                        claim_ledger_entry_id=latest_entry_id,
+                        evidence_span_id=ev_id,
+                        latest_check=latest_ce_by_pair.get(pair_key),
+                    )
+                )
+
+        items.append(
+            {
+                "logical_claim_id": str(lid),
+                "latest_entry_id": latest_entry_id_str,
+                "latest_state": latest_state,
+                "canonical_claim_text": lc.get("canonical_claim_text"),
+                # claim_type is not persisted on logical_claims /
+                # claim_ledger_entries in MVP-0; surfaced as null to
+                # preserve the documented shape without inventing
+                # data. See PHASE_8_8B_REPORT_PRE.md §15 (raw/classified
+                # excluded from v1).
+                "claim_type": None,
+                "support_scope": support_scope,
+                "evidence_links": [
+                    _build_evidence_link_view(ln) for ln in links
+                ],
+                "cve_lite": [
+                    _build_cve_lite_view(r) for r in cve_records
+                ],
+                "source_quality": sq_views,
+                "entailment": ce_views,
+            }
+        )
+    return items
+
+
+def _build_evidence_items(
+    evidence_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Assemble the ``evidence`` array of the report.
+
+    Each row mirrors the shape documented in PHASE_8_8B_REPORT_PRE.md
+    §6: identifiers + the verbatim quote and quote_hash + document
+    metadata for context. Ordering is preserved from the SQL fetch
+    (document_id ASC, chunk_index ASC, char_start ASC, evidence id
+    ASC).
+    """
+    out: list[dict[str, Any]] = []
+    for r in evidence_rows:
+        out.append(
+            {
+                "evidence_span_id": _uuid_str(r["evidence_span_id"]),
+                "document_chunk_id": _uuid_str(r["document_chunk_id"]),
+                "quote": r.get("quote"),
+                "quote_hash": r.get("quote_hash"),
+                "document_id": _uuid_str(r["document_id"]),
+                "document_filename": r.get("document_filename"),
+            }
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# CODE-B: axis_summary aggregations
+# ---------------------------------------------------------------------------
+def _build_axis_summary_cve(
+    cve_records: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate CVE-lite outcomes into report counters.
+
+    Mapping (PHASE_8_8B_REPORT_PRE.md §7.4):
+      - outcome='pass'         → verified_claims_count
+      - outcome='fail'         → unverified_claims_count
+      - outcome='inconclusive' → inconclusive_count
+
+    Unknown outcomes (defensive; the CHECK constraint in 0004 already
+    pins the codomain) are bucketed into ``inconclusive_count`` so a
+    future codomain extension surfaces as inconclusive rather than as
+    a silent drop.
+    """
+    counts = {
+        "verified_claims_count": 0,
+        "unverified_claims_count": 0,
+        "inconclusive_count": 0,
+    }
+    for r in cve_records:
+        outcome = r.get("outcome")
+        if outcome == "pass":
+            counts["verified_claims_count"] += 1
+        elif outcome == "fail":
+            counts["unverified_claims_count"] += 1
+        else:
+            counts["inconclusive_count"] += 1
+    return counts
+
+
+def _build_axis_summary_source_quality(
+    *,
+    relevant_span_ids: list[uuid.UUID],
+    latest_sq_by_span: dict[uuid.UUID, dict[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate Source Quality latest-per-target into report counters.
+
+    The relevant span set is the union of evidence_span_ids reached
+    by claim_evidence_links targeting any latest ledger entry of the
+    task — see PHASE_8_8B_REPORT_PRE.md §5.2. Spans attached to the
+    task via task_documents but never linked to a claim are NOT
+    counted (they would inflate ``missing_count`` artificially).
+
+    All five overall_quality codomain keys are initialized to 0 so
+    consumers can rely on the shape regardless of what data is
+    present. Unknown values surface in the ``unknown`` bucket
+    defensively.
+    """
+    counts: dict[str, int] = {
+        f"{v}_count": 0 for v in _SOURCE_QUALITY_OVERALL_QUALITY_VALUES
+    }
+    counts["missing_count"] = 0
+    for sid in relevant_span_ids:
+        latest = latest_sq_by_span.get(sid)
+        if latest is None:
+            counts["missing_count"] += 1
+            continue
+        oq = latest.get("overall_quality")
+        if isinstance(oq, str) and oq in _SOURCE_QUALITY_OVERALL_QUALITY_VALUES:
+            counts[f"{oq}_count"] += 1
+        else:
+            counts["unknown_count"] += 1
+    return counts
+
+
+def _build_axis_summary_entailment(
+    *,
+    relevant_pairs: list[tuple[uuid.UUID, uuid.UUID]],
+    latest_ce_by_pair: dict[
+        tuple[uuid.UUID, uuid.UUID], dict[str, Any]
+    ],
+) -> dict[str, Any]:
+    """Aggregate Claim Entailment latest-per-pair into report counters.
+
+    The relevant pair set is ``(latest_entry_id, evidence_span_id)``
+    derived from claim_evidence_links restricted to the latest ledger
+    entry per logical claim. Pairs not realized by an existing
+    entailment check fall into ``missing_count`` — same rule applied
+    by the Final Answer Gate for "missing entailment check"
+    warnings (see PHASE_8_8A_GATE_PRE.md and the Gate's
+    ``_classify_entailment_per_span``).
+
+    All five verdict codomain keys are initialized to 0. Unknown
+    verdicts surface in ``uncertain_count`` defensively (same fallback
+    used by the Gate when it cannot map a verdict).
+    """
+    counts: dict[str, int] = {
+        f"{v}_count": 0 for v in _CLAIM_ENTAILMENT_VERDICT_VALUES
+    }
+    counts["missing_count"] = 0
+    for pair in relevant_pairs:
+        latest = latest_ce_by_pair.get(pair)
+        if latest is None:
+            counts["missing_count"] += 1
+            continue
+        verdict = latest.get("verdict")
+        if isinstance(verdict, str) and verdict in _CLAIM_ENTAILMENT_VERDICT_VALUES:
+            counts[f"{verdict}_count"] += 1
+        else:
+            counts["uncertain_count"] += 1
+    return counts
+
+
 def _build_axis_summary_final_gate(
     coverage_gaps: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Build the ``axis_summary.final_gate`` block from coverage gaps.
-
-    This is the ONLY axis_summary block actually computed in CODE-A
-    (the others — cve_lite, source_quality, claim_entailment — are
-    initialized with zeroed counters by ``_build_zeroed_axis_summary``
-    and will be populated in CODE-B).
 
     Counters:
       - ``blocking_gap_count``: number of gaps with severity == "block".
@@ -532,10 +1330,9 @@ def _build_axis_summary_final_gate(
       - ``has_blocking_gaps``: ``blocking_gap_count > 0``.
       - ``has_warnings``: ``warning_gap_count > 0``.
 
-    Note: info-severity gaps are not counted toward either bucket;
-    they are surfaced in ``gate.coverage_gaps`` but do not influence
-    these two summary booleans. Mirrors the report's UI intent
-    described in PHASE_8_8B_REPORT_PRE.md §8.7.
+    Info-severity gaps are not counted toward either bucket; they
+    surface in ``gate.coverage_gaps`` but do not influence these
+    summary booleans (PHASE_8_8B_REPORT_PRE.md §8.7).
     """
     blocking_gap_count = 0
     warning_gap_count = 0
@@ -553,76 +1350,46 @@ def _build_axis_summary_final_gate(
     }
 
 
-def _build_zeroed_axis_summary() -> dict[str, Any]:
-    """Build the ``axis_summary`` block with zeroed counters for CODE-A.
-
-    Only ``final_gate`` is populated meaningfully; the other three
-    axes return shape-compatible zero counters so consumers can rely
-    on every key being present from day one. The full population of
-    cve_lite / source_quality / claim_entailment arrives in CODE-B.
-    """
-    return {
-        "cve_lite": {
-            "verified_claims_count": 0,
-            "unverified_claims_count": 0,
-            "inconclusive_count": 0,
-        },
-        "source_quality": {
-            "strong_count": 0,
-            "adequate_count": 0,
-            "weak_count": 0,
-            "unsuitable_count": 0,
-            "unknown_count": 0,
-            "missing_count": 0,
-        },
-        "claim_entailment": {
-            "entailed_count": 0,
-            "partially_supported_count": 0,
-            "not_supported_count": 0,
-            "contradicted_count": 0,
-            "uncertain_count": 0,
-            "missing_count": 0,
-        },
-        "final_gate": {
-            "has_blocking_gaps": False,
-            "has_warnings": False,
-            "blocking_gap_count": 0,
-            "warning_gap_count": 0,
-        },
-    }
-
-
 # ---------------------------------------------------------------------------
-# Mock indicators
+# Mock indicators (CODE-B: derive from real rows when available)
 # ---------------------------------------------------------------------------
-def _build_mock_indicators(
+def _update_mock_indicators(
+    *,
     draft: dict[str, Any] | None,
+    cve_records: list[dict[str, Any]],
+    sq_rows: list[dict[str, Any]],
+    ce_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Build the ``mock_indicators`` section.
+    """Build the ``mock_indicators`` section deriving from real data.
 
-    Today every axis ships with a mock implementation in MVP-0
-    (PROVIDERS_ENABLED=mock, MAX_COST_PER_TASK=0). The base
-    indicators are therefore ``True`` by default. The one indicator
-    we can derive non-trivially from CODE-A's surface area is
-    ``uses_mock_compiler``, which inspects
-    ``draft_final_answers.compiler_name``:
-      - if a draft exists and its ``compiler_name`` matches the mock
-        compiler shipped today, ``uses_mock_compiler`` is True;
-      - if a draft exists with a different ``compiler_name``, the
-        compiler has been upgraded for this task and the indicator
-        flips to False;
-      - if no draft exists yet, we keep True as the MVP-0 fallback
-        and add an explanatory note (the compiler simply has not run
-        yet).
+    Derivation rules (PHASE_8_8B_REPORT_PRE.md §7.7):
 
-    The remaining axes (source_quality / claim_entailment / cve_lite)
-    will be derived from real per-record provenance in CODE-B; for
-    CODE-A they remain at the MVP-0 fallback ``True`` value because
-    we do not yet inspect those tables here.
+      uses_mock_source_quality:
+        - True if at least one source_quality_assessments row relevant
+          to the task has either evaluator_name equal to the known mock
+          evaluator name OR payload.mock == True;
+        - True fallback when no SQ data is present (MVP-0 default).
 
-    ``notes`` carries the mandatory anti-hallucination disclaimers.
-    Consumers MUST display at least these notes verbatim alongside
-    any rendering of the report.
+      uses_mock_claim_entailment:
+        - True if at least one claim_entailment_checks row relevant to
+          the task has either checker_name equal to the known mock
+          checker name OR payload.mock == True;
+        - True fallback when no CE data is present (MVP-0 default).
+
+      uses_mock_compiler:
+        - if draft exists: True iff draft.compiler_name == mock
+          compiler name; False otherwise;
+        - if no draft: True fallback (compiler did not run yet).
+
+      uses_mock_cve_lite:
+        - True if at least one verification_records row of kind
+          'cve_lite' relevant to the task has check_name equal to the
+          known mock CVE-lite check name;
+        - True fallback when no CVE-lite data is present.
+
+    The ``notes`` array carries the anti-hallucination disclaimers. The
+    CODE-B note replaces CODE-A's "claims/evidence aggregation is
+    deferred" wording.
     """
     notes: list[str] = [
         "Una fonte citata non implica un claim vero.",
@@ -632,19 +1399,49 @@ def _build_mock_indicators(
         "mondo.",
         "Il payload JSONB è esposto verbatim; RBAC/redaction non "
         "implementata.",
-        "Lifecycle/source-loss event details are not included in "
-        "CODE-A; coverage_gap_statements with kind='source_loss', if "
-        "present, may still appear in gate.coverage_gaps.",
+        "Lifecycle/source-loss event details are not included in this "
+        "report; eventual coverage_gap_statements with "
+        "kind='source_loss' may still appear in gate.coverage_gaps.",
         "claims/evidence/CVE-lite/Source Quality/Claim Entailment "
-        "aggregation sarà completata in 8.8B-REPORT-CODE-B.",
+        "aggregation inclusa in questo report; lifecycle/source-loss "
+        "event details restano fuori dalla v1.",
     ]
 
+    # Source Quality.
+    uses_mock_source_quality: bool
+    if not sq_rows:
+        uses_mock_source_quality = True
+        notes.append(
+            "uses_mock_source_quality reflects the MVP-0 fallback: "
+            "no source_quality_assessments rows are linked to claims "
+            "of this task yet."
+        )
+    else:
+        uses_mock_source_quality = any(
+            r.get("evaluator_name") == _MOCK_SOURCE_QUALITY_EVALUATOR_NAME
+            or _is_payload_mock(r.get("payload"))
+            for r in sq_rows
+        )
+
+    # Claim Entailment.
+    uses_mock_claim_entailment: bool
+    if not ce_rows:
+        uses_mock_claim_entailment = True
+        notes.append(
+            "uses_mock_claim_entailment reflects the MVP-0 fallback: "
+            "no claim_entailment_checks rows are linked to claims of "
+            "this task yet."
+        )
+    else:
+        uses_mock_claim_entailment = any(
+            r.get("checker_name") == _MOCK_ENTAILMENT_CHECKER_NAME
+            or _is_payload_mock(r.get("payload"))
+            for r in ce_rows
+        )
+
+    # Compiler.
     uses_mock_compiler: bool
     if draft is None:
-        # No draft yet: the compiler simply has not run. The MVP-0
-        # default is mock, so we keep True and add a disambiguating
-        # note so consumers do not mistake this for "we proved the
-        # compiler is mock by inspecting a draft".
         uses_mock_compiler = True
         notes.append(
             "uses_mock_compiler reflects the MVP-0 fallback: no draft "
@@ -654,11 +1451,26 @@ def _build_mock_indicators(
         compiler_name = draft.get("compiler_name")
         uses_mock_compiler = compiler_name == _MOCK_COMPILER_NAME
 
+    # CVE-lite.
+    uses_mock_cve_lite: bool
+    if not cve_records:
+        uses_mock_cve_lite = True
+        notes.append(
+            "uses_mock_cve_lite reflects the MVP-0 fallback: no "
+            "verification_records of kind 'cve_lite' are present for "
+            "claims of this task yet."
+        )
+    else:
+        uses_mock_cve_lite = any(
+            r.get("check_name") == _MOCK_CVE_LITE_CHECK_NAME
+            for r in cve_records
+        )
+
     return {
-        "uses_mock_source_quality": True,
-        "uses_mock_claim_entailment": True,
+        "uses_mock_source_quality": uses_mock_source_quality,
+        "uses_mock_claim_entailment": uses_mock_claim_entailment,
         "uses_mock_compiler": uses_mock_compiler,
-        "uses_mock_cve_lite": True,
+        "uses_mock_cve_lite": uses_mock_cve_lite,
         "notes": notes,
     }
 
@@ -682,12 +1494,14 @@ def _limitations() -> list[str]:
         "Il payload JSONB è esposto verbatim; RBAC/redaction non "
         "implementata.",
         "I dettagli evento lifecycle/source-loss non sono inclusi in "
-        "CODE-A; eventuali coverage_gap_statements con "
+        "questo report; eventuali coverage_gap_statements con "
         "kind='source_loss' possono comunque comparire in "
         "gate.coverage_gaps.",
-        "CODE-A non include ancora claims/evidence/CVE-lite/Source "
-        "Quality/Claim Entailment aggregation; arriverà in "
-        "8.8B-REPORT-CODE-B.",
+        "claims/evidence/CVE-lite/Source Quality/Claim Entailment "
+        "aggregation inclusa in questo report; lifecycle/source-loss "
+        "event details restano fuori dalla v1, ma eventuali "
+        "coverage_gap_statements con kind='source_loss' possono "
+        "comparire in gate.coverage_gaps.",
     ]
 
 
@@ -715,11 +1529,9 @@ def _build_publication_section(
     All optional identifiers are stringified UUIDs (or ``None``).
     ``summary_text`` is NOT loaded here because the ``published_answers``
     table does not store summary_text directly: it lives on
-    ``draft_final_answers``. To keep CODE-A minimal we surface the
-    published-answer-side ``content_hash`` (which is derived from
-    summary_text per the gate's invariant) and leave ``summary_text``
-    as ``None`` for now; CODE-B can fold in the draft's summary when
-    the broader aggregation is wired.
+    ``draft_final_answers``. CODE-B leaves it as None; a future block
+    may fold in the draft's summary when the broader aggregation is
+    wired.
     """
     if published is None:
         return {
@@ -783,7 +1595,7 @@ def get_task_anti_hallucination_report(
     task_id: uuid.UUID,
     conn: Connection = Depends(get_conn),
 ) -> dict[str, Any]:
-    """Return the task-level Anti-Hallucination Report (CODE-A skeleton).
+    """Return the task-level Anti-Hallucination Report (CODE-A + CODE-B).
 
     Behavior summary:
       - 404 RESOURCE_NOT_FOUND with ``details.resource="task_masters"``
@@ -793,12 +1605,27 @@ def get_task_anti_hallucination_report(
         ``project_id``, ``tenant_id``, ``task``, ``publication``,
         ``gate``, ``claims``, ``evidence``, ``axis_summary``,
         ``mock_indicators``, ``limitations``).
-      - ``claims`` and ``evidence`` are empty lists in CODE-A. The
-        full per-claim aggregation (CVE-lite, Source Quality,
-        Claim Entailment) arrives in CODE-B.
-      - ``axis_summary.final_gate`` is derived from the coverage
-        gaps attached to the latest draft. The other three axes
-        carry zeroed counters (CODE-B).
+      - ``claims`` is one entry per logical_claim of the task,
+        carrying ``latest_entry_id``, ``latest_state``,
+        ``support_scope``, structural ``evidence_links`` (scoped to
+        the latest ledger entry), CVE-lite records, latest Source
+        Quality per linked span, and latest Claim Entailment per
+        (latest_entry, span) pair.
+      - ``evidence`` is one entry per evidence_span attached to the
+        task via task_documents.
+      - ``axis_summary.final_gate`` is derived from the coverage gaps
+        attached to the latest draft.
+      - ``axis_summary.cve_lite`` counts CVE-lite outcomes on the
+        latest ledger entries.
+      - ``axis_summary.source_quality`` counts the LATEST
+        overall_quality per evidence_span linked to claims; missing
+        rows fall into ``missing_count``.
+      - ``axis_summary.claim_entailment`` counts the LATEST verdict
+        per (latest_entry, span) pair derived from claim_evidence_links;
+        missing rows fall into ``missing_count``. Spans attached to
+        the task via task_documents but never linked to a claim are
+        NOT counted as missing — this avoids inflating missing_count
+        for unused document spans.
       - ``coverage_gaps`` are returned ordered severity-first
         (block > warn > info), then created_at ASC, then id ASC. The
         derived ``axis`` decoration is added per gap.
@@ -811,7 +1638,12 @@ def get_task_anti_hallucination_report(
         authoritative.
       - JSONB content is exposed verbatim; RBAC redaction is a known
         debt and is acknowledged in ``limitations``.
+      - ``claim_type`` is surfaced as None: the column does not exist
+        on logical_claims / claim_ledger_entries in MVP-0 (it lives on
+        ``classified_claims`` and is excluded from v1 per
+        PHASE_8_8B_REPORT_PRE.md §15).
     """
+    # --- Existence check and core context ----------------------------------
     task = _task_or_404(conn, task_id)
 
     draft = _select_latest_draft(conn, task_id)
@@ -834,12 +1666,103 @@ def get_task_anti_hallucination_report(
         task=task, gate=gate, published=published
     )
 
-    axis_summary = _build_zeroed_axis_summary()
-    axis_summary["final_gate"] = _build_axis_summary_final_gate(
-        coverage_gaps_view
+    # --- CODE-B: claim / evidence aggregation ------------------------------
+    logical_claims = _select_logical_claims(conn, task_id)
+    logical_ids = [uuid.UUID(str(lc["id"])) for lc in logical_claims]
+
+    ledger_rows = _select_ledger_entries_for_logical_ids(conn, logical_ids)
+    latest_entry_by_logical = _latest_ledger_by_logical_id(ledger_rows)
+
+    latest_entry_ids: list[uuid.UUID] = [
+        uuid.UUID(str(row["id"])) for row in latest_entry_by_logical.values()
+    ]
+
+    raw_links = _select_claim_evidence_links(conn, latest_entry_ids)
+
+    # Group links by claim_ledger_entry_id for downstream assembly. Same
+    # ordering as the SQL fetch is preserved by Python's stable list.
+    links_by_entry: dict[uuid.UUID, list[dict[str, Any]]] = {}
+    for link in raw_links:
+        eid = uuid.UUID(str(link["claim_ledger_entry_id"]))
+        links_by_entry.setdefault(eid, []).append(link)
+
+    cve_records = _select_cve_lite_records(conn, latest_entry_ids)
+    cve_records_by_entry: dict[uuid.UUID, list[dict[str, Any]]] = {}
+    for r in cve_records:
+        eid = uuid.UUID(str(r["claim_ledger_entry_id"]))
+        cve_records_by_entry.setdefault(eid, []).append(r)
+
+    # Compute the set of evidence spans that are RELEVANT to claim-level
+    # axes (i.e. reached by a claim_evidence_links targeting a latest
+    # ledger entry). Spans attached via task_documents that are not
+    # linked to any claim are EXCLUDED from missing_count semantics.
+    relevant_span_ids: list[uuid.UUID] = []
+    seen_spans: set[uuid.UUID] = set()
+    for link in raw_links:
+        ev_id_raw = link["evidence_span_id"]
+        if ev_id_raw is None:
+            continue
+        sid = uuid.UUID(str(ev_id_raw))
+        if sid in seen_spans:
+            continue
+        seen_spans.add(sid)
+        relevant_span_ids.append(sid)
+
+    sq_rows = _select_source_quality_rows(conn, relevant_span_ids)
+    latest_sq_by_span = _latest_source_quality_by_span(sq_rows)
+
+    ce_rows = _select_entailment_rows(conn, latest_entry_ids)
+    latest_ce_by_pair = _latest_entailment_by_pair(ce_rows)
+
+    # Relevant pair set for the entailment axis: union of
+    # (latest_entry_id, evidence_span_id) across all links targeting a
+    # latest ledger entry.
+    relevant_pairs: list[tuple[uuid.UUID, uuid.UUID]] = []
+    seen_pairs: set[tuple[uuid.UUID, uuid.UUID]] = set()
+    for link in raw_links:
+        ev_id_raw = link["evidence_span_id"]
+        if ev_id_raw is None:
+            continue
+        eid = uuid.UUID(str(link["claim_ledger_entry_id"]))
+        sid = uuid.UUID(str(ev_id_raw))
+        pair_key = (eid, sid)
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+        relevant_pairs.append(pair_key)
+
+    claims_view = _build_claim_items(
+        logical_claims=logical_claims,
+        latest_entry_by_logical=latest_entry_by_logical,
+        links_by_entry=links_by_entry,
+        cve_records_by_entry=cve_records_by_entry,
+        latest_sq_by_span=latest_sq_by_span,
+        latest_ce_by_pair=latest_ce_by_pair,
     )
 
-    mock_indicators = _build_mock_indicators(draft)
+    evidence_rows = _select_evidence_for_task(conn, task_id)
+    evidence_view = _build_evidence_items(evidence_rows)
+
+    # --- axis_summary -------------------------------------------------------
+    axis_summary = {
+        "cve_lite": _build_axis_summary_cve(cve_records),
+        "source_quality": _build_axis_summary_source_quality(
+            relevant_span_ids=relevant_span_ids,
+            latest_sq_by_span=latest_sq_by_span,
+        ),
+        "claim_entailment": _build_axis_summary_entailment(
+            relevant_pairs=relevant_pairs,
+            latest_ce_by_pair=latest_ce_by_pair,
+        ),
+        "final_gate": _build_axis_summary_final_gate(coverage_gaps_view),
+    }
+
+    mock_indicators = _update_mock_indicators(
+        draft=draft,
+        cve_records=cve_records,
+        sq_rows=sq_rows,
+        ce_rows=ce_rows,
+    )
 
     return {
         "task_id": _uuid_str(task["id"]),
@@ -853,8 +1776,8 @@ def get_task_anti_hallucination_report(
         "gate": _build_gate_section(
             gate=gate, coverage_gaps_view=coverage_gaps_view
         ),
-        "claims": [],
-        "evidence": [],
+        "claims": claims_view,
+        "evidence": evidence_view,
         "axis_summary": axis_summary,
         "mock_indicators": mock_indicators,
         "limitations": _limitations(),
