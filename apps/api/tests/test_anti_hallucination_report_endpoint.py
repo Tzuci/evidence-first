@@ -1466,6 +1466,118 @@ def test_get_anti_hallucination_report_includes_claim_evidence_source_quality_en
     assert axis["claim_entailment"]["contradicted_count"] == 0
 
 
+
+def test_get_anti_hallucination_report_maps_parent_cve_record_to_latest_entry() -> None:
+    """CVE-lite records are written on the v1 parent entry by the worker.
+
+    The report is keyed by the latest ledger entry, usually v2
+    ``verified_fact`` created after CVE-lite passes. This regression
+    test locks the lineage mapping:
+
+      v1 parent entry --claim_lineage/supersedes--> v2 latest entry
+
+    The CVE-lite verification_record remains attached to v1, but the
+    report must display it under the claim item whose latest_entry_id is
+    v2 and count it in axis_summary.cve_lite.
+    """
+    _skip_if_db_unreachable()
+
+    engine = get_engine()
+    with engine.begin() as conn:
+        tenant_id, user_id = _seed_tenant_user(conn)
+        project_id, task_id = _seed_project_and_task(
+            conn, tenant_id=tenant_id, user_id=user_id
+        )
+        chain = _create_evidence_span_chain(
+            conn,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            user_id=user_id,
+            task_id=task_id,
+        )
+
+        lc_id, parent_entry_id = _create_logical_claim_with_verified_entry(
+            conn,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            task_id=task_id,
+            canonical_text="Revenue reached 12500000 USD in 2024.",
+        )
+
+        latest_entry_id = uuid.UUID(
+            str(
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO claim_ledger_entries
+                            (id, claim_logical_id, version_no, state,
+                             support_scope, user_provided_dependency,
+                             transition_reason)
+                        VALUES
+                            (:id, :lc, 2, 'verified_fact',
+                             'supported_by_user_corpus_only',
+                             'supported_by_user_corpus_only',
+                             'cve_lite_pass')
+                        RETURNING id
+                        """
+                    ),
+                    {"id": uuid.uuid4(), "lc": lc_id},
+                ).first()[0]
+            )
+        )
+
+        conn.execute(
+            text(
+                """
+                INSERT INTO claim_lineage
+                    (id, parent_entry_id, child_entry_id, relation_kind)
+                VALUES
+                    (:id, :parent, :child, 'supersedes')
+                """
+            ),
+            {
+                "id": uuid.uuid4(),
+                "parent": parent_entry_id,
+                "child": latest_entry_id,
+            },
+        )
+
+        _link_claim_to_span(
+            conn,
+            claim_logical_id=lc_id,
+            claim_ledger_entry_id=latest_entry_id,
+            evidence_span_id=chain["evidence_span_id"],
+        )
+
+        cve_id = _insert_cve_lite_record(
+            conn,
+            claim_logical_id=lc_id,
+            claim_ledger_entry_id=parent_entry_id,
+            outcome="pass",
+        )
+
+    client = TestClient(app)
+    resp = client.get(_endpoint(task_id))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    claim_item = next(
+        c for c in body["claims"] if c["logical_claim_id"] == str(lc_id)
+    )
+    assert claim_item["latest_entry_id"] == str(latest_entry_id)
+
+    cve_items = claim_item["cve_lite"]
+    assert len(cve_items) == 1
+    assert cve_items[0]["verification_record_id"] == str(cve_id)
+    # The source verification row truthfully points at the v1 parent.
+    assert cve_items[0]["claim_ledger_entry_id"] == str(parent_entry_id)
+    assert cve_items[0]["outcome"] == "pass"
+
+    assert body["axis_summary"]["cve_lite"]["verified_claims_count"] == 1
+    assert body["axis_summary"]["cve_lite"]["unverified_claims_count"] == 0
+    assert body["axis_summary"]["cve_lite"]["inconclusive_count"] == 0
+
+
 # 8 — latest source_quality version wins
 # ===========================================================================
 def test_get_anti_hallucination_report_uses_latest_source_quality_version() -> None:

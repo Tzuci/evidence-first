@@ -770,32 +770,61 @@ def _select_evidence_for_task(
 def _select_cve_lite_records(
     conn: Connection, entry_ids: list[uuid.UUID]
 ) -> list[dict[str, Any]]:
-    """Return ``verification_records`` rows of kind 'cve_lite' for the
-    given ledger entries.
+    """Return CVE-lite ``verification_records`` relevant to latest entries.
 
-    Ordering: ``claim_ledger_entry_id ASC, id ASC``. The UNIQUE
-    constraint ``(claim_ledger_entry_id, check_kind, check_name)`` on
-    verification_records (0004) guarantees at most one CVE-lite row
-    per ledger entry, so this ordering is sufficient for
-    determinism without picking a "latest".
+    Important lineage detail:
+    CVE-lite writes ``verification_records`` on the v1 candidate entry,
+    then appends a v2 ``claim_ledger_entries`` row such as
+    ``verified_fact`` / ``unverifiable`` and links v1 -> v2 via
+    ``claim_lineage(relation_kind='supersedes')``.
+
+    The report is built around latest ledger entries, so we must read
+    CVE-lite records both:
+      - directly attached to a latest entry, for manually seeded / future
+        rows; and
+      - attached to the parent entry that was superseded by the latest
+        entry, which is the normal worker pipeline path.
+
+    ``report_claim_ledger_entry_id`` is the latest entry under which the
+    record should be displayed. ``claim_ledger_entry_id`` remains the
+    actual ledger entry referenced by the verification_records row.
     """
     if not entry_ids:
         return []
     stmt = text(
         """
-        SELECT
-          id,
-          claim_logical_id,
-          claim_ledger_entry_id,
-          check_kind,
-          check_name,
-          outcome,
-          payload,
-          created_at
-        FROM verification_records
-        WHERE check_kind = 'cve_lite'
-          AND claim_ledger_entry_id IN :entry_ids
-        ORDER BY claim_ledger_entry_id ASC, id ASC
+        WITH target_entries AS (
+            SELECT
+              cle.id AS report_claim_ledger_entry_id,
+              cle.id AS record_claim_ledger_entry_id
+            FROM claim_ledger_entries cle
+            WHERE cle.id IN :entry_ids
+
+            UNION ALL
+
+            SELECT
+              cl.child_entry_id  AS report_claim_ledger_entry_id,
+              cl.parent_entry_id AS record_claim_ledger_entry_id
+            FROM claim_lineage cl
+            WHERE cl.child_entry_id IN :entry_ids
+              AND cl.relation_kind = 'supersedes'
+        )
+        SELECT DISTINCT ON (te.report_claim_ledger_entry_id, vr.id)
+          te.report_claim_ledger_entry_id,
+          vr.id,
+          vr.claim_logical_id,
+          vr.claim_ledger_entry_id,
+          vr.check_kind,
+          vr.check_name,
+          vr.outcome,
+          vr.payload,
+          vr.created_at
+        FROM target_entries te
+        JOIN verification_records vr
+          ON vr.claim_ledger_entry_id = te.record_claim_ledger_entry_id
+        WHERE vr.check_kind = 'cve_lite'
+        ORDER BY te.report_claim_ledger_entry_id ASC,
+                 vr.id ASC
         """
     ).bindparams(
         bindparam("entry_ids", expanding=True, type_=_SAUuid())
@@ -1689,7 +1718,15 @@ def get_task_anti_hallucination_report(
     cve_records = _select_cve_lite_records(conn, latest_entry_ids)
     cve_records_by_entry: dict[uuid.UUID, list[dict[str, Any]]] = {}
     for r in cve_records:
-        eid = uuid.UUID(str(r["claim_ledger_entry_id"]))
+        # CVE-lite records are normally attached to the v1 parent entry,
+        # while the report is keyed by the latest v2 entry. The SELECT
+        # provides report_claim_ledger_entry_id to map the source record
+        # back under the latest entry without falsifying the record's own
+        # claim_ledger_entry_id.
+        report_entry_id = r.get("report_claim_ledger_entry_id") or r[
+            "claim_ledger_entry_id"
+        ]
+        eid = uuid.UUID(str(report_entry_id))
         cve_records_by_entry.setdefault(eid, []).append(r)
 
     # Compute the set of evidence spans that are RELEVANT to claim-level
