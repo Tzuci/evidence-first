@@ -590,4 +590,59 @@ Sequenza operativa raccomandata:
 - **Inflazione semantica del report:** il rischio di trattarlo come "fonte di verità" anziché vista derivata. Mitigazione: `limitations` testuali, separazione netta degli assi, mock_indicators sempre presenti, e disclaimer ripetuto in tutta la documentazione futura.
 - **Dipendenza implicita dalla policy del Gate:** se la policy `mvp0_entailment_gate_policy` o la policy SQ vengono bumpate, il report deve continuare a essere coerente con la decisione del Gate. Mitigazione: il report **non ricalcola** la decisione; legge `final_gate_reports.decision/reason_code/payload` e li espone verbatim.
 - **No claim-level entailment read API in v1:** il dettaglio claim-level resta non esposto via HTTP. La UI può ricavarlo dal report aggregato in molti casi, ma non è sostitutivo dell'endpoint dedicato. Rinviato a 8.8A-READ-B.
-- **Rischi ereditati invariati:** no Citation-to-Claim Validator (8.8B storico), no Contradiction Detector reale (8.8C), no Final Answer Sentence Gate (8.8D), no External Verification / Web-RAG (8.9), no Multi-agent consensus (9.0), no UI, no retention distruttiva, no trigger append-only su `coverage_gap_statements`, no worker main loop reale negli end-to-end test, no backfill per task pre-8.7E / pre-8.8A-WORKER.
+- **Rischi ereditati invariati:** no Citation-to-Claim Validator (8.8B storico), no Contradiction Detector reale (8.8C), no Final Answer Sentence Gate (8.8D), no External Verification / Web-RAG (8.9), no Multi-agent consensus (9.0), no UI, no retention distruttiva, no trigger append-only su `coverage_gap_statements`, no worker main loop reale negli end-to-end test, no backfill per task pre-8.7E / pre-8.8A.
+
+---
+
+## Implementation status
+
+> **Aggiornamento post-implementazione (append-only).** Il corpo del documento sopra è il **piano pre-codice** di 8.8B-REPORT, conservato integralmente come traccia decisionale e non riscritto. Le sezioni che parlano al futuro ("da implementare in 8.8B-REPORT-CODE", "non scritto in questo blocco", "raccomandazione operativa") riflettono lo stato del repository al momento in cui questo piano è stato redatto e **non descrivono lo stato corrente**. Lo stato corrente vive in `PROJECT_STATE.md`, che è la fonte documentale autoritativa post-`af74187`.
+
+### Blocchi 8.8B-REPORT chiusi tecnicamente
+
+Tutti i blocchi della sotto-fase 8.8B-REPORT sono tecnicamente chiusi al commit `af74187`:
+
+- **8.8B-REPORT-PRE** — questo documento (piano pre-codice). Commit di partenza `13533ac`.
+- **8.8B-REPORT-CODE-A** — `apps/api/app/routes/anti_hallucination_report.py` (top-level shape: `task`, `publication`, `gate` con coverage_gaps decorati `axis` e ordinati severity-first, `mock_indicators` con flag fallback MVP-0, `limitations` sempre presente; `claims`/`evidence` vuoti in questo blocco; `axis_summary.final_gate` derivato da coverage_gaps, gli altri assi a counters zero) + registrazione router in `apps/api/app/main.py` + 6 scenari di test in `apps/api/tests/test_anti_hallucination_report_endpoint.py` (404 missing task, not_ready empty task, publication_held + gaps, withdrawn/superseded non flatten, read-only snapshot invariant, severity-first ordering). Commit `a49f923` plan + `ce31488` skeleton.
+- **8.8B-REPORT-CODE-B** — aggregazione claim-level: `claims` con `latest_entry_id`/`latest_state`/`support_scope`/`evidence_links`/`cve_lite`/`source_quality`/`entailment`, `evidence` con righe `evidence_spans` task-attached, `axis_summary` completo per `cve_lite`/`source_quality`/`claim_entailment` con `missing_count` ristretto a spans/pairs claim-linked, `mock_indicators` derivati da identità servizio + `payload.mock` con note descrittive. 6 nuovi scenari di test (happy path completo, latest source quality version wins, latest entailment version wins, missing SQ/CE → null slots + missing_count, spans non linkati a claim non contano in missing, ordering deterministico di claims ed evidence). Commit `eaab497`.
+- **8.8B-REPORT-CODE-C-FIX** — fix CVE-lite lineage. CVE-lite scrive `verification_records` (`check_kind='cve_lite'`) sulla v1 candidate `claim_ledger_entries` e poi appende una v2 `verified_fact`/`unverifiable` con `claim_lineage(relation_kind='supersedes')`. Il report è keyed per la **latest entry** (v2), mentre il `verification_records` resta legato a v1: la query `_select_cve_lite_records` è stata modificata per leggere i record CVE-lite **sia direttamente dalla latest entry sia tramite il parent v1 superseded** (`JOIN claim_lineage cl ON cl.child_entry_id IN :entry_ids AND cl.relation_kind = 'supersedes'`). Aggiunto il test regression `test_get_anti_hallucination_report_maps_parent_cve_record_to_latest_entry` che seede v1 + v2 + `claim_lineage` + `verification_records` su v1, e verifica che il report mappi il record sotto la v2 e conti `verified_claims_count=1`. Commit `af74187`.
+- **8.8B-REPORT-FLOW** — `tests/test_phase_8_8b_report_flow.py` con due test indipendenti end-to-end attraverso API → FakeRedis → dispatcher → consumer → servizi worker → DB → GET report:
+  - `test_anti_hallucination_report_flow_published_warning_path`: mock services reali → Final Answer Gate approved con `reason_code` ∈ {`all_spans_verified_with_warnings`, `all_spans_verified`} → `publication.status='published'`, claims/evidence non vuoti, axis_summary coerente, `mock_indicators` tutti True, `axis_summary.claim_entailment.contradicted_count=0`, audit chain valida con `task.entailment_checked` tra `task.source_quality_assessed` e `task.compiling`.
+  - `test_anti_hallucination_report_flow_publication_held_entailment_block`: monkeypatch del simbolo `_wapp.consumers.task_created.run_claim_entailment_checks` con stub che inserisce v1 `claim_entailment_checks` con `verdict='contradicted'` per ogni pair (necessario perché il mock checker reale non emette `contradicted`) → Gate rejected con `reason_code='entailment_block'` → `publication.status='publication_held'`, `published_answer_id=null`, `coverage_gaps` include `entailment_block` severity='block' con `axis='claim_entailment'`, `axis_summary.claim_entailment.contradicted_count >= 1`, `axis_summary.final_gate.has_blocking_gaps=True`, `GET /published-answer` → 404 con `details.resource='published_answers'`, audit terminale `task.publication_held`.
+  Commit `af74187`.
+
+### Decisioni di §15 effettivamente adottate
+
+- **Schema Pydantic shared o wrapper inline:** adottata l'opzione (b) — wrapper inline nel route module. Promozione a `AntiHallucinationReportRead` shared rinviata.
+- **Task-level vs published-answer-level:** adottata l'opzione (a) — solo task-level in v1. Endpoint published-answer-level rinviato.
+- **Lifecycle / source-loss in v1:** adottata l'opzione (b) — estensione futura. Eventuali `coverage_gap_statements` di kind `source_loss` possono comunque comparire in `gate.coverage_gaps` con `axis='source_loss'`, ma il report non popola sezioni lifecycle/source-loss dedicate.
+- **Raw e classified claims:** adottata l'opzione (b) — solo logical + latest entry. `claim_type` esposto come `None` perché logical_claims/claim_ledger_entries non persistono `claim_type` in MVP-0 (vive su `classified_claims`).
+- **Dettaglio del payload JSONB:** adottata l'opzione (a) — verbatim integrale. Selezione/redaction rinviata.
+- **Summary counts SQL o Python:** adottata l'opzione (b) — calcolo in Python.
+- **Ordering coverage gaps:** adottata l'opzione (a) — severity-first (`block` > `warn` > `info`), poi `created_at ASC`, poi `id ASC`.
+- **Report per task non terminali:** adottata l'opzione (a) — 200 con campi parziali e `publication.status='not_ready'`.
+- **Pagination:** adottata l'opzione (a) — limit-only non applicabile alla forma task-level naturalmente bounded; il report v1 non è paginato.
+
+### Test verdi dichiarati prima del commit `af74187`
+
+- `apps/api/tests/test_anti_hallucination_report_endpoint.py` → **13 passed** (6 CODE-A + 6 CODE-B + 1 CVE lineage regression).
+- `tests/test_phase_8_8b_report_flow.py` → **2 passed**.
+- `tests/test_phase_8_8a_entailment_gate_flow.py` → **2 passed** (regression).
+- `apps/api` tests → **112 passed, 8 skipped**.
+- Root tests → **164 passed**.
+
+### Note di precisione
+
+- **Nessuna nuova migration in 8.8B-REPORT.** La numerazione disponibile resta a `0011_*` o successivo, candidata naturale per la retention distruttiva.
+- **Il report è strettamente read-only.** Nessun INSERT/UPDATE/DELETE su nessuna tabella, nessun import di codice worker, nessun uso di Redis. Le fonti di verità primarie restano le tabelle append-only e gli endpoint read specialistici.
+- **Il report non ricalcola il Final Answer Gate.** Legge `final_gate_reports.decision`/`reason_code`/`payload` verbatim.
+- **Il branch `entailment_block` resta dormiente in produzione mock-driven.** Il mock checker reale non emette `contradicted`; nel realistic flow test 8.8B-REPORT-FLOW il branch è attivato via stub dell'orchestrator (stesso pattern di 8.8A-GATE-FLOW).
+- **Promessa anti-allucinazione invariata.** Il sistema riduce il rischio di pubblicare claim non supportati, contraddetti o basati su fonti inadeguate; non garantisce verità assoluta. Una fonte citata non implica un claim vero. Una quote presente non implica supporto semantico. Un verdict `entailed` non implica verità del claim nel mondo. Il report è una vista read-only derivata, non un'autorità decisionale.
+
+### Note sulle frasi del corpo storico da non leggere come stato corrente
+
+Le frasi seguenti, presenti nel corpo storico, riflettono lo stato pre-implementazione e sono state superate dall'esecuzione effettiva:
+
+- "**da implementare in 8.8B-REPORT-CODE, non in questo blocco**" (§3.1) → oggi `apps/api/app/routes/anti_hallucination_report.py` è implementato e registrato in `apps/api/app/main.py`.
+- "**Test da proporre, NON da scrivere in questo blocco**" (§13) → oggi tutti i 13 scenari API + 2 realistic flow sono scritti e passano.
+- "**Sequenza operativa raccomandata: ... 4. UI-PRE — apertura della fase UI**" (§16) → oggi il prossimo blocco operativo consigliato è effettivamente **UI-PRE**: il report aggregato è il primo contratto stabile su cui aprire la fase UI.
