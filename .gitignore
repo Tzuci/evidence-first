@@ -39,3 +39,6 @@ node_modules/
 out/
 .vitest/
 coverage/
+
+# Local development runtime artifacts
+.dev/
