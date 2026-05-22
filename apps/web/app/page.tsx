@@ -1,26 +1,33 @@
 import * as React from "react";
 
 /**
- * Product entrypoint home page (UI-HOME-B).
+ * Product entrypoint home page.
  *
- * This page makes the `/` route a usable product entrypoint rather
- * than an informational page. It lets the user understand what
- * Evidence-First MVP-0 does, what is and is not available, and —
- * most importantly — open an existing task by pasting a task id.
+ * Updated by Phase UI-CREATE-FLOW-A: the home page now makes
+ * "New evidence-based request" the PRIMARY action, linking to
+ * `/requests/new`, where the user can create a real task from the
+ * browser without knowing a task id. "Open existing task" — the
+ * plain HTML GET form that forwards a pasted task id to its summary
+ * page — is kept as the SECONDARY action for developers who already
+ * have an id.
  *
- * Hard constraints (PHASE UI-HOME-B §5, §6):
+ * Hard constraints (PHASE UI-CREATE-FLOW-A §8, §12):
  *   - React server component only: no "use client", no hooks, no
- *     fetch, no API calls, no client-side JavaScript. The single
- *     interactive element is a plain HTML <form> with method="get"
- *     and action="/tasks"; the browser performs the navigation.
- *   - The form does NOT create tasks and does NOT call the backend.
- *     It only navigates to the user-facing task summary route.
+ *     fetch, no API calls. The primary CTA is a plain link to
+ *     `/requests/new`; the secondary action is a plain HTML <form>
+ *     with method="get" and action="/tasks". Neither creates a task
+ *     here — task creation happens on `/requests/new`.
  *   - No misleading wording. The page must not overclaim what the
  *     system can establish. Publication can be held when the checks
  *     find insufficient support; the wording stays sober.
  *   - Inline styles only, in line with the rest of the project. No
  *     CSS modules, no Tailwind, no component libraries, no new
  *     dependencies.
+ *   - The Task summary vs Technical report distinction, the MVP
+ *     limitations, the direct health links and the legacy
+ *     `/diagnostic` note are all kept; only the hierarchy changes so
+ *     the home no longer feels like the user must already know a
+ *     task id.
  *
  * The companion test `apps/web/tests/home.test.tsx` enforces the
  * banned-copy guardrail and the structural expectations.
@@ -70,18 +77,47 @@ const heroNoteStyle: React.CSSProperties = {
 
 const primaryCardStyle: React.CSSProperties = {
   marginTop: 20,
-  padding: 16,
-  border: "1px solid #c2d2e6",
+  padding: 18,
+  border: "1px solid #1f3a8a",
   borderRadius: 6,
-  background: "#f3f7fc",
+  background: "#eef3fb",
 };
 
 const primaryCardTitleStyle: React.CSSProperties = {
-  fontSize: 16,
+  fontSize: 18,
+  fontWeight: 700,
+  margin: 0,
+  marginBottom: 8,
+  color: "#1f2f57",
+};
+
+const primaryCtaLinkStyle: React.CSSProperties = {
+  display: "inline-block",
+  marginTop: 6,
+  padding: "10px 20px",
+  fontSize: 15,
+  fontWeight: 600,
+  color: "#fff",
+  background: "#1f3a8a",
+  border: "1px solid #1a3270",
+  borderRadius: 4,
+  textDecoration: "none",
+};
+
+const secondaryCardStyle: React.CSSProperties = {
+  marginTop: 16,
+  padding: 16,
+  border: "1px solid #d6dbe1",
+  borderRadius: 6,
+  background: "#fafbfc",
+};
+
+const secondaryCardTitleStyle: React.CSSProperties = {
+  fontSize: 15,
   fontWeight: 600,
   margin: 0,
   marginBottom: 8,
-  color: "#1f3a5a",
+  color: "#444",
 };
 
 const formRowStyle: React.CSSProperties = {
@@ -108,9 +144,9 @@ const submitButtonStyle: React.CSSProperties = {
   padding: "8px 16px",
   fontSize: 14,
   fontWeight: 600,
-  color: "#fff",
-  background: "#1f3a8a",
-  border: "1px solid #1a3270",
+  color: "#1f3a5a",
+  background: "#f3f7fc",
+  border: "1px solid #c2d2e6",
   borderRadius: 4,
   cursor: "pointer",
 };
@@ -137,13 +173,6 @@ const sectionHeaderStyle: React.CSSProperties = {
   margin: 0,
   marginBottom: 12,
   color: "#111",
-};
-
-const paragraphStyle: React.CSSProperties = {
-  margin: 0,
-  fontSize: 14,
-  color: "#222",
-  lineHeight: 1.55,
 };
 
 const listStyle: React.CSSProperties = {
@@ -322,22 +351,58 @@ function Hero(): React.ReactElement {
         MVP-0 uses MockProvider and makes no external AI calls.
       </p>
 
+      {/* Primary action: start a new evidence-based request. */}
       <section
-        aria-labelledby="open-task-heading"
+        aria-labelledby="new-request-cta-heading"
         style={primaryCardStyle}
       >
-        <h2 id="open-task-heading" style={primaryCardTitleStyle}>
+        <h2
+          id="new-request-cta-heading"
+          style={primaryCardTitleStyle}
+        >
+          Start here
+        </h2>
+        <p
+          style={{
+            margin: 0,
+            marginBottom: 4,
+            fontSize: 13,
+            color: "#333",
+            lineHeight: 1.55,
+          }}
+        >
+          Begin from what you need: choose a project, attach sources,
+          write your request, and the system creates the task for
+          you. You do not need a task id.
+        </p>
+        <a
+          href="/requests/new"
+          style={primaryCtaLinkStyle}
+          data-testid="primary-cta-new-request"
+        >
+          New evidence-based request
+        </a>
+      </section>
+
+      {/* Secondary action: open an existing task by id. */}
+      <section
+        aria-labelledby="open-task-heading"
+        style={secondaryCardStyle}
+      >
+        <h2 id="open-task-heading" style={secondaryCardTitleStyle}>
           Open existing task
         </h2>
         <p
           style={{
-            ...paragraphStyle,
-            fontSize: 13,
+            margin: 0,
             marginBottom: 10,
+            fontSize: 13,
+            color: "#555",
           }}
         >
-          Paste an existing task id to open its user-facing task
-          summary.
+          Already have a task id? Paste it to open its user-facing
+          task summary. This is a shortcut for developers; most users
+          should start a new request above.
         </p>
         <form action="/tasks" method="get">
           <div style={formRowStyle}>
@@ -371,11 +436,23 @@ function WhatYouCanDo(): React.ReactElement {
       </h2>
       <div style={cardGridStyle}>
         <article style={cardStyle}>
+          <h3 style={cardTitleStyle}>
+            Start a new evidence-based request
+          </h3>
+          <p style={cardBodyStyle}>
+            Route:{" "}
+            <code style={codeInlineStyle}>/requests/new</code>. Create
+            a project, attach sources, write your request, and create
+            a task — the recommended starting point.
+          </p>
+        </article>
+
+        <article style={cardStyle}>
           <h3 style={cardTitleStyle}>Open an existing task summary</h3>
           <p style={cardBodyStyle}>
             Route:{" "}
             <code style={codeInlineStyle}>/tasks/&lt;taskId&gt;</code>
-            . User-facing view; the best starting point.
+            . User-facing view for a task you already have an id for.
           </p>
         </article>
 
@@ -386,7 +463,7 @@ function WhatYouCanDo(): React.ReactElement {
             <code style={codeInlineStyle}>
               /tasks/&lt;taskId&gt;/report
             </code>
-            . Audit and debugging view.
+            . Secondary audit and debugging view.
           </p>
         </article>
 
@@ -398,18 +475,6 @@ function WhatYouCanDo(): React.ReactElement {
           <code style={codeBlockStyle} aria-label="API health endpoints">
             {"http://localhost:8000/health/live\n" +
               "http://localhost:8000/health/ready"}
-          </code>
-        </article>
-
-        <article style={cardStyle}>
-          <h3 style={cardTitleStyle}>Inspect local task ids</h3>
-          <p style={cardBodyStyle}>
-            Task ids come from existing backend and database state.
-            This browser UI does not run database queries. From a
-            shell you can list them with a pattern such as:
-          </p>
-          <code style={codeBlockStyle} aria-label="Local task id command pattern">
-            docker exec -it ef_db ...
           </code>
         </article>
       </div>
@@ -427,9 +492,10 @@ function WhichPage(): React.ReactElement {
         <article style={cardStyle}>
           <h3 style={cardTitleStyle}>Task summary</h3>
           <p style={cardBodyStyle}>
-            User-facing view and the best starting point. It shows
-            the task objective, publication status, the answer text
-            when it is exposed, and high-level checks.
+            User-facing view and the best starting point after a task
+            is created. It shows the task objective, publication
+            status, the answer text when it is exposed, and
+            high-level checks.
           </p>
           <p style={{ ...cardBodyStyle, marginTop: 8 }}>
             URL:{" "}
@@ -440,9 +506,9 @@ function WhichPage(): React.ReactElement {
         <article style={cardStyle}>
           <h3 style={cardTitleStyle}>Technical report</h3>
           <p style={cardBodyStyle}>
-            Audit and debugging view. It shows gate details, axis
-            summaries, mock indicators, limitations and raw report
-            data.
+            Secondary audit and debugging view. It shows gate details,
+            axis summaries, mock indicators, limitations and raw
+            report data.
           </p>
           <p style={{ ...cardBodyStyle, marginTop: 8 }}>
             URL:{" "}
@@ -480,25 +546,38 @@ function Workflow(): React.ReactElement {
   );
 }
 
-function NotAvailable(): React.ReactElement {
+function MvpLimitations(): React.ReactElement {
   return (
     <section
-      aria-labelledby="not-available-heading"
+      aria-labelledby="mvp-limitations-heading"
       style={sectionStyle}
     >
-      <h2 id="not-available-heading" style={sectionHeaderStyle}>
-        Not available in the browser yet
+      <h2 id="mvp-limitations-heading" style={sectionHeaderStyle}>
+        MVP-0 limitations
       </h2>
       <ul style={listStyle}>
-        <li>Creating a new task from the browser.</li>
-        <li>Uploading or selecting documents from the browser.</li>
-        <li>Browsing task history from the browser.</li>
-        <li>Editing or publishing answers from the browser.</li>
+        <li>
+          Browsing task history from the browser is not available
+          yet.
+        </li>
+        <li>
+          Editing, deleting or publishing answers from the browser is
+          not available.
+        </li>
+        <li>
+          Processing runs on MockProvider; there are no external AI
+          calls.
+        </li>
+        <li>
+          Publication can be held when the available checks find
+          support is insufficient. A held publication does not mean
+          the answer is false in the world.
+        </li>
       </ul>
       <p style={noteStyle}>
-        The underlying backend and pipeline pieces already support
-        parts of the flow, but these browser workflows are planned
-        for later phases.
+        Creating a task and attaching sources are available from the
+        browser via the new request flow. Other browser workflows are
+        planned for later phases.
       </p>
     </section>
   );
@@ -552,7 +631,7 @@ export default function HomePage(): React.ReactElement {
       <WhatYouCanDo />
       <WhichPage />
       <Workflow />
-      <NotAvailable />
+      <MvpLimitations />
       <ServiceLinks />
     </article>
   );

@@ -1,24 +1,46 @@
 /**
- * Minimal HTTP client for the Anti-Hallucination Report API
- * (Phase 8.8B-REPORT), consumed by the UI viewer (UI-REPORT-A).
+ * HTTP client for the Evidence-First browser UI.
  *
- * Scope:
- *   - Single function `getAntiHallucinationReport(taskId)` calling
- *     `GET ${API_BASE_URL}/api/v1/tasks/{taskId}/anti-hallucination-report`
- *     with `cache: "no-store"`.
- *   - On a non-OK response, the function throws `ApiError` carrying
- *     the HTTP status, the normalized error envelope (when present)
- *     and the raw body string.
- *   - On a network failure (fetch threw), the function throws
- *     `ApiNetworkError` so the page can render a dedicated
- *     "API unreachable" state.
+ * Two surfaces live here:
  *
- * Read-only consumer guarantees: this module never issues mutating
- * requests and never retries automatically. The route is a derived
- * view; refetch is a manual page reload.
+ *   1. The read-only Anti-Hallucination Report client (Phase
+ *      8.8B-REPORT / UI-REPORT-A): `getAntiHallucinationReport`.
+ *
+ *   2. The request-creation flow client (Phase UI-CREATE-FLOW-A):
+ *      `listProjects`, `createProject`, `listProjectDocuments`,
+ *      `uploadProjectDocument`, `createTask`.
+ *
+ * Both surfaces share the same typed error model — `ApiError` for a
+ * non-2xx HTTP response and `ApiNetworkError` for a `fetch` failure —
+ * and the same base-URL resolution.
+ *
+ * Read-only vs mutating: `getAntiHallucinationReport` is strictly a
+ * derived-view read. The create-flow functions DO mutate backend
+ * state (create project, upload document, create task). None of them
+ * retries automatically; `createTask` carries an `Idempotency-Key`
+ * so a manual retry after an ambiguous failure is safe.
+ *
+ * Routing note (PHASE_UI_CREATE_FLOW_PRE.md §6, PHASE UI-CREATE-FLOW-A
+ * §6): the report client calls the backend directly because its only
+ * caller is a Next.js server component (server-side fetch — no CORS
+ * involved). The create-flow client, by contrast, runs inside a
+ * browser client component; the backend ships no CORS middleware
+ * (see `apps/api/app/main.py`), so a direct browser call would fail
+ * the CORS preflight. The create-flow functions therefore target
+ * SAME-ORIGIN Next.js route handlers under `/api/ef/*`, which proxy
+ * to the real backend server-side. The backend is NOT modified.
  */
 
 import type { AntiHallucinationReport } from "./reportTypes";
+import type {
+  CreateProjectInput,
+  CreateTaskInput,
+  DocumentListResponse,
+  DocumentSummary,
+  ProjectListResponse,
+  ProjectSummary,
+  TaskCreatedResponse,
+} from "./apiTypes";
 
 /**
  * Base URL of the Evidence-First API.
@@ -36,6 +58,19 @@ export const API_BASE_URL: string =
     process.env &&
     process.env.NEXT_PUBLIC_API_BASE_URL) ||
   "http://localhost:8000";
+
+/**
+ * Same-origin base path for the create-flow proxy route handlers.
+ *
+ * The create-flow client calls these instead of `API_BASE_URL`
+ * directly: a browser client component cannot reach the backend
+ * cross-origin without CORS, and the backend ships none. The Next.js
+ * route handlers under `apps/web/app/api/ef/` forward to the backend
+ * server-side. An empty string keeps the fetch URL relative
+ * ("/api/ef/projects"), i.e. same-origin in both the browser and
+ * jsdom test environments.
+ */
+export const PROXY_BASE_PATH = "/api/ef";
 
 /**
  * Normalized backend error envelope shape (see
@@ -218,4 +253,214 @@ export async function getAntiHallucinationReport(
       raw
     );
   }
+}
+
+// ===========================================================================
+// Phase UI-CREATE-FLOW-A — request-creation flow client
+// ===========================================================================
+//
+// The functions below back the `/requests/new` flow. They all target
+// the same-origin proxy (`PROXY_BASE_PATH`) rather than `API_BASE_URL`
+// directly — see the module header for the CORS rationale.
+//
+// Every function follows the same contract as
+// `getAntiHallucinationReport`:
+//   - non-2xx response  → throws `ApiError`   (status + parsed
+//                          envelope + raw body);
+//   - `fetch` failure   → throws `ApiNetworkError`;
+//   - 2xx + malformed   → throws `ApiError(0, MALFORMED_RESPONSE)`.
+
+/**
+ * Shared low-level request helper for the create-flow client.
+ *
+ * Reads the body as text first (so the raw envelope survives a
+ * non-2xx response), maps failures onto the typed error model, and
+ * parses a 2xx JSON body. `init` is forwarded to `fetch` verbatim so
+ * callers can pass a method, headers, or a body (including
+ * `FormData` for the multipart upload).
+ *
+ * `cache: "no-store"` is forced: create-flow reads (project list,
+ * document list) must reflect the latest DB state, and a stale read
+ * after the user just created a project would be confusing.
+ */
+async function proxyRequest<T>(
+  path: string,
+  init?: RequestInit
+): Promise<T> {
+  const url = `${PROXY_BASE_PATH}${path}`;
+
+  let response: Response;
+  try {
+    response = await fetch(url, { cache: "no-store", ...init });
+  } catch (e) {
+    throw new ApiNetworkError(e, API_BASE_URL);
+  }
+
+  const raw = await response.text();
+
+  if (!response.ok) {
+    const envelope = tryParseErrorEnvelope(raw);
+    throw new ApiError(response.status, envelope, raw);
+  }
+
+  // A 204 / empty 2xx body is unexpected for these endpoints (each
+  // returns a JSON object), but guard against it rather than throwing
+  // an opaque JSON.parse error.
+  if (raw === "") {
+    throw new ApiError(
+      0,
+      {
+        code: "MALFORMED_RESPONSE",
+        message: "Server returned 2xx with an empty body",
+      },
+      raw
+    );
+  }
+
+  try {
+    return JSON.parse(raw) as T;
+  } catch (e) {
+    throw new ApiError(
+      0,
+      {
+        code: "MALFORMED_RESPONSE",
+        message:
+          e instanceof Error
+            ? `Server returned 2xx with non-JSON body: ${e.message}`
+            : "Server returned 2xx with non-JSON body",
+      },
+      raw
+    );
+  }
+}
+
+/**
+ * List the projects of the dev tenant.
+ *
+ * Backend contract: `GET /api/v1/projects` → `{ items, next_cursor }`.
+ * The flow consumes only the first page; `next_cursor` is surfaced in
+ * the returned object for a future pagination block but is not used
+ * by `/requests/new` today.
+ */
+export async function listProjects(): Promise<ProjectListResponse> {
+  const body = await proxyRequest<ProjectListResponse>("/projects", {
+    method: "GET",
+  });
+  return {
+    items: Array.isArray(body.items) ? body.items : [],
+    next_cursor: body.next_cursor ?? null,
+  };
+}
+
+/**
+ * Create a project.
+ *
+ * Backend contract: `POST /api/v1/projects` with `{ name }` →
+ * `201 ProjectRead`. A duplicate name in the dev tenant yields
+ * `409 RESOURCE_CONFLICT`; the caller is expected to catch the
+ * resulting `ApiError` and render an inline, recoverable message.
+ *
+ * The `name` is trimmed here so a name that is only whitespace never
+ * reaches the backend; the caller should still validate non-empty
+ * before invoking this function for a fast inline error.
+ */
+export async function createProject(
+  input: CreateProjectInput
+): Promise<ProjectSummary> {
+  const payload: Record<string, unknown> = { name: input.name.trim() };
+  if (input.mode_default !== undefined) {
+    payload.mode_default = input.mode_default;
+  }
+  return proxyRequest<ProjectSummary>("/projects", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+/**
+ * List the documents already attached to a project.
+ *
+ * Backend contract: `GET /api/v1/projects/{project_id}/documents` →
+ * `{ items }`.
+ */
+export async function listProjectDocuments(
+  projectId: string
+): Promise<DocumentListResponse> {
+  const body = await proxyRequest<DocumentListResponse>(
+    `/projects/${encodeURIComponent(projectId)}/documents`,
+    { method: "GET" }
+  );
+  return { items: Array.isArray(body.items) ? body.items : [] };
+}
+
+/**
+ * Upload a single `.txt` / `.md` document to a project.
+ *
+ * Backend contract: `POST /api/v1/projects/{project_id}/documents`
+ * with a multipart body whose field name is `file` → `201
+ * DocumentRead`.
+ *
+ * The caller is expected to have already validated the extension and
+ * non-emptiness client-side for a fast error; the backend still
+ * validates defensively (unsupported extension / empty file →
+ * `400 VALIDATION_ERROR`, oversize → `413
+ * STORAGE_INLINE_TOO_LARGE`), and those surface here as `ApiError`.
+ *
+ * NOTE: when `body` is a `FormData`, `fetch` sets the multipart
+ * `Content-Type` (with boundary) automatically — we deliberately do
+ * NOT set a `Content-Type` header here, because doing so would
+ * clobber the boundary and break the upload.
+ */
+export async function uploadProjectDocument(
+  projectId: string,
+  file: File
+): Promise<DocumentSummary> {
+  const form = new FormData();
+  form.append("file", file);
+  return proxyRequest<DocumentSummary>(
+    `/projects/${encodeURIComponent(projectId)}/documents`,
+    {
+      method: "POST",
+      body: form,
+    }
+  );
+}
+
+/**
+ * Create a real task from a project, an objective and a set of
+ * document ids.
+ *
+ * Backend contract: `POST /api/v1/tasks` with
+ * `{ project_id, objective, mode: "closed_corpus", document_ids }`
+ * → `201 TaskRead`.
+ *
+ * The `idempotencyKey` is sent as the `Idempotency-Key` header. It
+ * MUST be generated once per submit attempt by the caller: a double
+ * submit then returns the same task instead of creating two. After
+ * an ambiguous network failure a retry with the SAME key is safe.
+ *
+ * `mode` is pinned to the literal `"closed_corpus"` here regardless
+ * of the input object, because it is the only value the backend
+ * accepts in MVP-0; this also guarantees the wire payload always
+ * carries the correct mode.
+ */
+export async function createTask(
+  input: CreateTaskInput,
+  idempotencyKey: string
+): Promise<TaskCreatedResponse> {
+  const payload = {
+    project_id: input.project_id,
+    objective: input.objective,
+    mode: "closed_corpus" as const,
+    document_ids: input.document_ids,
+  };
+  return proxyRequest<TaskCreatedResponse>("/tasks", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Idempotency-Key": idempotencyKey,
+    },
+    body: JSON.stringify(payload),
+  });
 }
