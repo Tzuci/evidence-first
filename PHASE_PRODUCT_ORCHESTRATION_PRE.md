@@ -225,32 +225,50 @@ prodotto** non corrisponde ancora al **modello mentale dell'utente**.
 Un utente che si avvicina a un prodotto descritto come "piattaforma multi-AI
 evidence-first" si aspetta, in ordine naturale, di poter:
 
-1. **scrivere il proprio Prompt Master** — la domanda, il problema o
-   l'obiettivo — in un campo centrale e prominente, come input primario del
-   prodotto. Non come campo secondario di un form di creazione task;
+1. **scrivere un Prompt Master come input centrale** — la domanda, il problema o
+   l'obiettivo — in un campo prominente che è l'input primario del prodotto, non
+   un campo secondario di un form di creazione task;
 
-2. **fornire fonti** — caricare testo e Markdown oggi, PDF e immagini in
-   futuro — e capire che queste fonti sono il corpus su cui il sistema lavora
-   in modalità controllata;
+2. **avviare una orchestrazione multi-AI anche senza fonti iniziali fornite**
+   — l'utente non è tenuto a caricare documenti per partire; l'orchestrazione
+   multi-AI può iniziare dal solo Prompt Master, e saranno gli agenti a
+   produrre risposte e a proporre fonti candidate;
 
-3. **configurare gli agenti AI** — aggiungere uno o più agenti, e per ciascuno
+3. **scegliere opzionalmente fonti** — fonti locali caricate dall'utente, fonti
+   interne, o in futuro fonti web. Le fonti dell'utente sono un input
+   *opzionale e utile*, non un passo obbligatorio centrale;
+
+4. **configurare più agenti AI** — aggiungere uno o più agenti, e per ciascuno
    indicare nome, provider/modello, ruolo, prompt specifico, compito, vincoli,
-   token budget, output atteso, e l'eventuale ruolo di reviewer o di
+   token budget e output atteso, con l'eventuale ruolo di reviewer o di
    synthesizer;
 
-4. **far partire una esecuzione** in cui gli agenti lavorano sul Prompt Master e
-   sulle fonti, in modo indipendente o coordinato, con un confronto bounded e
-   non una chat infinita;
+5. **far produrre agli agenti risposte e fonti candidate** — ogni agente
+   produce una propria risposta e può proporre o citare fonti, che il sistema
+   tratta come *source candidates* da recuperare e verificare, non come
+   evidenze già valide;
 
-5. **vedere un risultato evidence-gated** — una risposta originale multi-AI, con
-   evidenze tracciabili, limiti dichiarati, contraddizioni o gap individuati, e
-   uno stato esplicito di *publication allowed* oppure *publication held*, più
-   un report tecnico per audit e debugging.
+6. **far convergere gli output verso una risposta unica candidata** — gli
+   output dei diversi agenti vengono confrontati e portati a una sintesi unica,
+   una *candidate answer* non ancora pubblicata;
 
-Oggi l'utente può fare, dal browser, solo i punti 2 e (in forma ridotta) 5: può
+7. **ricevere una risposta articolata e originale** — non solo un report
+   tecnico, ma una risposta leggibile che è il vero output principale del
+   prodotto;
+
+8. **vedere lo stato di pubblicazione della risposta candidata** — se è
+   pubblicabile perché supportata dalle evidenze disponibili, trattenuta per
+   supporto insufficiente, trattenuta per fonti inadeguate o contraddittorie,
+   oppure inconclusiva rispetto alle evidenze disponibili;
+
+9. **consultare un report tecnico** — con claim, fonti, evidence span, limiti,
+   gap e decisione del gate, come livello di audit e debugging.
+
+Oggi l'utente può fare, dal browser, solo una piccola parte di tutto questo: può
 caricare documenti `.txt`/`.md` e può osservare il report di un task. Non può
-fare nulla dei punti 1, 3, 4 nella forma che il prodotto promette, perché le
-entità e le superfici corrispondenti non esistono.
+scrivere un Prompt Master come entità centrale, non può configurare agenti, non
+può avviare un'orchestrazione multi-AI, non può ricevere una risposta articolata
+multi-AI — perché le entità e le superfici corrispondenti non esistono.
 
 ### 3.3 Il divario, in termini di prodotto
 
@@ -259,11 +277,14 @@ Il divario di prodotto si può riassumere così:
 | Dimensione | Esperienza attesa | Esperienza attuale |
 |---|---|---|
 | Punto di partenza | Prompt Master come input centrale | Selezione di un progetto amministrativo |
-| Fonti | Testo, Markdown, (futuro) PDF e immagini | Solo testo e Markdown |
+| Fonti utente | Opzionali e utili, non obbligatorie | Obbligatorie: senza documenti il task va `blocked` |
+| Fonti proposte dagli agenti | Trattate come *source candidates* da recuperare e verificare | Nessun concetto di fonte proposta da un agente |
+| Fonti recuperate/verificate dal sistema | Recuperate, risolte, verificate prima del gate | Nessun recupero o risoluzione di fonti |
 | Agenti AI | Più agenti configurabili con ruolo e prompt | Nessun concetto di agente |
 | Esecuzione | Orchestrazione bounded multi-AI | Pipeline mock deterministica single-path |
 | Verifica | Output AI reali verificati dall'engine | Claim mock verificati dall'engine |
-| Risultato | Sintesi originale multi-AI evidence-gated | Task summary derivato da pipeline mock |
+| Output principale | Risposta articolata e originale multi-AI | Task summary derivato da pipeline mock |
+| Report tecnico | Livello di audit/debug, non output principale | Di fatto l'unico output osservabile |
 
 Questa fase **non chiude** il divario — chiuderlo è lavoro di molte fasi di
 codice. Questa fase lo **descrive con precisione** e prepara il modello
@@ -279,6 +300,48 @@ disponibili*, può *trattenere la pubblicazione quando il supporto è
 insufficiente*, e *non garantisce la verità fattuale nel mondo*. La forma del
 prodotto cambia; la promessa epistemica no.
 
+### 3.5 Core product modes
+
+Il prodotto si articola in tre modalità. Distinguerle è essenziale per non
+confondere il *core* del prodotto con una sua modalità secondaria.
+
+**1. Multi-AI Orchestration Mode — il core del prodotto.**
+È la modalità centrale. Parte dal Prompt Master e **non richiede che l'utente
+fornisca fonti iniziali**. Più agenti AI, configurati con provider/modello,
+ruolo e prompt, producono ciascuno una risposta e propongono o citano fonti
+candidate. Il sistema porta gli output a convergere in una risposta unica
+candidata. Le fonti proposte dagli agenti vengono recuperate, risolte e
+verificate (vedi §4) prima di poter partecipare al gate. Il Final Answer Gate
+decide pubblicazione o hold in base alle evidenze disponibili. Questa modalità
+**richiede provider AI reali o un modello AI locale integrato**: senza di essi
+non è possibile una vera sintesi multi-AI (vedi nota sotto).
+
+**2. Local Evidence Mode — modalità secondaria ma utile.**
+L'utente fornisce un Prompt Master *insieme* a fonti locali. Con un provider AI
+reale o un modello locale, questa modalità può produrre una risposta articolata
+basata sulle fonti fornite. Senza provider né modello locale, può produrre solo
+output deterministico, estrattivo, mock o report tecnico. È utile — in
+particolare per testare la pipeline, il gate e il report in modo deterministico
+— ma **non deve essere presentata come il core finale del prodotto**.
+Corrisponde, sostanzialmente, alla forma a cui il sistema closed-corpus attuale
+è più vicino.
+
+**3. Hybrid Mode — probabilmente la modalità più potente.**
+Combina le due strade: parte dal Prompt Master, usa le fonti fornite
+dall'utente, *e* integra le fonti proposte dagli agenti e quelle
+recuperate/verificate dal sistema. È la modalità che sfrutta nel modo più
+completo sia il contributo dell'utente sia quello degli agenti.
+
+**Nota vincolante sui provider.** Senza un provider AI reale o un modello AI
+locale integrato, il sistema **non può generare una vera risposta articolata
+multi-AI**. In modalità solo mock/deterministica può produrre output di test,
+template, estratti, report tecnici o simulazioni — il che è prezioso per
+sviluppare e validare pipeline, gate, audit e report — ma non una sintesi
+intelligente reale. Questa distinzione va tenuta presente in tutto il resto del
+documento: la roadmap costruisce l'orchestrazione *mock-first* proprio perché il
+core multi-AI reale arriva solo quando i provider reali o un modello locale
+vengono integrati.
+
 ---
 
 ## 4. Visione target
@@ -286,41 +349,52 @@ prodotto cambia; la promessa epistemica no.
 ### 4.1 Il flusso target end-to-end
 
 La visione prodotto è un flusso che parte dal Prompt Master e termina con una
-risposta finale pubblicata o trattenuta, evidence-gated. In forma lineare:
+risposta articolata pubblicata o trattenuta, evidence-gated. Il punto centrale
+è che **gli agenti AI vengono prima delle fonti**: l'orchestrazione può partire
+dal solo Prompt Master, e sono gli agenti a produrre risposte e a proporre fonti
+candidate. Le fonti fornite dall'utente sono un input *opzionale e laterale*,
+non uno step obbligatorio centrale. In forma lineare:
 
 ```
 Prompt Master
    │
+   │  ◄── (opzionale, laterale) Fonti utente / fonti interne / fonti web future
    ▼
-Sources (testo / Markdown / futuro PDF / futuro immagini / web / interne)
+AI Agents (configurazione: nome, provider, modello, ruolo, prompt, vincoli, budget)
    │
    ▼
-AI Agents (configurazione: nome, provider, ruolo, prompt, vincoli, token budget)
+Agent Answers + Source Candidates (ogni agente risponde e propone/cita fonti)
    │
    ▼
-Orchestration Run (esecuzione coordinata o indipendente, bounded)
+Source Retrieval / Source Resolution (il sistema recupera o risolve le fonti reali)
    │
    ▼
-Agent Outputs (output reali per agente, auditabili, con token accounting)
+Source Verification / Evidence Extraction (estrazione quote/evidence span, hash)
    │
    ▼
 Cross Review (confronto bounded fra agenti, critic review, contraddizioni/gap)
    │
    ▼
-Candidate Synthesis (sintesi multi-AI originale, ancora non pubblicata)
+Candidate Synthesis (convergenza verso una risposta unica candidata)
    │
    ▼
 Claim Extraction (la sintesi viene scomposta in claim verificabili)
    │
    ▼
-Evidence Binding (i claim vengono collegati a evidence span delle fonti)
+Evidence Binding (i claim vengono collegati a evidence span verificati)
    │
    ▼
 Final Answer Gate (CVE-lite + Source Quality + Claim Entailment → decisione)
    │
    ▼
-Published / Held Final Answer (publication allowed oppure publication held)
+Articulated Answer + Publication Status + Technical Report
 ```
+
+L'output finale è una **risposta articolata** — l'output principale del
+prodotto — accompagnata da uno **stato di pubblicazione** e da un **report
+tecnico** di audit/debug. Le fonti dell'utente, quando ci sono, entrano nel
+flusso come input laterale che si unisce alle fonti candidate proposte dagli
+agenti; non sono un passo che l'utente è obbligato ad attraversare.
 
 ### 4.2 Lettura del flusso, stadio per stadio
 
@@ -328,54 +402,97 @@ Published / Held Final Answer (publication allowed oppure publication held)
 l'input primario del prodotto e l'entità centrale persistente a cui tutto il
 resto è agganciato.
 
-**Sources.** L'utente allega le fonti su cui il sistema deve lavorare. In MVP-0
-e nel breve termine sono testo e Markdown; PDF e immagini, e le modalità web o
-interne, sono fasi dedicate successive. Le fonti restano il corpus di
-riferimento: il prodotto rimane evidence-gated, quindi la risposta finale deve
-essere ancorabile alle fonti disponibili.
+**Sources (input opzionale e laterale).** L'utente *può* allegare fonti, ma non
+è obbligato a farlo: l'orchestrazione multi-AI può partire dal solo Prompt
+Master. Le fonti dell'utente, quando ci sono, sono uno dei cinque tipi di fonte
+che il sistema distingue: (1) fonti caricate dall'utente; (2) fonti
+proposte/citate dagli agenti AI; (3) fonti recuperate dal sistema; (4) fonti web
+future; (5) fonti interne/locali. Le fonti caricate dall'utente sono testo e
+Markdown oggi; PDF, immagini e modalità web sono fasi successive. Il prodotto
+resta evidence-gated — la risposta finale deve essere ancorabile alle evidenze
+disponibili — ma quelle evidenze non provengono necessariamente da un upload
+dell'utente.
 
 **AI Agents.** L'utente configura uno o più agenti. Ogni agente porta una
 configurazione: nome, provider/modello, ruolo, prompt specifico, compito,
 vincoli, token budget atteso, output atteso, ed eventualmente un ruolo
 funzionale di reviewer o di synthesizer. La configurazione è *mutabile* finché
-una esecuzione non viene avviata.
+una esecuzione non viene avviata. Gli agenti non si limitano a rispondere:
+**propongono o citano fonti**, che il sistema raccoglie come *source candidates*.
+
+**Agent Answers + Source Candidates.** Ogni agente produce una risposta e, con
+essa, un insieme di fonti candidate (proposte o citate). Una fonte proposta da un
+agente **non è ancora un'evidenza valida**: è un *source candidate* che deve
+essere recuperato e verificato. Il flusso per le fonti agentiche è: l'AI
+propone/cita una fonte → il sistema recupera o risolve la fonte reale → il
+sistema estrae quote ed evidence span → il sistema verifica presenza e hash → il
+sistema valuta la qualità della fonte → il sistema valuta la relazione claim ↔
+evidence span → solo allora la fonte può partecipare al gate. Saltare uno di
+questi passi significherebbe trattare una citazione di un'AI come se fosse
+un'evidenza verificata, cosa che il prodotto evidence-first non fa.
 
 **Orchestration Run.** Una esecuzione coordina gli agenti. Gli agenti possono
-lavorare in modo indipendente (ognuno produce il proprio output sul Prompt
-Master e sulle fonti) oppure coordinato (un confronto strutturato). Il confronto
-è **bounded**: un numero finito e predeterminato di passi, non una chat infinita
-fra agenti. L'esecuzione è la radice di audit di tutto ciò che accade durante un
-run.
+lavorare in modo indipendente (ognuno produce la propria risposta a partire dal
+Prompt Master, e dalle fonti se presenti) oppure coordinato (un confronto
+strutturato). Il confronto è **bounded**: un numero finito e predeterminato di
+passi, non una chat infinita fra agenti. L'esecuzione è la radice di audit di
+tutto ciò che accade durante un run.
 
-**Agent Outputs.** Ogni agente produce uno o più output reali. Gli output sono
-**auditabili** e **append-only**: una volta registrati non vengono riscritti.
-Ogni output porta un token accounting (token consumati, costo) confrontato con
-il token budget configurato.
-
-**Cross Review.** Gli output degli agenti vengono confrontati. Un eventuale
+**Cross Review.** Le risposte degli agenti vengono confrontate. Un eventuale
 agente con ruolo reviewer (o un passo di critic review) individua punti deboli,
 contraddizioni, gap di copertura fra gli output. Anche questo passo è bounded.
 
-**Candidate Synthesis.** Dal confronto emerge una sintesi multi-AI originale: un
-*candidate*, non ancora una risposta pubblicata. È esplicitamente una
-*candidate answer* finché non ha attraversato il gate.
+**Candidate Synthesis.** Dal confronto gli output convergono verso una **risposta
+unica candidata**: una sintesi multi-AI originale, non ancora pubblicata. È
+esplicitamente una *candidate answer* finché non ha attraversato il gate. La
+convergenza verso un'unica risposta candidata — non un elenco di output paralleli
+— è il cuore del valore dell'orchestrazione multi-AI.
 
 **Claim Extraction.** La candidate synthesis viene scomposta in claim
 verificabili, esattamente come oggi l'extractor scompone un draft in claim. È il
 punto di innesto fra la nuova catena multi-AI e il Claim Ledger esistente.
 
-**Evidence Binding.** I claim estratti vengono collegati a evidence span delle
-fonti disponibili, popolando `claim_evidence_links` come fa già la pipeline
-attuale.
+**Evidence Binding.** I claim estratti vengono collegati agli evidence span
+**verificati** — sia quelli ricavati dalle fonti dell'utente, sia quelli
+ricavati dalle fonti candidate degli agenti dopo recupero e verifica — popolando
+`claim_evidence_links` come fa già la pipeline attuale.
 
 **Final Answer Gate.** Il gate esistente compone gli assi — CVE-lite, Source
 Quality, Claim Entailment — e decide la pubblicabilità secondo una policy
-versionata. Il gate **non** è una decisione di verità: è una decisione di
-*publication allowed* / *publication held*.
+versionata. Il gate **non** è una decisione di verità nel mondo: è una decisione
+di *publication allowed* / *publication held*.
 
-**Published / Held Final Answer.** L'esito finale: una risposta originale
-multi-AI con evidenze tracciabili, limiti dichiarati, contraddizioni o gap, e
-uno stato di pubblicazione esplicito, più il report tecnico per audit.
+**Articulated Answer + Publication Status + Technical Report.** L'esito finale è
+una **risposta articolata e originale** — l'output principale del prodotto —
+accompagnata dallo stato di pubblicazione e dal report tecnico. Lo stato di
+pubblicazione non si esprime in termini di verità assoluta ma in termini
+evidence-first: *publication allowed* quando la risposta è supportata dalle
+evidenze disponibili; *publication held* quando il supporto è insufficiente,
+quando la risposta è contraddetta dalle evidenze disponibili, quando si basa su
+fonti di qualità inadeguata, o quando le fonti sono mancanti, non verificabili o
+inconclusive. Il report tecnico — con claim, fonti, evidence span, limiti, gap e
+decisione del gate — è un livello di audit/debug, **non** l'output principale.
+
+### 4.2bis Correzione epistemica: stati di prodotto, non verità del mondo
+
+Il prodotto **non** classifica una risposta come "vera", "falsa" o "incerta" in
+senso assoluto rispetto al mondo. Usa stati di prodotto evidence-first. La
+mappatura corretta, da usare in tutto il documento e in tutte le superfici:
+
+- ciò che in linguaggio comune si direbbe "vera" → lato prodotto significa
+  **pubblicabile perché supportata dalle evidenze disponibili**;
+- ciò che si direbbe "falsa" → lato prodotto significa **publication held perché
+  contraddetta, basata su fonti inadeguate o con supporto insufficiente**;
+- ciò che si direbbe "incerta" → lato prodotto significa **publication held /
+  support insufficient perché le fonti sono mancanti, non verificabili o
+  inconclusive**.
+
+La UX può presentare stati comprensibili all'utente, ma il **linguaggio interno
+resta evidence-first**: *publication allowed*, *publication held*, *support
+insufficient*, *source candidates unverified*, *source quality inadequate*,
+*contradicted by available evidence*, *inconclusive against available
+evidence*. Il sistema non dichiara mai di "decidere se qualcosa è vero o falso"
+in senso assoluto.
 
 ### 4.3 Principio di riuso
 
@@ -958,15 +1075,17 @@ roadmap (§19) dovranno affrontare.
 ## 8. UI target
 
 Questa sezione descrive la **futura home** del prodotto: la superficie che
-rifletterà il modello mentale dell'utente (Prompt Master → fonti → agenti →
-esecuzione → risultato evidence-gated) anziché il ciclo amministrativo progetto
-→ documenti → task. È una descrizione di *target di prodotto*, non una specifica
-di implementazione: nessuna pagina o componente viene creato in questa fase.
+rifletterà il modello mentale dell'utente (Prompt Master → agenti → esecuzione →
+risultato evidence-gated, con le fonti come input opzionale) anziché il ciclo
+amministrativo progetto → documenti → task. È una descrizione di *target di
+prodotto*, non una specifica di implementazione: nessuna pagina o componente
+viene creato in questa fase.
 
 ### 8.1 I sei pannelli della home target
 
-La home target è organizzata in sei pannelli, ordinati secondo il flusso
-naturale dell'utente.
+La home target è organizzata in sei pannelli. Il pannello centrale è il Prompt
+Master; il pannello delle fonti è un input *opzionale e laterale*, non un passo
+obbligatorio del percorso.
 
 **Prompt Master panel.** Il pannello centrale e prominente. Contiene una
 textarea grande in cui l'utente scrive la domanda, il problema o l'obiettivo. È
@@ -974,11 +1093,16 @@ l'input primario del prodotto e corrisponde all'entità `MasterPrompt` (§7.1). 
 copy intorno resta sobria: inquadra l'input come "richiesta" o "obiettivo", mai
 come "claim da verificare come vero", e non promette certezza fattuale.
 
-**Sources panel.** Il pannello in cui l'utente allega le fonti su cui il sistema
-deve lavorare. Oggi e nel breve termine: upload di testo e Markdown, e selezione
-di fonti già presenti. In futuro: PDF, immagini, fonti web o interne. Ogni fonte
-mostrata corrisponde a un `SourceInput` (§7.2). Il pannello deve dichiarare
-onestamente quali tipi di fonte sono disponibili oggi e quali sono pianificati.
+**Sources panel.** Il pannello in cui l'utente *può opzionalmente* allegare
+fonti. **Non è un passo obbligatorio**: l'orchestrazione multi-AI può partire dal
+solo Prompt Master, e gli agenti possono proporre le proprie fonti candidate. Il
+pannello copre cinque tipi di fonte: fonti caricate dall'utente (testo e
+Markdown oggi; PDF, immagini e web in futuro), fonti proposte/citate dagli
+agenti, fonti recuperate dal sistema, fonti web future, fonti interne/locali.
+Le fonti caricate dall'utente corrispondono a `SourceInput` (§7.2). Il pannello
+deve dichiarare onestamente quali tipi di fonte sono disponibili oggi, quali
+sono pianificati, e deve chiarire che fornire fonti è utile ma non necessario
+per avviare un'orchestrazione.
 
 **AI Agents panel.** Il pannello in cui l'utente configura uno o più agenti. Per
 ogni agente l'utente compila la configurazione descritta in §9 (nome, provider,
@@ -1001,10 +1125,12 @@ il modello reload-based attuale con una superficie pensata per seguire un
 processo in più passi (vedi §17 e §18 per gli eventi e la fase UI dedicata).
 
 **Results / Evidence Report panel.** Il pannello che mostra il risultato finale:
-la risposta originale multi-AI con evidenze tracciabili, limiti dichiarati,
-contraddizioni o gap, e lo stato esplicito *publication allowed* / *publication
-held*, più l'accesso al report tecnico per audit. Riusa concettualmente le
-superfici già esistenti — `TaskSummaryView`, l'Anti-Hallucination Report viewer
+la **risposta articolata e originale multi-AI** come output principale, con
+evidenze tracciabili, limiti dichiarati, contraddizioni o gap, e lo stato
+esplicito *publication allowed* / *publication held*, più l'accesso al report
+tecnico per audit. Il report tecnico è un livello di audit/debug, non l'output
+principale. Riusa concettualmente le superfici già esistenti — `TaskSummaryView`,
+l'Anti-Hallucination Report viewer
 — estese al contesto multi-AI. È una vista derivata read-only: non prende nuove
 decisioni e non ricalcola il gate.
 
@@ -1158,6 +1284,30 @@ L'astrazione qui descritta è concettuale. La sua implementazione, e ancor più
 l'implementazione dei provider reali, sono materia delle fasi `ORCH-PROVIDER-PRE`
 e `ORCH-PROVIDER-A` della roadmap (§19).
 
+### 10.5 Una risposta articolata reale richiede un provider o un modello locale
+
+Va dichiarato in modo esplicito, perché ha conseguenze sulla roadmap e sulle
+aspettative di prodotto: una **risposta articolata reale** — una vera sintesi
+multi-AI — richiede una di queste due condizioni:
+
+- un **provider AI esterno** integrato dietro l'astrazione (OpenAI, Anthropic,
+  Gemini); oppure
+- un **modello AI locale** integrato.
+
+In assenza di entrambi, cioè in modalità solo mock/deterministica:
+
+- il sistema **può** testare e validare la pipeline, l'audit, il gate e il
+  report;
+- il sistema **può** generare output mock, estrattivi, template o simulazioni;
+- il sistema **non può** produrre una vera sintesi multi-AI intelligente.
+
+Questo non è un limite da nascondere: è la ragione per cui la roadmap adotta un
+approccio mock-first. L'orchestrazione viene costruita e collaudata sul mock
+provider — il che è prezioso e necessario — ma il core multi-AI reale del
+prodotto si attiva solo quando un provider reale o un modello locale viene
+integrato (fase `ORCH-PROVIDER-A` e successive). Le superfici UI e la copy non
+devono presentare un output mock come se fosse una sintesi multi-AI reale.
+
 ---
 
 ## 11. Token budget strategy
@@ -1255,10 +1405,12 @@ passi.
 
 ### 12.1 Le modalità bounded
 
-**Independent parallel answers.** Ogni agente lavora in modo indipendente sul
-Prompt Master e sulle fonti, e produce il proprio output. Non c'è confronto
+**Independent parallel answers.** Ogni agente lavora in modo indipendente a
+partire dal Prompt Master (e dalle fonti, quando l'utente ne ha fornite), e
+produce la propria risposta più le proprie fonti candidate. Non c'è confronto
 diretto fra agenti in questa modalità: è il pass di base, e da solo produce un
-insieme di `AgentOutput` paralleli.
+insieme di `AgentOutput` paralleli, ciascuno con le proprie *source candidates*
+ancora da recuperare e verificare.
 
 **Reviewer pass.** Un pass in cui uno o più agenti con *reviewer flag* (§9)
 esaminano gli output prodotti dagli altri agenti e producono osservazioni
@@ -1316,43 +1468,58 @@ il nucleo evidence-gated già funzionante (§5).
 ### 13.1 La catena di integrazione
 
 ```
-AgentOutput
+Agent Answers + Source Candidates
    │
    ▼
-CandidateSynthesis
+Source Retrieval / Resolution      (recupero o risoluzione delle fonti candidate)
    │
    ▼
-ExtractedClaims        (Claim Extraction)
+Source Verification / Extraction   (estrazione quote/evidence span, hash)
    │
    ▼
-Claim Ledger           (logical_claims, claim_ledger_entries — append-only)
+CandidateSynthesis                 (convergenza verso la risposta unica candidata)
    │
    ▼
-Evidence Links         (claim_evidence_links — append-only)
+ExtractedClaims                    (Claim Extraction)
    │
    ▼
-CVE-lite               (verification_records — controllo quote/hash)
+Claim Ledger                       (logical_claims, claim_ledger_entries — append-only)
    │
    ▼
-Source Quality         (source_quality_assessments — qualità della fonte)
+Evidence Links                     (claim_evidence_links — append-only)
    │
    ▼
-Claim Entailment       (claim_entailment_checks — relazione claim↔evidence)
+CVE-lite                           (verification_records — controllo quote/hash)
    │
    ▼
-Final Answer Gate      (final_gate_reports — decisione di pubblicabilità)
+Source Quality                     (source_quality_assessments — qualità della fonte)
    │
    ▼
-Published / Held Answer
+Claim Entailment                   (claim_entailment_checks — relazione claim↔evidence)
+   │
+   ▼
+Final Answer Gate                  (final_gate_reports — decisione di pubblicabilità)
+   │
+   ▼
+Articulated Answer + Publication Status + Technical Report
 ```
 
-Gli `AgentOutput` prodotti dall'orchestrazione confluiscono in una
-`CandidateSynthesis`. La `CandidateSynthesis` viene scomposta in claim
-verificabili (`ExtractedClaims`), che entrano nel Claim Ledger esistente. Da
-quel punto in poi la catena coincide integralmente con la pipeline attuale: i
-claim vengono collegati a evidence span, sottoposti a CVE-lite, valutati su
+Gli agenti producono risposte e **fonti candidate**. Le fonti candidate — che
+siano proposte dagli agenti o fornite dall'utente — **non sono evidenze valide
+finché non sono state recuperate e verificate**: il sistema le recupera o le
+risolve, ne estrae quote ed evidence span, ne verifica presenza e hash. Solo gli
+evidence span così verificati entrano nella catena. Da lì gli output convergono
+in una `CandidateSynthesis`, che viene scomposta in claim verificabili
+(`ExtractedClaims`) che entrano nel Claim Ledger esistente. Da quel punto in poi
+la catena coincide integralmente con la pipeline attuale: i claim vengono
+collegati agli evidence span verificati, sottoposti a CVE-lite, valutati su
 Source Quality e Claim Entailment, e infine sottoposti al Final Answer Gate, che
-decide se la risposta multi-AI è pubblicabile o va trattenuta.
+decide se la risposta articolata multi-AI è pubblicabile o va trattenuta.
+
+Trattare una fonte citata da un'AI come se fosse già un'evidenza valida — cioè
+saltare il recupero e la verifica — equivarrebbe a fidarsi della citazione di un
+modello senza controllarla: è esattamente ciò che un prodotto evidence-first non
+deve fare.
 
 ### 13.2 Il gate non va bypassato
 
@@ -1418,13 +1585,22 @@ Le capacità di ingestione future, ciascuna da affrontare in una fase dedicata:
   Web Mode / Web-RAG).
 - **source provenance** — tracciamento dell'origine di ogni fonte: da dove
   proviene, quando è stata acquisita, attraverso quale percorso.
+- **agent source candidate resolution** — il recupero e la risoluzione delle
+  fonti *proposte o citate dagli agenti AI*: una citazione di un agente è un
+  *source candidate* che va trasformato in una fonte reale ingeribile, da cui
+  estrarre quote ed evidence span verificabili. È una capacità di ingestione di
+  prima importanza per il core multi-AI, distinta dall'upload dell'utente.
 - **chunking specializzato** — strategie di chunking adattate al tipo di
   documento (un PDF strutturato non si chunka come un `.txt` piatto).
 - **hash / tracciabilità** — hashing del contenuto e dei chunk per garantire che
   ogni evidence span sia riconducibile in modo verificabile alla fonte originale.
 
 Ciascuna di queste capacità corrisponde a `SourceInput` (§7.2) e
-`SourceIngestion` (§7.3) del modello concettuale.
+`SourceIngestion` (§7.3) del modello concettuale. Va sottolineato che
+l'ingestione non riguarda solo i file caricati dall'utente: riguarda tutti e
+cinque i tipi di fonte (utente, agenti, recuperate dal sistema, web future,
+interne), e in particolare le fonti candidate degli agenti, che senza recupero e
+verifica non possono partecipare al gate.
 
 ### 14.3 PDF e immagini non vanno improvvisati nella UI
 
@@ -1678,21 +1854,37 @@ non deve fare, e criteri di accettazione. Le firme di file sono indicative.
 - **Criteri di accettazione.** Una `CandidateSynthesis` viene prodotta in modo
   bounded e auditabile; nessuna pubblicazione avviene in questa fase; test verdi.
 
-### 19.10 ORCH-GATE-A
+### 19.10 ORCH-SOURCES-A
+
+- **Scopo.** Implementare il recupero e la verifica delle **fonti candidate**:
+  prendere le fonti proposte o citate dagli agenti (oltre alle eventuali fonti
+  dell'utente), recuperarle o risolverle, estrarne quote ed evidence span,
+  verificarne presenza e hash, così che possano alimentare l'Evidence Binding.
+- **File probabili.** Servizi di source resolution e ingestione in
+  `apps/worker/*`; test.
+- **Cosa non deve fare.** Non trattare una fonte candidata come evidenza valida
+  senza verifica; non improvvisare PDF/immagini senza ingestione dedicata; non
+  bypassare il gate; non usare provider reali.
+- **Criteri di accettazione.** Le fonti candidate vengono recuperate e
+  verificate in modo auditabile; solo gli evidence span verificati proseguono;
+  una fonte non risolvibile o non verificabile è segnalata, non assunta valida;
+  test verdi.
+
+### 19.11 ORCH-GATE-A
 
 - **Scopo.** Implementare il punto di giunzione (§13): trasformare una
-  `CandidateSynthesis` in `ExtractedClaims`, collegarli a evidence, e
-  sottoporli al Final Answer Gate esistente.
+  `CandidateSynthesis` in `ExtractedClaims`, collegarli agli evidence span
+  verificati, e sottoporli al Final Answer Gate esistente.
 - **File probabili.** Servizio di adattamento synthesis→claim in
   `apps/worker/*`; test end-to-end.
 - **Cosa non deve fare.** **Non bypassare il Final Answer Gate**; non modificare
   la semantica del gate; non promettere verità; non usare provider reali.
 - **Criteri di accettazione.** Una `CandidateSynthesis` attraversa Claim
   Extraction → Evidence Binding → CVE-lite → Source Quality → Claim Entailment →
-  Final Answer Gate ed esita in *published* o *publication held*; il gate non è
-  bypassato; test end-to-end verdi.
+  Final Answer Gate ed esita in *publication allowed* o *publication held*; il
+  gate non è bypassato; test end-to-end verdi.
 
-### 19.11 UI-PROMPT-A
+### 19.12 UI-PROMPT-A
 
 - **Scopo.** Implementare il Prompt Master panel della home target (§8.1).
 - **File probabili.** Route e componenti sotto `apps/web/*`; test.
@@ -1702,7 +1894,7 @@ non deve fare, e criteri di accettazione. Le firme di file sono indicative.
   MasterPrompt; copy sobria verificata da test di wording vietato; nessuna nuova
   dipendenza.
 
-### 19.12 UI-AGENTS-A
+### 19.13 UI-AGENTS-A
 
 - **Scopo.** Implementare l'AI Agents panel (§8.1, §9).
 - **File probabili.** Componenti sotto `apps/web/*`; test.
@@ -1711,7 +1903,7 @@ non deve fare, e criteri di accettazione. Le firme di file sono indicative.
 - **Criteri di accettazione.** L'utente può configurare uno o più agenti secondo
   §9; configurazione mutabile prima del run; test verdi.
 
-### 19.13 UI-RUN-A
+### 19.14 UI-RUN-A
 
 - **Scopo.** Implementare l'Execution settings panel e il Run progress panel
   (§8.1).
@@ -1721,7 +1913,7 @@ non deve fare, e criteri di accettazione. Le firme di file sono indicative.
 - **Criteri di accettazione.** L'utente può avviare un run e seguirne
   l'avanzamento via vista derivata read-only; test verdi.
 
-### 19.14 UI-RESULTS-A
+### 19.15 UI-RESULTS-A
 
 - **Scopo.** Implementare il Results / Evidence Report panel (§8.1).
 - **File probabili.** Componenti sotto `apps/web/*`; test.
@@ -1731,16 +1923,18 @@ non deve fare, e criteri di accettazione. Le firme di file sono indicative.
   limiti, contraddizioni/gap e stato *published/held* come vista derivata;
   wording sobrio verificato da test; test verdi.
 
-### 19.15 Ordine consigliato
+### 19.16 Ordine consigliato
 
 L'ordine consigliato segue le dipendenze: prima lo schema
 (`ORCH-SCHEMA-PRE` → `ORCH-SCHEMA-A`), poi il provider
 (`ORCH-PROVIDER-PRE` → `ORCH-PROVIDER-A`), poi il runner per gradi
 (`ORCH-RUNNER-A` → `ORCH-MULTI-A` → `ORCH-REVIEW-A` → `ORCH-SYNTHESIS-A` →
-`ORCH-GATE-A`), e infine le superfici UI (`UI-PROMPT-A` → `UI-AGENTS-A` →
-`UI-RUN-A` → `UI-RESULTS-A`). Le fasi UI possono in parte procedere in parallelo
-alle fasi worker una volta che lo schema è stabile, ma `UI-RESULTS-A` ha senso
-solo dopo `ORCH-GATE-A`.
+`ORCH-SOURCES-A` → `ORCH-GATE-A`), e infine le superfici UI
+(`UI-PROMPT-A` → `UI-AGENTS-A` → `UI-RUN-A` → `UI-RESULTS-A`). `ORCH-SOURCES-A`
+— il recupero e la verifica delle fonti candidate — precede `ORCH-GATE-A`,
+perché il gate può lavorare solo su evidence span già verificati. Le fasi UI
+possono in parte procedere in parallelo alle fasi worker una volta che lo schema
+è stabile, ma `UI-RESULTS-A` ha senso solo dopo `ORCH-GATE-A`.
 
 ---
 
@@ -1834,42 +2028,48 @@ righe al di fuori di un tale elenco esplicito, il documento va corretto.
 
 ## Output finale
 
+> **Nota di revisione.** Questo documento è stato corretto dalla micro-fase
+> `PRODUCT-ORCHESTRATION-PRE-FIX-A`, che ha chiarito il modello di prodotto: il
+> core non è "Prompt Master + fonti caricate dall'utente", ma "Prompt Master →
+> coordinamento multi-AI → convergenza verso una risposta unica candidata →
+> raccolta e verifica delle fonti proposte dagli agenti o disponibili → evidence
+> gate → risposta articolata + stato di pubblicazione + report tecnico". Le
+> fonti caricate dall'utente sono opzionali e utili, non il cuore del prodotto.
+
 **1. Elenco file creati / modificati.**
-Un solo file: `PHASE_PRODUCT_ORCHESTRATION_PRE.md`, creato nella PARTE 1 (sezioni
-1-7) e completato in questa PARTE 2 (header e indice aggiornati, sezioni 8-22
-aggiunte, blocchi di chiusura della PARTE 1 riscritti). Nessun altro file è stato
+Un solo file: `PHASE_PRODUCT_ORCHESTRATION_PRE.md`. Nessun altro file è stato
 creato o modificato.
 
-**2. Sintesi del documento finale.**
-Il documento è un design di architettura completo, in italiano, che riallinea
-prodotto e architettura verso un orchestratore multi-AI evidence-gated. Le
-sezioni 1-7 definiscono lo scopo, diagnosticano lo stato attuale (UI-CREATE-FLOW-A
-è un passo tecnico utile ma orientato a progetto/documenti/task), inquadrano il
-problema prodotto, descrivono la visione target (flusso Prompt Master → Sources
-→ AI Agents → Orchestration Run → Agent Outputs → Cross Review → Candidate
-Synthesis → Claim Extraction → Evidence Binding → Final Answer Gate →
-Published/Held), elencano cosa esiste ed è riusabile, cosa manca, e definiscono
-un modello concettuale di diciotto entità. Le sezioni 8-18 dettagliano la UI
-target a sei pannelli, la configurazione degli agenti, l'astrazione di provider
-mock-first, la strategia di budget di token, la strategia di orchestrazione
-bounded, l'integrazione con l'Evidence Gate (che non va mai bypassato), la
-roadmap di ingestione documenti, e i gap di backend, worker, API e UI. Le
-sezioni 19-22 propongono una roadmap incrementale di quattordici fasi piccole,
-i non-goals, i criteri di accettazione e i comandi di verifica.
+**2. Sintesi delle correzioni (FIX-A).**
+La correzione ha reso chiaro, in tutto il documento, che le fonti caricate
+dall'utente sono **opzionali**, non il core. In particolare: §3.2 ora descrive
+un utente che può avviare un'orchestrazione multi-AI anche senza fonti iniziali;
+§3.3 distingue nella tabella fonti utente opzionali, fonti proposte dagli
+agenti, fonti recuperate/verificate dal sistema, e separa risposta articolata
+(output principale) da report tecnico (audit/debug); la nuova §3.5 definisce le
+tre *core product modes* (Multi-AI Orchestration Mode come core, Local Evidence
+Mode come modalità secondaria, Hybrid Mode); §4.1 e §4.2 mettono gli AI Agents
+prima delle fonti e introducono il flusso di recupero e verifica delle fonti
+candidate; la nuova §4.2bis fissa la correzione epistemica (stati di prodotto
+evidence-first, non verità del mondo); §8 e §10 chiariscono che le fonti sono un
+input opzionale e che una risposta articolata reale richiede un provider AI o un
+modello locale; §13.1 inserisce nel flusso il recupero e la verifica delle fonti
+candidate; §14 aggiunge l'agent source candidate resolution alla roadmap di
+ingestione; §19 aggiunge la fase `ORCH-SOURCES-A` dedicata al recupero e alla
+verifica delle fonti candidate. Le sezioni non citate sono rimaste invariate.
 
-**3. Conferma che nessun codice è stato toccato.**
-Confermato. Non è stato scritto né modificato alcun file di codice. `apps/web/*`,
+**3. Conferma che solo `PHASE_PRODUCT_ORCHESTRATION_PRE.md` è stato modificato.**
+Confermato. Nessun altro file del repository è stato creato o modificato.
+
+**4. Conferma che nessun codice / migration / test / README / PROJECT_STATE è
+stato toccato.**
+Confermato. Non è stato scritto né modificato alcun file di codice; `apps/web/*`,
 `apps/api/*`, `apps/worker/*`, `packages/shared/*` sono invariati. Nessuna
-dipendenza è stata aggiunta. Nessun test è stato toccato. `README.md` e
-`PROJECT_STATE.md` sono invariati.
-
-**4. Conferma che nessuna migration è stata toccata.**
-Confermato. Nessun file in `migrations/` è stato creato o modificato. Il
-documento descrive possibili futuri schema (§15) solo a livello concettuale, e
-rinvia ogni migration alla fase `ORCH-SCHEMA-A` della roadmap.
+migration è stata creata o modificata. Nessun test è stato toccato. Nessuna
+dipendenza è stata aggiunta. `README.md` e `PROJECT_STATE.md` sono invariati.
 
 **5. Comandi eseguiti o da eseguire.**
-Comandi di verifica da eseguire (§22): `git diff --check`, `git diff --stat`,
+Comandi di verifica (§22): `git diff --check`, `git diff --stat`,
 `git status -sb`, `git diff --name-only`. Atteso: l'unico file modificato è
 `PHASE_PRODUCT_ORCHESTRATION_PRE.md`. Controllo opzionale di wording vietato via
 `grep -i` (§22.1): atteso nessun risultato al di fuori di elenchi espliciti.
@@ -1882,10 +2082,19 @@ Nessun test runtime è richiesto, essendo la fase documentation-only.
   closed-corpus o assorbirlo. Decisione da prendere in `ORCH-SCHEMA-PRE`.
 - *Destino della nozione di progetto.* Resta aperto se `projects` resti come
   contenitore organizzativo o venga reso superfluo dal `MasterPrompt`.
+- *Recupero delle fonti candidate.* Resta aperto *come* il sistema recupera o
+  risolve una fonte proposta da un agente: una citazione testuale, un URL, un
+  riferimento bibliografico richiedono strategie di risoluzione diverse, e
+  alcune (fonti web) dipendono da capacità non ancora disponibili. Decisione da
+  inquadrare in `ORCH-SOURCES-A`.
 - *Punto di giunzione synthesis → claim.* Resta aperto se la trasformazione
   `CandidateSynthesis` → `ExtractedClaims` debba riusare direttamente il
   compiler/extractor esistente o passare per un adattatore dedicato. Decisione
   da prendere in `ORCH-SCHEMA-PRE` / `ORCH-GATE-A`.
+- *Confine fra le tre modalità.* Resta aperto come Multi-AI Orchestration Mode,
+  Local Evidence Mode e Hybrid Mode si traducano in configurazione concreta di
+  un `OrchestrationRun`: se siano modalità esplicite selezionabili o
+  configurazioni emergenti dalla presenza/assenza di fonti e agenti.
 - *Meccanismo di snapshot.* Resta aperto *come* fissare gli snapshot immutabili
   di MasterPrompt, AgentConfig, AgentRolePrompt e TokenBudget (copia inline vs
   versionamento in stile `policy_versions`).
@@ -1895,13 +2104,18 @@ Nessun test runtime è richiesto, essendo la fase documentation-only.
 - *Provider come entità.* Resta aperto se promuovere `ProviderConfig` /
   `ProviderCredential` a entità di prima classe. Decisione da prendere in
   `ORCH-PROVIDER-PRE`.
+- *Dipendenza dal provider reale.* Il core multi-AI reale non è esercitabile
+  finché un provider reale o un modello locale non è integrato; fino ad allora
+  l'orchestrazione è validabile solo in modalità mock/estrattiva. È un rischio
+  di aspettativa di prodotto, non un difetto: va comunicato con onestà.
 - *Rischio di context explosion.* Anche con i budget e il bounding, la gestione
   del contesto multi-pass è un rischio concreto: va validata presto, sul mock
   provider, nelle fasi `ORCH-MULTI-A` e successive.
 - *Rischio di drift semantico.* Estendendo la UI al multi-AI cresce il rischio
-  di wording che implichi "verità multi-AI". I test di wording vietato vanno
-  estesi a ogni nuova superficie, come già fatto per la linea UI esistente.
+  di wording che implichi "verità multi-AI" o che presenti un output mock come
+  sintesi reale. I test di wording vietato vanno estesi a ogni nuova superficie,
+  come già fatto per la linea UI esistente.
 
 ---
 
-*Commit message suggerito:* `Document product orchestration architecture`
+*Commit message suggerito:* `Clarify product orchestration source model`
