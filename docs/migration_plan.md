@@ -175,6 +175,63 @@ Da scrivere e applicare insieme alla pipeline worker corrispondente.
 
 ---
 
+## 0011_orchestration_schema.sql (Fase ORCH-SCHEMA-A)
+
+Schema persistente minimo per il futuro nucleo di orchestrazione multi-AI. Migration **puramente DDL** e **strettamente additiva**: introduce 19 tabelle nuove e non tocca nulla di preesistente.
+
+### Tabelle introdotte (19, tutte nuove e vuote dopo la migration)
+
+Configurazione / snapshot:
+
+- **`master_prompts`** — input primario del prodotto (domanda/obiettivo). Configurazione mutabile. CHECK `status ∈ {draft, ready, archived}`. Trigger `set_updated_at`. Nessun trigger append-only.
+- **`agent_role_prompts`** — ruolo e prompt assegnabili a un agente; catalogo versionato. CHECK `role_category ∈ {researcher, critic, synthesizer, generic}`, `version_no >= 1`. UNIQUE `(tenant_id, name, version_no)`. Modellata come configurazione mutabile (la mutabilità pre-consumo è governata applicativamente): nessun trigger append-only.
+- **`agent_configs`** — configurazione di un agente AI (provider, modello, ruolo, contract, flag reviewer/synthesizer). Configurazione mutabile. CHECK `order_index >= 0`. Trigger `set_updated_at`.
+- **`token_budgets`** — budget di token/costo **pre-run**. Configurazione mutabile. Può referenziare `tenant_id`, `master_prompt_id`, `agent_config_id`; **non** referenzia `orchestration_runs`. CHECK `budget_level ∈ {per_orchestration, per_agent, per_pass}`, `overflow_policy ∈ {hard_stop, warn}`, `token_limit >= 0`, e CHECK condizionale `tb_level_target` (`per_agent ⇒ agent_config_id NOT NULL`).
+- **`master_prompt_versions`** — snapshot append-only del testo di un master prompt. UNIQUE `(master_prompt_id, version_no)`. Trigger append-only.
+- **`agent_config_snapshots`** — snapshot append-only della configurazione di un agente all'avvio del run. UNIQUE `(orchestration_run_id, agent_config_id)`. Trigger append-only.
+
+Run / events:
+
+- **`orchestration_runs`** — radice di una esecuzione di orchestrazione multi-AI. CHECK `mode ∈ {multi_ai_orchestration, local_evidence, hybrid}`, `execution_mode ∈ {independent, coordinated}`, `status ∈ {pending, running, waiting_source_resolution, synthesizing, submitted_to_gate, completed, failed, cancelled}`. UNIQUE `(tenant_id, idempotency_key)`. Eventuale `final_gate_report_id` nullable: solo collegamento all'esito del gate esistente, **non** un gate nuovo. **Senza trigger append-only**: porta un campo `status` materializzato (più `started_at/completed_at/failure_reason`) — è l'unica eccezione ammessa; ogni transizione di stato deve avere un evento corrispondente in `orchestration_events`.
+- **`orchestration_events`** — log append-only delle transizioni del run. CHECK su `event_type` (codominio incluso `run_created … gate_completed, token_budget_exceeded, run_cancelled, run_failed`), `sequence_no >= 0`. UNIQUE `(orchestration_run_id, sequence_no)` e `(orchestration_run_id, event_type, idempotency_key)`. Trigger append-only.
+- **`orchestration_agent_runs`** — esecuzione concreta di un agente. CHECK `status ∈ {pending, running, succeeded, failed, cancelled}`, `attempt_no >= 1`. UNIQUE `(orchestration_run_id, agent_config_snapshot_id, attempt_no)`. Trigger append-only.
+- **`orchestration_agent_messages`** — messaggi a livello provider. CHECK `message_role ∈ {system, user, assistant, review, tool}`, `sequence_no >= 0`. UNIQUE `(agent_run_id, sequence_no)`. Trigger append-only.
+- **`orchestration_agent_outputs`** — output strutturato di un agent run. CHECK `sequence_no >= 0`. UNIQUE `(agent_run_id, sequence_no)`. Trigger append-only.
+- **`provider_invocations`** — invocazione del provider come fatto auditabile. CHECK `status ∈ {pending, succeeded, failed, cancelled}` (timeout/rate-limit espressi via `error_code`/`error_message`, non come status principale), `attempt_no >= 1`. UNIQUE `(agent_run_id, attempt_no, idempotency_key)`. **Nessuna colonna per API key/secret/credenziali.** Trigger append-only.
+- **`token_usage_records`** — consumo reale di token. CHECK su `pass_kind`, `tokens_input/output >= 0`, `attempt_no >= 1`. Idempotenza tramite **due indici UNIQUE parziali**, perché `provider_invocation_id` è nullable e una UNIQUE su colonna NULL ammetterebbe duplicati in PostgreSQL: `token_usage_records_provider_idem_uq` su `(orchestration_run_id, provider_invocation_id, idempotency_key)` `WHERE provider_invocation_id IS NOT NULL`, e `token_usage_records_no_provider_idem_uq` su `(orchestration_run_id, idempotency_key)` `WHERE provider_invocation_id IS NULL`. Trigger append-only.
+
+Source candidate flow:
+
+- **`source_candidates`** — fonte proposta/citata; **non è** evidence. **Nessuna colonna `evidence_span_id`** e nessuna FK verso `evidence_spans`/`claim_evidence_links`/`logical_claims`. Può referenziare `orchestration_agent_outputs`. CHECK su `candidate_type` e `status`. Trigger append-only.
+- **`source_resolutions`** — recupero/risoluzione della fonte reale. CHECK `outcome ∈ {resolved, failed, insufficient_metadata, partial, unreachable, not_found}`. UNIQUE `(source_candidate_id, idempotency_key)`. Trigger append-only.
+- **`source_verifications`** — verifica della fonte risolta; **ponte verso `evidence_spans`** (FK nullable). Colonna principale `outcome ∈ {verified_as_retrieved, rejected, inconclusive}`. UNIQUE `(source_resolution_id, idempotency_key)`. Trigger append-only.
+
+Candidate synthesis:
+
+- **`candidate_syntheses`** — sintesi multi-AI candidata; **non è** un `published_answers`. CHECK `status ∈ {draft, ready_for_claim_extraction, submitted_to_gate, superseded}`, `version_no >= 1`. Due UNIQUE con scopi distinti: `candidate_syntheses_run_version_uq` su `(orchestration_run_id, version_no)` per il versioning della sintesi, e `candidate_syntheses_run_idem_uq` su `(orchestration_run_id, idempotency_key)` per l'idempotenza contro redelivery. Trigger append-only.
+- **`synthesis_source_links`** — join append-only verso `orchestration_agent_outputs` e/o `evidence_spans`; CHECK `slk_target_present` (almeno un target NOT NULL); due indici UNIQUE parziali per target. Trigger append-only.
+- **`synthesis_claim_links`** — join append-only verso `logical_claims` (ponte verso il Claim Ledger esistente). UNIQUE `(candidate_synthesis_id, logical_claim_id)`. Nessuna FK verso `published_answers`/`final_gate_reports`. Trigger append-only.
+
+### Vincoli trasversali
+
+- 14 tabelle di fatto ricevono il trigger condiviso `reject_modify_append_only()` di `0001`: `master_prompt_versions`, `agent_config_snapshots`, `orchestration_events`, `orchestration_agent_runs`, `orchestration_agent_messages`, `orchestration_agent_outputs`, `source_candidates`, `source_resolutions`, `source_verifications`, `provider_invocations`, `token_usage_records`, `candidate_syntheses`, `synthesis_source_links`, `synthesis_claim_links`.
+- 4 tabelle di configurazione restano mutabili senza trigger append-only: `master_prompts`, `agent_role_prompts`, `agent_configs`, `token_budgets`.
+- `orchestration_runs` non riceve il trigger append-only per via del campo `status` materializzato; nessun trigger custom è creato per questa eccezione.
+- Tutte le FK sono `ON DELETE RESTRICT`. Nessun ENUM PostgreSQL: i codomini sono CHECK su `TEXT`. Nessuna funzione nuova: l'append-only riusa `reject_modify_append_only()` e gli `updated_at` riusano `set_updated_at()`, entrambe da `0001`.
+
+### Dichiarazioni di scope (ORCH-SCHEMA-A)
+
+- **Additiva.** Introduce solo tabelle nuove; non esegue alcuna `ALTER` distruttiva su tabelle esistenti.
+- **Nessun provider reale**, nessuna API, nessun worker di orchestrazione, nessuna UI, nessun local LLM, nessun retrieval web, **nessun gate parallelo**.
+- **Non modifica le migration precedenti** `0001`-`0010`, applicate e immutabili.
+- **Non trasforma `agent_runs` / `agent_outputs` di `0005`**: le tabelle placeholder di `0005` (`agent_runs`, `agent_outputs`, `truncation_events`, `continuation_attempts`) non sono riusate, non sono ridefinite, non sono rimosse. La famiglia agente multi-AI usa nomi prefissati `orchestration_agent_*` per evitare ogni collisione semantica.
+
+### Nota di rinumerazione `0011`
+
+`PROJECT_STATE.md` preannunciava `0011_*` come candidato per la retention distruttiva. La fase ORCH-SCHEMA-A occupa il numero `0011` per lo schema di orchestrazione, come prescritto dal prompt operativo; la retention reale distruttiva slitta a un numero successivo (`0012_*` o oltre). Questa è una decisione da segnalare in revisione umana.
+
+---
+
 ## Regola d'oro
 
 Le migration applicate sono immutabili. Le incompatibilità rilevate dopo l'applicazione vengono gestite:
