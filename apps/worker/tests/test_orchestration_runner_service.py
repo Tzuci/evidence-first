@@ -935,3 +935,918 @@ def test_module_uses_no_network_redis_fastapi_or_provider_sdk_imports():
     # Positive control: the module does rely on the allowed building blocks.
     assert "sqlalchemy" in lowered
     assert "orchestration_provider" in lowered
+
+# ===========================================================================
+# ORCH-MULTI-A scaffold coverage
+# ===========================================================================
+def _seed_second_agent_config(conn, ids: dict[str, str]) -> str:
+    role_id = _seed_role_prompt(conn, tenant_id=ids["tenant_id"])
+    return _seed_agent_config(
+        conn,
+        tenant_id=ids["tenant_id"],
+        master_prompt_id=ids["master_prompt_id"],
+        role_prompt_id=role_id,
+    )
+
+
+def _make_multi_request(
+    ids: dict[str, str],
+    second_agent_config_id: str,
+    **overrides,
+):
+    kwargs: dict = {
+        "tenant_id": ids["tenant_id"],
+        "project_id": ids["project_id"],
+        "master_prompt_version_id": ids["master_prompt_version_id"],
+        "agent_config_ids": (ids["agent_config_id"], second_agent_config_id),
+        "idempotency_key": f"multi-run-idem-{uuid.uuid4()}",
+    }
+    kwargs.update(overrides)
+    return runner.MultiAgentMockOrchestrationRequest(**kwargs)
+
+
+def _multi_scaffold_counts(conn, run_id: str) -> dict[str, int]:
+    return {
+        "runs": _count(
+            conn,
+            "SELECT count(*) FROM orchestration_runs WHERE id = :r",
+            {"r": run_id},
+        ),
+        "snapshots": _count(
+            conn,
+            "SELECT count(*) FROM agent_config_snapshots "
+            "WHERE orchestration_run_id = :r",
+            {"r": run_id},
+        ),
+        "agent_runs": _count(
+            conn,
+            "SELECT count(*) FROM orchestration_agent_runs "
+            "WHERE orchestration_run_id = :r",
+            {"r": run_id},
+        ),
+        "events": _count(
+            conn,
+            "SELECT count(*) FROM orchestration_events "
+            "WHERE orchestration_run_id = :r",
+            {"r": run_id},
+        ),
+        "provider_invocations": _count(
+            conn,
+            "SELECT count(*) FROM provider_invocations "
+            "WHERE orchestration_run_id = :r",
+            {"r": run_id},
+        ),
+        "messages": _count(
+            conn,
+            "SELECT count(*) FROM orchestration_agent_messages "
+            "WHERE orchestration_run_id = :r",
+            {"r": run_id},
+        ),
+        "token_usage": _count(
+            conn,
+            "SELECT count(*) FROM token_usage_records "
+            "WHERE orchestration_run_id = :r",
+            {"r": run_id},
+        ),
+        "outputs": _count(
+            conn,
+            "SELECT count(*) FROM orchestration_agent_outputs o "
+            "JOIN orchestration_agent_runs ar ON ar.id = o.agent_run_id "
+            "WHERE ar.orchestration_run_id = :r",
+            {"r": run_id},
+        ),
+        "source_candidates": _count(
+            conn,
+            "SELECT count(*) FROM source_candidates "
+            "WHERE orchestration_run_id = :r",
+            {"r": run_id},
+        ),
+    }
+
+
+def test_multi_agent_provider_execution_persists_agent_facts_without_source_candidates(conn):
+    ids = _seed_full_config(conn)
+    second_agent_config_id = _seed_second_agent_config(conn, ids)
+    request = _make_multi_request(ids, second_agent_config_id)
+
+    result = runner.run_multi_agent_mock_orchestration(conn, request)
+
+    assert result.status == "succeeded"
+    assert result.is_mock is True
+    assert result.publication_status == "not_evaluated"
+    assert result.gate_report_id is None
+    assert result.orchestration_run_id is not None
+    assert len(result.agent_run_ids) == 2
+    assert result.failed_agent_config_ids == ()
+    assert len(result.provider_invocation_ids) == 2
+    assert len(result.agent_output_ids) == 2
+    assert len(result.token_usage_record_ids) == 2
+    assert len(result.agent_message_ids) == 6
+    assert result.source_candidate_ids == ()
+    assert result.error_code is None
+    assert result.error_message is None
+
+    run_id = result.orchestration_run_id
+    counts = _multi_scaffold_counts(conn, run_id)
+    assert counts == {
+        "runs": 1,
+        "snapshots": 2,
+        "agent_runs": 2,
+        "events": 5,
+        "provider_invocations": 2,
+        "messages": 6,
+        "token_usage": 2,
+        "outputs": 2,
+        "source_candidates": 0,
+    }
+
+    run_row = conn.execute(
+        text(
+            "SELECT status, final_gate_report_id, is_mock, failure_reason "
+            "FROM orchestration_runs WHERE id = :r"
+        ),
+        {"r": run_id},
+    ).mappings().first()
+    assert run_row["status"] == "completed"
+    assert run_row["final_gate_report_id"] is None
+    assert run_row["is_mock"] is True
+    assert run_row["failure_reason"] is None
+
+    agent_rows = conn.execute(
+        text(
+            "SELECT status, error_code, failure_reason, is_mock "
+            "FROM orchestration_agent_runs "
+            "WHERE orchestration_run_id = :r "
+            "ORDER BY created_at, id"
+        ),
+        {"r": run_id},
+    ).mappings().all()
+    assert len(agent_rows) == 2
+    assert {row["status"] for row in agent_rows} == {"succeeded"}
+    assert {row["is_mock"] for row in agent_rows} == {True}
+    assert all(row["error_code"] is None for row in agent_rows)
+    assert all(row["failure_reason"] is None for row in agent_rows)
+
+    provider_rows = conn.execute(
+        text(
+            "SELECT status, is_mock FROM provider_invocations "
+            "WHERE orchestration_run_id = :r "
+            "ORDER BY created_at, id"
+        ),
+        {"r": run_id},
+    ).mappings().all()
+    assert len(provider_rows) == 2
+    assert {row["status"] for row in provider_rows} == {"succeeded"}
+    assert {row["is_mock"] for row in provider_rows} == {True}
+
+    events = _events_for_run(conn, run_id)
+    assert [seq for seq, _ in events] == list(range(5))
+    assert [event_type for _, event_type in events] == [
+        "run_created",
+        "agent_run_started",
+        "agent_run_completed",
+        "agent_run_started",
+        "agent_run_completed",
+    ]
+
+def test_multi_agent_idempotency_replay_returns_existing_without_duplicates(conn):
+    ids = _seed_full_config(conn)
+    second_agent_config_id = _seed_second_agent_config(conn, ids)
+    request = _make_multi_request(ids, second_agent_config_id)
+
+    first = runner.run_multi_agent_mock_orchestration(conn, request)
+    before = _multi_scaffold_counts(conn, first.orchestration_run_id)
+
+    replay = runner.run_multi_agent_mock_orchestration(conn, request)
+    after = _multi_scaffold_counts(conn, first.orchestration_run_id)
+
+    assert replay.status == "succeeded"
+    assert replay.orchestration_run_id == first.orchestration_run_id
+    assert set(replay.agent_run_ids) == set(first.agent_run_ids)
+    assert replay.failed_agent_config_ids == ()
+    assert set(replay.provider_invocation_ids) == set(first.provider_invocation_ids)
+    assert set(replay.agent_output_ids) == set(first.agent_output_ids)
+    assert set(replay.token_usage_record_ids) == set(first.token_usage_record_ids)
+    assert set(replay.agent_message_ids) == set(first.agent_message_ids)
+    assert set(replay.event_ids) == set(first.event_ids)
+    assert before == after
+
+    run_count_for_key = _count(
+        conn,
+        "SELECT count(*) FROM orchestration_runs "
+        "WHERE tenant_id = :t AND idempotency_key = :k",
+        {"t": request.tenant_id, "k": request.idempotency_key},
+    )
+    assert run_count_for_key == 1
+
+def test_multi_agent_source_candidates_are_persisted_as_unverified_proposed(conn):
+    ids = _seed_full_config(conn)
+    second_agent_config_id = _seed_second_agent_config(conn, ids)
+    request = _make_multi_request(
+        ids,
+        second_agent_config_id,
+        mock_source_candidates_by_agent={
+            ids["agent_config_id"]: (
+                {
+                    "title": "Agent A source",
+                    "url": "https://example.test/a",
+                    "locator": "p.1",
+                    "raw_text": "candidate text A",
+                },
+            ),
+            second_agent_config_id: (
+                {
+                    "title": "Agent B source",
+                    "url": "https://example.test/b",
+                    "locator": "p.2",
+                    "raw_text": "candidate text B",
+                },
+            ),
+        },
+    )
+
+    gate_reports_before = _count(
+        conn,
+        "SELECT count(*) FROM final_gate_reports",
+        {},
+    )
+    published_answers_before = _count(
+        conn,
+        "SELECT count(*) FROM published_answers",
+        {},
+    )
+
+    result = runner.run_multi_agent_mock_orchestration(conn, request)
+
+    assert result.status == "succeeded"
+    assert result.publication_status == "not_evaluated"
+    assert result.gate_report_id is None
+    assert result.orchestration_run_id is not None
+    assert len(result.agent_run_ids) == 2
+    assert len(result.agent_output_ids) == 2
+    assert len(result.source_candidate_ids) == 2
+    assert result.failed_agent_config_ids == ()
+    assert result.error_code is None
+    assert result.error_message is None
+
+    run_id = result.orchestration_run_id
+    counts = _multi_scaffold_counts(conn, run_id)
+    assert counts == {
+        "runs": 1,
+        "snapshots": 2,
+        "agent_runs": 2,
+        "events": 7,
+        "provider_invocations": 2,
+        "messages": 6,
+        "token_usage": 2,
+        "outputs": 2,
+        "source_candidates": 2,
+    }
+
+    candidate_rows = conn.execute(
+        text(
+            "SELECT status, candidate_type, title, url, citation_text, "
+            "quoted_text, declared_confidence, agent_output_id, "
+            "provenance->>'is_verified' AS is_verified "
+            "FROM source_candidates "
+            "WHERE orchestration_run_id = :r "
+            "ORDER BY created_at, id"
+        ),
+        {"r": run_id},
+    ).mappings().all()
+
+    assert len(candidate_rows) == 2
+    assert {row["status"] for row in candidate_rows} == {"proposed"}
+    assert {row["candidate_type"] for row in candidate_rows} == {"agent_cited"}
+    assert {row["title"] for row in candidate_rows} == {
+        "Agent A source",
+        "Agent B source",
+    }
+    assert {row["url"] for row in candidate_rows} == {
+        "https://example.test/a",
+        "https://example.test/b",
+    }
+    assert {row["citation_text"] for row in candidate_rows} == {
+        "candidate text A",
+        "candidate text B",
+    }
+    assert all(row["quoted_text"] is None for row in candidate_rows)
+    assert all(row["declared_confidence"] is None for row in candidate_rows)
+    assert all(row["agent_output_id"] is not None for row in candidate_rows)
+    assert {row["is_verified"] for row in candidate_rows} == {"false"}
+
+    events = _events_for_run(conn, run_id)
+    assert [seq for seq, _ in events] == list(range(7))
+    assert [event_type for _, event_type in events].count(
+        "source_candidate_created"
+    ) == 2
+    assert "run_failed" not in [event_type for _, event_type in events]
+
+    assert _count(
+        conn,
+        "SELECT count(*) FROM source_resolutions "
+        "WHERE orchestration_run_id = :r",
+        {"r": run_id},
+    ) == 0
+    assert _count(
+        conn,
+        "SELECT count(*) FROM source_verifications sv "
+        "JOIN source_candidates sc ON sc.id = sv.source_candidate_id "
+        "WHERE sc.orchestration_run_id = :r",
+        {"r": run_id},
+    ) == 0
+    assert _count(
+        conn,
+        "SELECT count(*) FROM candidate_syntheses "
+        "WHERE orchestration_run_id = :r",
+        {"r": run_id},
+    ) == 0
+    run_gate_row = conn.execute(
+        text(
+            "SELECT final_gate_report_id "
+            "FROM orchestration_runs WHERE id = :r"
+        ),
+        {"r": run_id},
+    ).mappings().first()
+    assert run_gate_row["final_gate_report_id"] is None
+    assert _count(conn, "SELECT count(*) FROM final_gate_reports", {}) == gate_reports_before
+    assert _count(conn, "SELECT count(*) FROM published_answers", {}) == published_answers_before
+
+def test_multi_agent_failure_path_marks_run_failed_and_keeps_success_facts(conn):
+    ids = _seed_full_config(conn)
+    second_agent_config_id = _seed_second_agent_config(conn, ids)
+    request = _make_multi_request(
+        ids,
+        second_agent_config_id,
+        mock_source_candidates_by_agent={
+            ids["agent_config_id"]: (
+                {
+                    "title": "Successful agent source",
+                    "url": "https://example.test/success",
+                    "locator": "p.10",
+                    "raw_text": "candidate text from successful agent",
+                },
+            ),
+            second_agent_config_id: (
+                {
+                    "title": "Failed agent source",
+                    "url": "https://example.test/failed",
+                    "locator": "p.20",
+                    "raw_text": "candidate text from failed agent",
+                },
+            ),
+        },
+        mock_error_by_agent={
+            second_agent_config_id: {
+                "error_code": "rate_limited",
+                "error_message": "second agent forced failure",
+            },
+        },
+    )
+
+    gate_reports_before = _count(
+        conn,
+        "SELECT count(*) FROM final_gate_reports",
+        {},
+    )
+    published_answers_before = _count(
+        conn,
+        "SELECT count(*) FROM published_answers",
+        {},
+    )
+
+    result = runner.run_multi_agent_mock_orchestration(conn, request)
+
+    assert result.status == "failed"
+    assert result.publication_status == "not_evaluated"
+    assert result.gate_report_id is None
+    assert result.orchestration_run_id is not None
+    assert set(result.failed_agent_config_ids) == {second_agent_config_id}
+    assert len(result.agent_run_ids) == 2
+    assert len(result.provider_invocation_ids) == 2
+    assert len(result.token_usage_record_ids) == 2
+    assert len(result.agent_output_ids) == 1
+    assert len(result.agent_message_ids) == 5
+    assert len(result.source_candidate_ids) == 1
+    assert result.error_code == "rate_limited"
+    assert "second agent forced failure" in result.error_message
+
+    run_id = result.orchestration_run_id
+    counts = _multi_scaffold_counts(conn, run_id)
+    assert counts == {
+        "runs": 1,
+        "snapshots": 2,
+        "agent_runs": 2,
+        "events": 7,
+        "provider_invocations": 2,
+        "messages": 5,
+        "token_usage": 2,
+        "outputs": 1,
+        "source_candidates": 1,
+    }
+
+    run_row = conn.execute(
+        text(
+            "SELECT status, final_gate_report_id, failure_reason, is_mock "
+            "FROM orchestration_runs WHERE id = :r"
+        ),
+        {"r": run_id},
+    ).mappings().first()
+    assert run_row["status"] == "failed"
+    assert run_row["final_gate_report_id"] is None
+    assert run_row["is_mock"] is True
+    assert "second agent forced failure" in run_row["failure_reason"]
+
+    agent_rows = conn.execute(
+        text(
+            "SELECT s.agent_config_id, ar.status, ar.error_code, "
+            "ar.failure_reason, ar.is_mock "
+            "FROM orchestration_agent_runs ar "
+            "JOIN agent_config_snapshots s ON s.id = ar.agent_config_snapshot_id "
+            "WHERE ar.orchestration_run_id = :r "
+            "ORDER BY s.agent_config_id"
+        ),
+        {"r": run_id},
+    ).mappings().all()
+    rows_by_config = {str(row["agent_config_id"]): row for row in agent_rows}
+
+    assert rows_by_config[ids["agent_config_id"]]["status"] == "succeeded"
+    assert rows_by_config[ids["agent_config_id"]]["error_code"] is None
+    assert rows_by_config[ids["agent_config_id"]]["failure_reason"] is None
+    assert rows_by_config[ids["agent_config_id"]]["is_mock"] is True
+
+    failed_row = rows_by_config[second_agent_config_id]
+    assert failed_row["status"] == "failed"
+    assert failed_row["error_code"] == "rate_limited"
+    assert "second agent forced failure" in failed_row["failure_reason"]
+    assert failed_row["is_mock"] is True
+
+    provider_rows = conn.execute(
+        text(
+            "SELECT status, error_code, error_message, is_mock "
+            "FROM provider_invocations "
+            "WHERE orchestration_run_id = :r "
+            "ORDER BY created_at, id"
+        ),
+        {"r": run_id},
+    ).mappings().all()
+    assert len(provider_rows) == 2
+    assert {row["status"] for row in provider_rows} == {"succeeded", "failed"}
+    failed_provider_rows = [
+        row for row in provider_rows if row["status"] == "failed"
+    ]
+    assert len(failed_provider_rows) == 1
+    assert failed_provider_rows[0]["error_code"] == "rate_limited"
+    assert "second agent forced failure" in failed_provider_rows[0]["error_message"]
+    assert {row["is_mock"] for row in provider_rows} == {True}
+
+    message_counts = conn.execute(
+        text(
+            "SELECT ar.status, count(*) AS message_count "
+            "FROM orchestration_agent_runs ar "
+            "JOIN orchestration_agent_messages m ON m.agent_run_id = ar.id "
+            "WHERE ar.orchestration_run_id = :r "
+            "GROUP BY ar.status"
+        ),
+        {"r": run_id},
+    ).mappings().all()
+    assert {row["status"]: row["message_count"] for row in message_counts} == {
+        "succeeded": 3,
+        "failed": 2,
+    }
+
+    candidate_rows = conn.execute(
+        text(
+            "SELECT status, candidate_type, title, url, citation_text "
+            "FROM source_candidates "
+            "WHERE orchestration_run_id = :r "
+            "ORDER BY created_at, id"
+        ),
+        {"r": run_id},
+    ).mappings().all()
+    assert len(candidate_rows) == 1
+    assert candidate_rows[0]["status"] == "proposed"
+    assert candidate_rows[0]["candidate_type"] == "agent_cited"
+    assert candidate_rows[0]["title"] == "Successful agent source"
+    assert candidate_rows[0]["url"] == "https://example.test/success"
+    assert candidate_rows[0]["citation_text"] == "candidate text from successful agent"
+
+    events = _events_for_run(conn, run_id)
+    event_types = [event_type for _, event_type in events]
+    assert [seq for seq, _ in events] == list(range(7))
+    assert event_types.count("run_created") == 1
+    assert event_types.count("agent_run_started") == 2
+    assert event_types.count("source_candidate_created") == 1
+    assert event_types.count("agent_run_completed") == 1
+    assert event_types.count("agent_run_failed") == 1
+    assert event_types.count("run_failed") == 1
+
+    assert _count(
+        conn,
+        "SELECT count(*) FROM source_resolutions "
+        "WHERE orchestration_run_id = :r",
+        {"r": run_id},
+    ) == 0
+    assert _count(
+        conn,
+        "SELECT count(*) FROM source_verifications sv "
+        "JOIN source_candidates sc ON sc.id = sv.source_candidate_id "
+        "WHERE sc.orchestration_run_id = :r",
+        {"r": run_id},
+    ) == 0
+    assert _count(
+        conn,
+        "SELECT count(*) FROM candidate_syntheses "
+        "WHERE orchestration_run_id = :r",
+        {"r": run_id},
+    ) == 0
+
+    run_gate_row = conn.execute(
+        text(
+            "SELECT final_gate_report_id "
+            "FROM orchestration_runs WHERE id = :r"
+        ),
+        {"r": run_id},
+    ).mappings().first()
+    assert run_gate_row["final_gate_report_id"] is None
+    assert _count(conn, "SELECT count(*) FROM final_gate_reports", {}) == gate_reports_before
+    assert _count(conn, "SELECT count(*) FROM published_answers", {}) == published_answers_before
+
+def test_multi_agent_failed_idempotency_replay_returns_existing_without_duplicates(conn):
+    ids = _seed_full_config(conn)
+    second_agent_config_id = _seed_second_agent_config(conn, ids)
+    request = _make_multi_request(
+        ids,
+        second_agent_config_id,
+        mock_source_candidates_by_agent={
+            ids["agent_config_id"]: (
+                {
+                    "title": "Replay successful agent source",
+                    "url": "https://example.test/replay-success",
+                    "locator": "p.30",
+                    "raw_text": "candidate text from replay successful agent",
+                },
+            ),
+            second_agent_config_id: (
+                {
+                    "title": "Replay failed agent source",
+                    "url": "https://example.test/replay-failed",
+                    "locator": "p.40",
+                    "raw_text": "candidate text from replay failed agent",
+                },
+            ),
+        },
+        mock_error_by_agent={
+            second_agent_config_id: {
+                "error_code": "rate_limited",
+                "error_message": "second agent replay forced failure",
+            },
+        },
+    )
+
+    first = runner.run_multi_agent_mock_orchestration(conn, request)
+    before = _multi_scaffold_counts(conn, first.orchestration_run_id)
+
+    replay = runner.run_multi_agent_mock_orchestration(conn, request)
+    after = _multi_scaffold_counts(conn, first.orchestration_run_id)
+
+    assert first.status == "failed"
+    assert replay.status == "failed"
+    assert replay.orchestration_run_id == first.orchestration_run_id
+    assert replay.publication_status == "not_evaluated"
+    assert replay.gate_report_id is None
+
+    assert set(first.failed_agent_config_ids) == {second_agent_config_id}
+    assert set(replay.failed_agent_config_ids) == {second_agent_config_id}
+    assert replay.error_code == first.error_code == "rate_limited"
+    assert first.error_message is not None
+    assert replay.error_message is not None
+    assert "second agent replay forced failure" in first.error_message
+    assert "second agent replay forced failure" in replay.error_message
+
+    assert set(replay.agent_run_ids) == set(first.agent_run_ids)
+    assert set(replay.provider_invocation_ids) == set(first.provider_invocation_ids)
+    assert set(replay.token_usage_record_ids) == set(first.token_usage_record_ids)
+    assert set(replay.agent_output_ids) == set(first.agent_output_ids)
+    assert set(replay.agent_message_ids) == set(first.agent_message_ids)
+    assert set(replay.source_candidate_ids) == set(first.source_candidate_ids)
+    assert set(replay.event_ids) == set(first.event_ids)
+
+    assert len(replay.agent_run_ids) == 2
+    assert len(replay.provider_invocation_ids) == 2
+    assert len(replay.token_usage_record_ids) == 2
+    assert len(replay.agent_output_ids) == 1
+    assert len(replay.agent_message_ids) == 5
+    assert len(replay.source_candidate_ids) == 1
+    assert len(replay.event_ids) == 7
+
+    assert before == after
+    assert after == {
+        "runs": 1,
+        "snapshots": 2,
+        "agent_runs": 2,
+        "events": 7,
+        "provider_invocations": 2,
+        "messages": 5,
+        "token_usage": 2,
+        "outputs": 1,
+        "source_candidates": 1,
+    }
+
+    run_count_for_key = _count(
+        conn,
+        "SELECT count(*) FROM orchestration_runs "
+        "WHERE tenant_id = :t AND idempotency_key = :k",
+        {"t": request.tenant_id, "k": request.idempotency_key},
+    )
+    assert run_count_for_key == 1
+
+    run_row = conn.execute(
+        text(
+            "SELECT status, final_gate_report_id, failure_reason "
+            "FROM orchestration_runs WHERE id = :r"
+        ),
+        {"r": first.orchestration_run_id},
+    ).mappings().first()
+    assert run_row["status"] == "failed"
+    assert run_row["final_gate_report_id"] is None
+    assert "second agent replay forced failure" in run_row["failure_reason"]
+
+    candidate_rows = conn.execute(
+        text(
+            "SELECT title, status, candidate_type "
+            "FROM source_candidates "
+            "WHERE orchestration_run_id = :r "
+            "ORDER BY created_at, id"
+        ),
+        {"r": first.orchestration_run_id},
+    ).mappings().all()
+    assert len(candidate_rows) == 1
+    assert candidate_rows[0]["title"] == "Replay successful agent source"
+    assert candidate_rows[0]["status"] == "proposed"
+    assert candidate_rows[0]["candidate_type"] == "agent_cited"
+
+    events = _events_for_run(conn, first.orchestration_run_id)
+    event_types = [event_type for _, event_type in events]
+    assert [seq for seq, _ in events] == list(range(7))
+    assert event_types.count("run_created") == 1
+    assert event_types.count("agent_run_started") == 2
+    assert event_types.count("source_candidate_created") == 1
+    assert event_types.count("agent_run_completed") == 1
+    assert event_types.count("agent_run_failed") == 1
+    assert event_types.count("run_failed") == 1
+
+def test_multi_agent_budget_preflight_hard_stop_fails_before_agent_facts(conn):
+    import dataclasses
+
+    ids = _seed_full_config(conn)
+    second_agent_config_id = _seed_second_agent_config(conn, ids)
+
+    master_prompt_id = conn.execute(
+        text(
+            "SELECT master_prompt_id "
+            "FROM master_prompt_versions WHERE id = :id"
+        ),
+        {"id": ids["master_prompt_version_id"]},
+    ).scalar_one()
+
+    budget_id = conn.execute(
+        text(
+            "INSERT INTO token_budgets ("
+            "tenant_id, master_prompt_id, agent_config_id, "
+            "budget_level, token_limit, cost_limit, overflow_policy"
+            ") VALUES ("
+            ":tenant_id, :master_prompt_id, NULL, "
+            "'per_orchestration', 0, NULL, 'hard_stop'"
+            ") RETURNING id"
+        ),
+        {
+            "tenant_id": ids["tenant_id"],
+            "master_prompt_id": master_prompt_id,
+        },
+    ).scalar_one()
+
+    request = _make_multi_request(ids, second_agent_config_id)
+    request = dataclasses.replace(request, token_budget_id=str(budget_id))
+
+    gate_reports_before = _count(
+        conn,
+        "SELECT count(*) FROM final_gate_reports",
+        {},
+    )
+    published_answers_before = _count(
+        conn,
+        "SELECT count(*) FROM published_answers",
+        {},
+    )
+
+    result = runner.run_multi_agent_mock_orchestration(conn, request)
+
+    assert result.status == "failed"
+    assert result.error_code == "budget_exceeded"
+    assert result.error_message is not None
+    assert "budget" in result.error_message
+    assert result.publication_status == "not_evaluated"
+    assert result.gate_report_id is None
+    assert result.orchestration_run_id is not None
+
+    assert result.agent_run_ids == ()
+    assert result.failed_agent_config_ids == ()
+    assert result.provider_invocation_ids == ()
+    assert result.token_usage_record_ids == ()
+    assert result.agent_message_ids == ()
+    assert result.agent_output_ids == ()
+    assert result.source_candidate_ids == ()
+    assert len(result.event_ids) == 3
+
+    run_id = result.orchestration_run_id
+    counts = _multi_scaffold_counts(conn, run_id)
+    assert counts == {
+        "runs": 1,
+        "snapshots": 0,
+        "agent_runs": 0,
+        "events": 3,
+        "provider_invocations": 0,
+        "messages": 0,
+        "token_usage": 0,
+        "outputs": 0,
+        "source_candidates": 0,
+    }
+
+    run_row = conn.execute(
+        text(
+            "SELECT status, final_gate_report_id, failure_reason, is_mock "
+            "FROM orchestration_runs WHERE id = :r"
+        ),
+        {"r": run_id},
+    ).mappings().first()
+    assert run_row["status"] == "failed"
+    assert run_row["final_gate_report_id"] is None
+    assert run_row["is_mock"] is True
+    assert "budget" in run_row["failure_reason"]
+
+    events = _events_for_run(conn, run_id)
+    assert [seq for seq, _ in events] == list(range(3))
+    assert [event_type for _, event_type in events] == [
+        "run_created",
+        "token_budget_exceeded",
+        "run_failed",
+    ]
+
+    assert _count(
+        conn,
+        "SELECT count(*) FROM source_resolutions "
+        "WHERE orchestration_run_id = :r",
+        {"r": run_id},
+    ) == 0
+    assert _count(
+        conn,
+        "SELECT count(*) FROM source_verifications sv "
+        "JOIN source_candidates sc ON sc.id = sv.source_candidate_id "
+        "WHERE sc.orchestration_run_id = :r",
+        {"r": run_id},
+    ) == 0
+    assert _count(
+        conn,
+        "SELECT count(*) FROM candidate_syntheses "
+        "WHERE orchestration_run_id = :r",
+        {"r": run_id},
+    ) == 0
+
+    assert _count(conn, "SELECT count(*) FROM final_gate_reports", {}) == gate_reports_before
+    assert _count(conn, "SELECT count(*) FROM published_answers", {}) == published_answers_before
+
+def test_multi_agent_budget_preflight_idempotency_replay_returns_existing_without_duplicates(conn):
+    import dataclasses
+
+    ids = _seed_full_config(conn)
+    second_agent_config_id = _seed_second_agent_config(conn, ids)
+
+    master_prompt_id = conn.execute(
+        text(
+            "SELECT master_prompt_id "
+            "FROM master_prompt_versions WHERE id = :id"
+        ),
+        {"id": ids["master_prompt_version_id"]},
+    ).scalar_one()
+
+    budget_id = conn.execute(
+        text(
+            "INSERT INTO token_budgets ("
+            "tenant_id, master_prompt_id, agent_config_id, "
+            "budget_level, token_limit, cost_limit, overflow_policy"
+            ") VALUES ("
+            ":tenant_id, :master_prompt_id, NULL, "
+            "'per_orchestration', 0, NULL, 'hard_stop'"
+            ") RETURNING id"
+        ),
+        {
+            "tenant_id": ids["tenant_id"],
+            "master_prompt_id": master_prompt_id,
+        },
+    ).scalar_one()
+
+    request = _make_multi_request(ids, second_agent_config_id)
+    request = dataclasses.replace(request, token_budget_id=str(budget_id))
+
+    first = runner.run_multi_agent_mock_orchestration(conn, request)
+    before = _multi_scaffold_counts(conn, first.orchestration_run_id)
+
+    replay = runner.run_multi_agent_mock_orchestration(conn, request)
+    after = _multi_scaffold_counts(conn, first.orchestration_run_id)
+
+    assert first.status == "failed"
+    assert replay.status == "failed"
+    assert replay.orchestration_run_id == first.orchestration_run_id
+    assert replay.publication_status == "not_evaluated"
+    assert replay.gate_report_id is None
+
+    assert first.error_code == "budget_exceeded"
+    assert replay.error_code == "budget_exceeded"
+    assert first.error_message is not None
+    assert replay.error_message is not None
+    assert "budget" in first.error_message
+    assert "budget" in replay.error_message
+
+    assert replay.agent_run_ids == first.agent_run_ids == ()
+    assert replay.failed_agent_config_ids == first.failed_agent_config_ids == ()
+    assert replay.provider_invocation_ids == first.provider_invocation_ids == ()
+    assert replay.token_usage_record_ids == first.token_usage_record_ids == ()
+    assert replay.agent_message_ids == first.agent_message_ids == ()
+    assert replay.agent_output_ids == first.agent_output_ids == ()
+    assert replay.source_candidate_ids == first.source_candidate_ids == ()
+    assert set(replay.event_ids) == set(first.event_ids)
+    assert len(replay.event_ids) == 3
+
+    assert before == after
+    assert after == {
+        "runs": 1,
+        "snapshots": 0,
+        "agent_runs": 0,
+        "events": 3,
+        "provider_invocations": 0,
+        "messages": 0,
+        "token_usage": 0,
+        "outputs": 0,
+        "source_candidates": 0,
+    }
+
+    run_count_for_key = _count(
+        conn,
+        "SELECT count(*) FROM orchestration_runs "
+        "WHERE tenant_id = :t AND idempotency_key = :k",
+        {"t": request.tenant_id, "k": request.idempotency_key},
+    )
+    assert run_count_for_key == 1
+
+    run_row = conn.execute(
+        text(
+            "SELECT status, final_gate_report_id, failure_reason, is_mock "
+            "FROM orchestration_runs WHERE id = :r"
+        ),
+        {"r": first.orchestration_run_id},
+    ).mappings().first()
+    assert run_row["status"] == "failed"
+    assert run_row["final_gate_report_id"] is None
+    assert run_row["is_mock"] is True
+    assert "budget" in run_row["failure_reason"]
+
+    events = _events_for_run(conn, first.orchestration_run_id)
+    assert [seq for seq, _ in events] == list(range(3))
+    assert [event_type for _, event_type in events] == [
+        "run_created",
+        "token_budget_exceeded",
+        "run_failed",
+    ]
+
+    run_failed_payload = conn.execute(
+        text(
+            "SELECT event_payload "
+            "FROM orchestration_events "
+            "WHERE orchestration_run_id = :r "
+            "AND event_type = 'run_failed'"
+        ),
+        {"r": first.orchestration_run_id},
+    ).scalar_one()
+    assert run_failed_payload["error_code"] == "budget_exceeded"
+    assert "budget" in run_failed_payload["error_message"]
+
+    assert _count(
+        conn,
+        "SELECT count(*) FROM source_resolutions "
+        "WHERE orchestration_run_id = :r",
+        {"r": first.orchestration_run_id},
+    ) == 0
+    assert _count(
+        conn,
+        "SELECT count(*) FROM source_verifications sv "
+        "JOIN source_candidates sc ON sc.id = sv.source_candidate_id "
+        "WHERE sc.orchestration_run_id = :r",
+        {"r": first.orchestration_run_id},
+    ) == 0
+    assert _count(
+        conn,
+        "SELECT count(*) FROM candidate_syntheses "
+        "WHERE orchestration_run_id = :r",
+        {"r": first.orchestration_run_id},
+    ) == 0

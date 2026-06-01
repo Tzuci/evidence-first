@@ -49,7 +49,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
@@ -94,6 +94,10 @@ RUN_MODE_VALUES: tuple[str, ...] = (
 
 # orchestration_runs.execution_mode: the runner only supports 'independent'.
 EXECUTION_MODE_INDEPENDENT = "independent"
+
+# Multi-agent bound (ORCH-MULTI-A design §7). A run is bounded: a request with
+# more than MAX_AGENTS agent_config_ids is rejected by a later micro-patch.
+MAX_AGENTS = 8
 
 # orchestration_agent_runs.status values written by the runner (final only).
 AGENT_RUN_STATUS_SUCCEEDED = "succeeded"
@@ -174,6 +178,124 @@ class OrchestrationRunnerResult:
     is_mock: bool
     publication_status: str
     gate_report_id: str | None
+
+
+@dataclass(frozen=True)
+class MultiAgentMockOrchestrationRequest:
+    """Logical request for a multi-agent mock orchestration run (ORCH-MULTI-A).
+
+    Extends OrchestrationRunnerRequest by replacing the single
+    ``agent_config_id`` with an ordered tuple of ``agent_config_ids``. Request
+    order is the deterministic execution order. No secret travels in this
+    contract: no API key, no authentication token, no credential, no
+    Authorization header. The provider is mock; no key is needed or expected.
+    """
+
+    tenant_id: str
+    project_id: str | None
+    master_prompt_version_id: str
+    agent_config_ids: tuple[str, ...]
+    idempotency_key: str
+    mode: str = "multi_ai_orchestration"
+    execution_mode: str = "independent"
+    token_budget_id: str | None = None
+    mock_source_candidates_by_agent: Mapping[
+        str, tuple[dict[str, Any], ...] | list[dict[str, Any]]
+    ] = field(default_factory=dict)
+    mock_error_by_agent: Mapping[str, dict[str, str]] = field(default_factory=dict)
+    created_by: str | None = None
+
+
+@dataclass(frozen=True)
+class MultiAgentMockOrchestrationResult:
+    """Logical result for a multi-agent run, aggregated across all agents.
+
+    Pluralizes the agent-scoped references of OrchestrationRunnerResult.
+    ``publication_status`` is always 'not_evaluated' and ``gate_report_id`` is
+    always None: the Final Answer Gate is not integrated by the runner.
+    """
+
+    status: str
+    orchestration_run_id: str | None
+    agent_run_ids: tuple[str, ...]
+    provider_invocation_ids: tuple[str, ...]
+    agent_output_ids: tuple[str, ...]
+    token_usage_record_ids: tuple[str, ...]
+    agent_message_ids: tuple[str, ...]
+    source_candidate_ids: tuple[str, ...]
+    event_ids: tuple[str, ...]
+    failed_agent_config_ids: tuple[str, ...]
+    error_code: str | None
+    error_message: str | None
+    is_mock: bool
+    publication_status: str
+    gate_report_id: str | None
+
+
+_MULTI_NOT_IMPLEMENTED_MESSAGE = (
+    "run_multi_agent_mock_orchestration is not implemented in patch 1; the "
+    "full multi-agent transaction is added in a later micro-patch"
+)
+
+
+def _failed_multi_result_no_db(
+    error_code: str, error_message: str
+) -> MultiAgentMockOrchestrationResult:
+    """Build a failed multi-agent result before any DB write."""
+    return MultiAgentMockOrchestrationResult(
+        status=RESULT_STATUS_FAILED,
+        orchestration_run_id=None,
+        agent_run_ids=(),
+        failed_agent_config_ids=(),
+        provider_invocation_ids=(),
+        agent_output_ids=(),
+        token_usage_record_ids=(),
+        agent_message_ids=(),
+        source_candidate_ids=(),
+        event_ids=(),
+        error_code=error_code,
+        error_message=_redact(error_message),
+        is_mock=True,
+        publication_status=PUBLICATION_STATUS_NOT_EVALUATED,
+        gate_report_id=None,
+    )
+
+
+def run_multi_agent_mock_orchestration(
+    conn: Connection,
+    request: MultiAgentMockOrchestrationRequest,
+) -> MultiAgentMockOrchestrationResult:
+    """Run a multi-agent, single-pass, mock-only orchestration run.
+
+    MICRO-PATCH 2 ONLY. This function now performs request-shape validation and
+    DB preload/validation for all requested agent_configs. It still performs no
+    DB writes, does not invoke the provider, and does not touch the Final Answer
+    Gate. The full multi-agent transaction is added in a later micro-patch.
+    """
+    try:
+        _validate_multi_request_shape(request)
+    except _RunnerValidationError as exc:
+        return _failed_multi_result_no_db(exc.error_code, exc.error_message)
+
+    existing = _select_existing_run(conn, request.tenant_id, request.idempotency_key)
+    if existing is not None:
+        return _build_multi_replay_result(conn, existing)
+
+    try:
+        ctx_list, budget_limit, overflow_policy = _load_and_validate_multi(
+            conn, request
+        )
+    except _RunnerValidationError as exc:
+        return _failed_multi_result_no_db(exc.error_code, exc.error_message)
+
+    return _execute_multi_provider_pass(
+        conn,
+        request,
+        ctx_list,
+        budget_limit,
+        overflow_policy,
+    )
+
 
 
 # ===========================================================================
@@ -516,6 +638,272 @@ def _load_budget(
 
 
 # ===========================================================================
+# Multi-agent validation and DB reads (ORCH-MULTI-A)
+# ===========================================================================
+
+
+def _validate_multi_request_shape(
+    request: MultiAgentMockOrchestrationRequest,
+) -> None:
+    """Validate the multi-agent request fields that need no DB access."""
+    if not request.idempotency_key or not str(request.idempotency_key).strip():
+        raise _RunnerValidationError(
+            op.ERROR_INVALID_REQUEST, "idempotency_key must be a non-empty string"
+        )
+    if request.mode not in RUN_MODE_VALUES:
+        raise _RunnerValidationError(
+            op.ERROR_INVALID_REQUEST,
+            f"mode must be one of {RUN_MODE_VALUES}, got {request.mode!r}",
+        )
+    if request.execution_mode != EXECUTION_MODE_INDEPENDENT:
+        raise _RunnerValidationError(
+            op.ERROR_INVALID_REQUEST,
+            "execution_mode must be 'independent' in ORCH-MULTI-A, "
+            f"got {request.execution_mode!r}",
+        )
+
+    agent_ids = tuple(str(agent_id) for agent_id in request.agent_config_ids)
+    if not agent_ids:
+        raise _RunnerValidationError(
+            op.ERROR_INVALID_REQUEST,
+            "agent_config_ids must contain at least one agent_config",
+        )
+    if len(set(agent_ids)) != len(agent_ids):
+        raise _RunnerValidationError(
+            op.ERROR_INVALID_REQUEST,
+            "agent_config_ids must not contain duplicates",
+        )
+    if len(agent_ids) > MAX_AGENTS:
+        raise _RunnerValidationError(
+            op.ERROR_INVALID_REQUEST,
+            f"agent_config_ids exceeds MAX_AGENTS={MAX_AGENTS}",
+        )
+
+    requested = set(agent_ids)
+    for agent_config_id in request.mock_error_by_agent:
+        if str(agent_config_id) not in requested:
+            raise _RunnerValidationError(
+                op.ERROR_INVALID_REQUEST,
+                "mock_error_by_agent references an agent_config_id not in the request",
+            )
+    for agent_config_id in request.mock_source_candidates_by_agent:
+        if str(agent_config_id) not in requested:
+            raise _RunnerValidationError(
+                op.ERROR_INVALID_REQUEST,
+                "mock_source_candidates_by_agent references an agent_config_id "
+                "not in the request",
+            )
+
+
+def _build_multi_run_context(*, cfg: Any, mpv: Any, role: Any) -> _RunContext:
+    """Build one _RunContext for a validated multi-agent agent_config."""
+    constraints = _as_dict(cfg["constraints"])
+    max_tokens = constraints.get("max_tokens")
+    if not isinstance(max_tokens, int):
+        max_tokens = None
+
+    return _RunContext(
+        agent_config_id=str(cfg["id"]),
+        name=cfg["name"],
+        master_prompt_id=str(cfg["master_prompt_id"]),
+        output_contract=_as_dict(cfg["output_contract"]),
+        constraints=constraints,
+        temperature_config=_as_dict(cfg["temperature_config"]),
+        retry_policy=_as_dict(cfg["retry_policy"]),
+        source_access=_as_dict(cfg["source_access"]),
+        reviewer_flag=bool(cfg["reviewer_flag"]),
+        synthesizer_flag=bool(cfg["synthesizer_flag"]),
+        order_index=int(cfg["order_index"]),
+        task_summary=cfg["task_summary"],
+        prompt_text=mpv["prompt_text"],
+        prompt_text_hash=mpv["prompt_text_hash"],
+        role_system_prompt=role["system_prompt_text"],
+        role_task_prompt=role["task_prompt_text"],
+        role_category=role["role_category"],
+        role_version_no=int(role["version_no"]),
+        role_prompt_text_hash=op.stable_hash(
+            {
+                "system_prompt_text": role["system_prompt_text"],
+                "task_prompt_text": role["task_prompt_text"],
+                "role_category": role["role_category"],
+                "version_no": int(role["version_no"]),
+            }
+        ),
+        budget_limit=None,
+        overflow_policy=None,
+        max_tokens=max_tokens,
+    )
+
+
+def _load_and_validate_multi(
+    conn: Connection,
+    request: MultiAgentMockOrchestrationRequest,
+) -> tuple[list[_RunContext], int | None, str | None]:
+    """Read and validate all multi-agent inputs from the DB, preserving request order."""
+    mpv = (
+        conn.execute(
+            text(
+                """
+                SELECT id, master_prompt_id, prompt_text, prompt_text_hash
+                FROM master_prompt_versions
+                WHERE id = :id
+                """
+            ),
+            {"id": request.master_prompt_version_id},
+        )
+        .mappings()
+        .first()
+    )
+    if mpv is None:
+        raise _RunnerValidationError(
+            op.ERROR_INVALID_REQUEST,
+            f"master_prompt_version not found: {request.master_prompt_version_id}",
+        )
+
+    expected_master_prompt_id = str(mpv["master_prompt_id"])
+    shared_master_prompt_id: str | None = None
+    ctx_list: list[_RunContext] = []
+
+    for agent_config_id in request.agent_config_ids:
+        cfg = (
+            conn.execute(
+                text(
+                    """
+                    SELECT id, tenant_id, master_prompt_id, agent_role_prompt_id,
+                           name, provider, model, task_summary, output_contract,
+                           constraints, temperature_config, retry_policy,
+                           source_access, reviewer_flag, synthesizer_flag,
+                           order_index
+                    FROM agent_configs
+                    WHERE id = :id
+                    """
+                ),
+                {"id": agent_config_id},
+            )
+            .mappings()
+            .first()
+        )
+        if cfg is None:
+            raise _RunnerValidationError(
+                op.ERROR_INVALID_REQUEST,
+                f"agent_config not found: {agent_config_id}",
+            )
+        if str(cfg["tenant_id"]) != str(request.tenant_id):
+            raise _RunnerValidationError(
+                op.ERROR_INVALID_REQUEST,
+                "tenant_id of request does not match agent_config.tenant_id",
+            )
+        if cfg["provider"] != op.MOCK_PROVIDER_NAME:
+            raise _RunnerValidationError(
+                op.ERROR_INVALID_REQUEST,
+                f"provider must be {op.MOCK_PROVIDER_NAME!r} in ORCH-MULTI-A, "
+                f"got {cfg['provider']!r}",
+            )
+        if cfg["model"] != op.MOCK_MODEL_NAME:
+            raise _RunnerValidationError(
+                op.ERROR_INVALID_MODEL,
+                f"model must be {op.MOCK_MODEL_NAME!r} in ORCH-MULTI-A, "
+                f"got {cfg['model']!r}",
+            )
+
+        cfg_master_prompt_id = str(cfg["master_prompt_id"])
+        if shared_master_prompt_id is None:
+            shared_master_prompt_id = cfg_master_prompt_id
+        elif cfg_master_prompt_id != shared_master_prompt_id:
+            raise _RunnerValidationError(
+                op.ERROR_INVALID_REQUEST,
+                "all agent_configs must share the same master_prompt_id",
+            )
+
+        if cfg_master_prompt_id != expected_master_prompt_id:
+            raise _RunnerValidationError(
+                op.ERROR_INVALID_REQUEST,
+                "master_prompt_version.master_prompt_id does not match "
+                "agent_config.master_prompt_id",
+            )
+
+        role = (
+            conn.execute(
+                text(
+                    """
+                    SELECT system_prompt_text, task_prompt_text, role_category,
+                           version_no
+                    FROM agent_role_prompts
+                    WHERE id = :id
+                    """
+                ),
+                {"id": cfg["agent_role_prompt_id"]},
+            )
+            .mappings()
+            .first()
+        )
+        if role is None:
+            raise _RunnerValidationError(
+                op.ERROR_INVALID_REQUEST,
+                f"agent_role_prompt not found: {cfg['agent_role_prompt_id']}",
+            )
+
+        ctx_list.append(_build_multi_run_context(cfg=cfg, mpv=mpv, role=role))
+
+    budget_limit, overflow_policy = _load_budget_multi(
+        conn, request, expected_master_prompt_id
+    )
+    return ctx_list, budget_limit, overflow_policy
+
+
+def _load_budget_multi(
+    conn: Connection,
+    request: MultiAgentMockOrchestrationRequest,
+    master_prompt_id: str,
+) -> tuple[int | None, str | None]:
+    """Read and validate the optional multi-agent token budget."""
+    if request.token_budget_id is None:
+        return None, None
+
+    budget = (
+        conn.execute(
+            text(
+                """
+                SELECT tenant_id, master_prompt_id, agent_config_id,
+                       token_limit, overflow_policy, budget_level
+                FROM token_budgets
+                WHERE id = :id
+                """
+            ),
+            {"id": request.token_budget_id},
+        )
+        .mappings()
+        .first()
+    )
+    if budget is None:
+        raise _RunnerValidationError(
+            op.ERROR_INVALID_REQUEST,
+            f"token_budget not found: {request.token_budget_id}",
+        )
+    if str(budget["tenant_id"]) != str(request.tenant_id):
+        raise _RunnerValidationError(
+            op.ERROR_INVALID_REQUEST,
+            "token_budget tenant_id does not match the request tenant_id",
+        )
+    if budget["master_prompt_id"] is not None and str(
+        budget["master_prompt_id"]
+    ) != str(master_prompt_id):
+        raise _RunnerValidationError(
+            op.ERROR_INVALID_REQUEST,
+            "token_budget master_prompt_id does not match the run master_prompt_id",
+        )
+    if budget["agent_config_id"] is not None and str(
+        budget["agent_config_id"]
+    ) not in {str(agent_id) for agent_id in request.agent_config_ids}:
+        raise _RunnerValidationError(
+            op.ERROR_INVALID_REQUEST,
+            "token_budget agent_config_id is not one of the requested agent_config_ids",
+        )
+
+    return int(budget["token_limit"]), budget["overflow_policy"]
+
+
+# ===========================================================================
 # Provider request construction (PHASE_ORCH_RUNNER_PRE.md §10)
 # ===========================================================================
 
@@ -619,6 +1007,60 @@ def _insert_orchestration_run(
             "execution_mode": request.execution_mode,
             "status": RUN_STATUS_PENDING,
             "hash": ctx.prompt_text_hash,
+            "bounding": json.dumps(bounding),
+            "idem": request.idempotency_key,
+            "policy_name": RUNNER_NAME,
+            "policy_version": RUNNER_VERSION,
+        },
+    )
+
+
+def _insert_multi_orchestration_run(
+    conn: Connection,
+    *,
+    run_id: str,
+    request: MultiAgentMockOrchestrationRequest,
+    ctx_list: list[_RunContext],
+    budget_limit: int | None,
+    overflow_policy: str | None,
+) -> None:
+    """Insert the orchestration_runs row for a multi-agent scaffold run."""
+    first_ctx = ctx_list[0]
+    bounding = {
+        "max_agents": len(ctx_list),
+        "pass_kinds": [PASS_KIND_INDEPENDENT_ANSWER],
+        "runner_name": RUNNER_NAME,
+        "runner_version": RUNNER_VERSION,
+    }
+    if budget_limit is not None:
+        bounding["token_budget"] = {
+            "token_limit": budget_limit,
+            "overflow_policy": overflow_policy,
+        }
+
+    conn.execute(
+        text(
+            """
+            INSERT INTO orchestration_runs
+                (id, tenant_id, project_id, master_prompt_version_id, mode,
+                 execution_mode, status, master_prompt_text_hash,
+                 bounding_parameters, idempotency_key, policy_name,
+                 policy_version, is_mock)
+            VALUES
+                (:id, :tenant_id, :project_id, :mpv_id, :mode, :execution_mode,
+                 :status, :hash, CAST(:bounding AS JSONB), :idem, :policy_name,
+                 :policy_version, TRUE)
+            """
+        ),
+        {
+            "id": run_id,
+            "tenant_id": request.tenant_id,
+            "project_id": request.project_id,
+            "mpv_id": request.master_prompt_version_id,
+            "mode": request.mode,
+            "execution_mode": request.execution_mode,
+            "status": RUN_STATUS_PENDING,
+            "hash": first_ctx.prompt_text_hash,
             "bounding": json.dumps(bounding),
             "idem": request.idempotency_key,
             "policy_name": RUNNER_NAME,
@@ -1109,10 +1551,182 @@ def _build_replay_result(
     )
 
 
-# ===========================================================================
-# Main entry point (PHASE_ORCH_RUNNER_PRE.md §8, §17)
-# ===========================================================================
+def _build_multi_replay_result(
+    conn: Connection, existing: dict[str, Any]
+) -> MultiAgentMockOrchestrationResult:
+    """Build a multi-agent result for an idempotent replay without DB writes."""
+    run_id = str(existing["id"])
+    run_status = str(existing["status"])
+    failure_reason = existing.get("failure_reason")
 
+    result_status = (
+        "succeeded"
+        if run_status == RUN_STATUS_COMPLETED
+        else RESULT_STATUS_FAILED
+        if run_status == RUN_STATUS_FAILED
+        else run_status
+    )
+
+    agent_run_ids = tuple(
+        str(r[0])
+        for r in conn.execute(
+            text(
+                "SELECT id FROM orchestration_agent_runs "
+                "WHERE orchestration_run_id = :r "
+                "ORDER BY created_at, id"
+            ),
+            {"r": run_id},
+        )
+    )
+
+    provider_invocation_ids = tuple(
+        str(r[0])
+        for r in conn.execute(
+            text(
+                "SELECT id FROM provider_invocations "
+                "WHERE orchestration_run_id = :r "
+                "ORDER BY created_at, id"
+            ),
+            {"r": run_id},
+        )
+    )
+
+    agent_output_ids = tuple(
+        str(r[0])
+        for r in conn.execute(
+            text(
+                "SELECT id FROM orchestration_agent_outputs "
+                "WHERE agent_run_id IN ("
+                "  SELECT id FROM orchestration_agent_runs "
+                "  WHERE orchestration_run_id = :r"
+                ") "
+                "ORDER BY sequence_no, id"
+            ),
+            {"r": run_id},
+        )
+    )
+
+    token_usage_record_ids = tuple(
+        str(r[0])
+        for r in conn.execute(
+            text(
+                "SELECT id FROM token_usage_records "
+                "WHERE orchestration_run_id = :r "
+                "ORDER BY recorded_at, id"
+            ),
+            {"r": run_id},
+        )
+    )
+
+    agent_message_ids = tuple(
+        str(r[0])
+        for r in conn.execute(
+            text(
+                "SELECT id FROM orchestration_agent_messages "
+                "WHERE orchestration_run_id = :r "
+                "ORDER BY sequence_no, id"
+            ),
+            {"r": run_id},
+        )
+    )
+
+    source_candidate_ids = tuple(
+        str(r[0])
+        for r in conn.execute(
+            text(
+                "SELECT id FROM source_candidates "
+                "WHERE orchestration_run_id = :r "
+                "ORDER BY created_at, id"
+            ),
+            {"r": run_id},
+        )
+    )
+
+    event_ids = tuple(
+        str(r[0])
+        for r in conn.execute(
+            text(
+                "SELECT id FROM orchestration_events "
+                "WHERE orchestration_run_id = :r "
+                "ORDER BY sequence_no"
+            ),
+            {"r": run_id},
+        )
+    )
+
+    error_code = conn.execute(
+        text(
+            "SELECT error_code FROM orchestration_agent_runs "
+            "WHERE orchestration_run_id = :r AND error_code IS NOT NULL "
+            "ORDER BY created_at, id LIMIT 1"
+        ),
+        {"r": run_id},
+    ).scalar()
+    error_message = str(failure_reason) if failure_reason is not None else None
+
+    failed_agent_config_ids = tuple(
+        str(r[0])
+        for r in conn.execute(
+            text(
+                "SELECT s.agent_config_id "
+                "FROM orchestration_agent_runs ar "
+                "JOIN agent_config_snapshots s "
+                "  ON s.id = ar.agent_config_snapshot_id "
+                "WHERE ar.orchestration_run_id = :r "
+                "  AND ar.status = :failed "
+                "ORDER BY ar.created_at, ar.id"
+            ),
+            {"r": run_id, "failed": AGENT_RUN_STATUS_FAILED},
+        )
+        if r[0] is not None
+    )
+
+    if error_code is None or error_message is None:
+        run_failed_event_for_replay = conn.execute(
+            text(
+                "SELECT event_payload "
+                "FROM orchestration_events "
+                "WHERE orchestration_run_id = :r "
+                "AND event_type = :event_type "
+                "ORDER BY sequence_no DESC LIMIT 1"
+            ),
+            {"r": run_id, "event_type": EVENT_RUN_FAILED},
+        ).mappings().first()
+        run_failed_payload_for_replay: dict[str, Any] = {}
+        if run_failed_event_for_replay is not None:
+            run_failed_payload_for_replay = _as_dict(
+                run_failed_event_for_replay["event_payload"]
+            )
+
+        if error_code is None:
+            payload_error_code = run_failed_payload_for_replay.get("error_code")
+            if payload_error_code is not None:
+                error_code = str(payload_error_code)
+
+        if error_message is None:
+            payload_error_message = run_failed_payload_for_replay.get(
+                "error_message"
+            )
+            if payload_error_message is not None:
+                error_message = str(payload_error_message)
+
+    return MultiAgentMockOrchestrationResult(
+        status=result_status,
+        orchestration_run_id=run_id,
+        agent_run_ids=agent_run_ids,
+        failed_agent_config_ids=failed_agent_config_ids,
+        provider_invocation_ids=provider_invocation_ids,
+        agent_output_ids=agent_output_ids,
+        token_usage_record_ids=token_usage_record_ids,
+        agent_message_ids=agent_message_ids,
+        source_candidate_ids=source_candidate_ids,
+        event_ids=event_ids,
+        error_code=error_code,
+        error_message=error_message,
+        is_mock=True,
+        publication_status=PUBLICATION_STATUS_NOT_EVALUATED,
+        gate_report_id=None,
+    )
 
 def run_single_agent_mock_orchestration(
     conn: Connection,
@@ -1149,6 +1763,425 @@ def run_single_agent_mock_orchestration(
     # 4) Execute the run within the caller's transaction.
     return _execute_run(conn, request, ctx)
 
+
+def _execute_multi_provider_pass(
+    conn: Connection,
+    request: MultiAgentMockOrchestrationRequest,
+    ctx_list: list[_RunContext],
+    budget_limit: int | None,
+    overflow_policy: str | None,
+) -> MultiAgentMockOrchestrationResult:
+    """Execute one mock provider pass per agent.
+
+    This phase persists provider invocations, token usage, messages and agent
+    outputs. Source candidates are intentionally left out for a later
+    micro-patch: provider-declared sources are still not evidence.
+    """
+    run_id = _new_id()
+    seq = _SeqCounter()
+    event_ids: list[str] = []
+    agent_run_ids: list[str] = []
+    provider_invocation_ids: list[str] = []
+    agent_output_ids: list[str] = []
+    token_usage_record_ids: list[str] = []
+    agent_message_ids: list[str] = []
+    source_candidate_ids: list[str] = []
+    failed_agent_config_ids: list[str] = []
+    run_idem = request.idempotency_key
+
+    _insert_multi_orchestration_run(
+        conn,
+        run_id=run_id,
+        request=request,
+        ctx_list=ctx_list,
+        budget_limit=budget_limit,
+        overflow_policy=overflow_policy,
+    )
+
+    event_ids.append(
+        _insert_event(
+            conn,
+            run_id=run_id,
+            event_type=EVENT_RUN_CREATED,
+            sequence_no=seq.next(),
+            idempotency_key=f"{run_idem}:{EVENT_RUN_CREATED}",
+            payload={"agent_count": len(ctx_list)},
+        )
+    )
+
+    _set_run_running(conn, run_id)
+
+    if budget_limit is not None and (
+        overflow_policy is None or overflow_policy == "hard_stop"
+    ):
+        estimated_input_tokens = 0
+        for index, ctx in enumerate(ctx_list):
+            preflight_request = OrchestrationRunnerRequest(
+                tenant_id=request.tenant_id,
+                project_id=request.project_id,
+                master_prompt_version_id=request.master_prompt_version_id,
+                agent_config_id=ctx.agent_config_id,
+                idempotency_key=f"{run_idem}:budget-preflight:{index}",
+                mode=request.mode,
+                execution_mode=request.execution_mode,
+                token_budget_id=request.token_budget_id,
+                mock_source_candidates=(),
+                mock_error_code=None,
+                mock_error_message=None,
+                created_by=request.created_by,
+            )
+            provider_request = _build_provider_request(
+                request=preflight_request,
+                ctx=ctx,
+                run_id=run_id,
+                agent_run_id=_new_id(),
+                snapshot_id=_new_id(),
+            )
+            estimated_input_tokens += op.count_request_input_tokens(
+                provider_request
+            )
+
+        if estimated_input_tokens > budget_limit:
+            error_code = op.ERROR_BUDGET_EXCEEDED
+            error_message = _redact(
+                "multi-agent mock preflight budget check: "
+                f"estimated input tokens {estimated_input_tokens} "
+                f"exceed budget limit {budget_limit}"
+            )
+            event_ids.append(
+                _insert_event(
+                    conn,
+                    run_id=run_id,
+                    event_type=EVENT_TOKEN_BUDGET_EXCEEDED,
+                    sequence_no=seq.next(),
+                    idempotency_key=f"{run_idem}:{EVENT_TOKEN_BUDGET_EXCEEDED}",
+                    payload={
+                        "estimated_input_tokens": estimated_input_tokens,
+                        "budget_limit": budget_limit,
+                        "overflow_policy": overflow_policy,
+                        "agent_count": len(ctx_list),
+                    },
+                )
+            )
+            event_ids.append(
+                _insert_event(
+                    conn,
+                    run_id=run_id,
+                    event_type=EVENT_RUN_FAILED,
+                    sequence_no=seq.next(),
+                    idempotency_key=f"{run_idem}:{EVENT_RUN_FAILED}",
+                    payload={
+                        "error_code": error_code,
+                        "error_message": error_message,
+                    },
+                )
+            )
+            _set_run_terminal(
+                conn,
+                run_id=run_id,
+                status=RUN_STATUS_FAILED,
+                failure_reason=error_message,
+            )
+            return MultiAgentMockOrchestrationResult(
+                status=RESULT_STATUS_FAILED,
+                orchestration_run_id=run_id,
+                agent_run_ids=(),
+                failed_agent_config_ids=(),
+                provider_invocation_ids=(),
+                agent_output_ids=(),
+                token_usage_record_ids=(),
+                agent_message_ids=(),
+                source_candidate_ids=(),
+                event_ids=tuple(event_ids),
+                error_code=error_code,
+                error_message=error_message,
+                is_mock=True,
+                publication_status=PUBLICATION_STATUS_NOT_EVALUATED,
+                gate_report_id=None,
+            )
+
+    first_error_code: str | None = None
+    first_error_message: str | None = None
+
+    for index, ctx in enumerate(ctx_list):
+        snapshot_id = _new_id()
+        agent_run_id = _new_id()
+
+        _insert_agent_config_snapshot(
+            conn,
+            snapshot_id=snapshot_id,
+            run_id=run_id,
+            ctx=ctx,
+        )
+
+        event_ids.append(
+            _insert_event(
+                conn,
+                run_id=run_id,
+                event_type=EVENT_AGENT_RUN_STARTED,
+                sequence_no=seq.next(),
+                idempotency_key=f"{run_idem}:{EVENT_AGENT_RUN_STARTED}:{index}",
+                related_entity_type=RELATED_AGENT_RUN,
+                related_entity_id=agent_run_id,
+                payload={
+                    "agent_config_id": ctx.agent_config_id,
+                    "order_index": ctx.order_index,
+                },
+            )
+        )
+
+        mock_error_cfg = request.mock_error_by_agent.get(ctx.agent_config_id) or {}
+        if not isinstance(mock_error_cfg, dict):
+            mock_error_cfg = {}
+
+        raw_source_candidates = (
+            request.mock_source_candidates_by_agent.get(ctx.agent_config_id, ())
+            or ()
+        )
+        if isinstance(raw_source_candidates, (list, tuple)):
+            mock_source_candidates = tuple(
+                dict(candidate)
+                for candidate in raw_source_candidates
+                if isinstance(candidate, dict)
+            )
+        else:
+            mock_source_candidates = ()
+
+        single_request = OrchestrationRunnerRequest(
+            tenant_id=request.tenant_id,
+            project_id=request.project_id,
+            master_prompt_version_id=request.master_prompt_version_id,
+            agent_config_id=ctx.agent_config_id,
+            idempotency_key=f"{run_idem}:agent:{index}",
+            mode=request.mode,
+            execution_mode=request.execution_mode,
+            token_budget_id=request.token_budget_id,
+            mock_source_candidates=mock_source_candidates,
+            mock_error_code=mock_error_cfg.get("error_code"),
+            mock_error_message=mock_error_cfg.get("error_message"),
+            created_by=request.created_by,
+        )
+
+        provider_request = _build_provider_request(
+            request=single_request,
+            ctx=ctx,
+            run_id=run_id,
+            agent_run_id=agent_run_id,
+            snapshot_id=snapshot_id,
+        )
+
+        adapter = MockProviderAdapter()
+        provider_result = adapter.invoke(provider_request)
+        succeeded = provider_result.status == op.PROVIDER_STATUS_SUCCEEDED
+
+        if succeeded:
+            error_code = None
+            safe_error_message = None
+        else:
+            error_code = (
+                provider_result.error.error_code
+                if provider_result.error
+                else op.ERROR_UNKNOWN
+            )
+            raw_message = (
+                single_request.mock_error_message
+                if single_request.mock_error_message is not None
+                else (
+                    provider_result.error.error_message
+                    if provider_result.error
+                    else None
+                )
+            )
+            safe_error_message = _redact(raw_message)
+            failed_agent_config_ids.append(ctx.agent_config_id)
+            if first_error_code is None:
+                first_error_code = error_code
+                first_error_message = safe_error_message
+
+        _insert_agent_run(
+            conn,
+            agent_run_id=agent_run_id,
+            run_id=run_id,
+            snapshot_id=snapshot_id,
+            status=AGENT_RUN_STATUS_SUCCEEDED
+            if succeeded
+            else AGENT_RUN_STATUS_FAILED,
+            error_code=error_code,
+            failure_reason=safe_error_message,
+        )
+        agent_run_ids.append(agent_run_id)
+
+        agent_message_ids.append(
+            _insert_message(
+                conn,
+                agent_run_id=agent_run_id,
+                run_id=run_id,
+                role="system",
+                content=ctx.role_system_prompt,
+                sequence_no=0,
+            )
+        )
+        agent_message_ids.append(
+            _insert_message(
+                conn,
+                agent_run_id=agent_run_id,
+                run_id=run_id,
+                role="user",
+                content=ctx.prompt_text,
+                sequence_no=1,
+            )
+        )
+        if succeeded:
+            agent_message_ids.append(
+                _insert_message(
+                    conn,
+                    agent_run_id=agent_run_id,
+                    run_id=run_id,
+                    role="assistant",
+                    content=provider_result.content_text or "",
+                    sequence_no=2,
+                )
+            )
+
+        pi_id = _new_id()
+        pi_record = op.to_provider_invocation_record(
+            provider_request,
+            provider_result,
+            attempt_no=1,
+        )
+        if not succeeded:
+            pi_record["error_message"] = safe_error_message
+        _insert_provider_invocation(conn, pi_id=pi_id, record=pi_record)
+        provider_invocation_ids.append(pi_id)
+
+        tu_id = _new_id()
+        tu_record = op.to_token_usage_record(
+            provider_request,
+            provider_result,
+            provider_invocation_id=pi_id,
+            pass_kind=PASS_KIND_INDEPENDENT_ANSWER,
+            attempt_no=1,
+        )
+        _insert_token_usage(conn, tu_id=tu_id, record=tu_record)
+        token_usage_record_ids.append(tu_id)
+
+        if succeeded:
+            output_id = _new_id()
+            _insert_agent_output(
+                conn,
+                output_id=output_id,
+                agent_run_id=agent_run_id,
+                result=provider_result,
+            )
+            agent_output_ids.append(output_id)
+
+            candidate_records = op.source_candidates_to_records(
+                provider_request,
+                provider_result,
+                agent_output_id=output_id,
+            )
+            for candidate_index, candidate_record in enumerate(candidate_records):
+                candidate_id = _new_id()
+                _insert_source_candidate(
+                    conn,
+                    candidate_id=candidate_id,
+                    record=candidate_record,
+                )
+                source_candidate_ids.append(candidate_id)
+                event_ids.append(
+                    _insert_event(
+                        conn,
+                        run_id=run_id,
+                        event_type=EVENT_SOURCE_CANDIDATE_CREATED,
+                        sequence_no=seq.next(),
+                        idempotency_key=(
+                            f"{run_idem}:{EVENT_SOURCE_CANDIDATE_CREATED}:"
+                            f"{index}:{candidate_index}"
+                        ),
+                        related_entity_type=RELATED_SOURCE_CANDIDATE,
+                        related_entity_id=candidate_id,
+                        payload={"agent_config_id": ctx.agent_config_id},
+                    )
+                )
+
+            event_ids.append(
+                _insert_event(
+                    conn,
+                    run_id=run_id,
+                    event_type=EVENT_AGENT_RUN_COMPLETED,
+                    sequence_no=seq.next(),
+                    idempotency_key=f"{run_idem}:{EVENT_AGENT_RUN_COMPLETED}:{index}",
+                    related_entity_type=RELATED_AGENT_RUN,
+                    related_entity_id=agent_run_id,
+                    payload={"agent_config_id": ctx.agent_config_id},
+                )
+            )
+        else:
+            event_ids.append(
+                _insert_event(
+                    conn,
+                    run_id=run_id,
+                    event_type=EVENT_AGENT_RUN_FAILED,
+                    sequence_no=seq.next(),
+                    idempotency_key=f"{run_idem}:{EVENT_AGENT_RUN_FAILED}:{index}",
+                    related_entity_type=RELATED_AGENT_RUN,
+                    related_entity_id=agent_run_id,
+                    payload={
+                        "agent_config_id": ctx.agent_config_id,
+                        "error_code": error_code,
+                        "error_message": safe_error_message,
+                    },
+                )
+            )
+
+    if failed_agent_config_ids:
+        event_ids.append(
+            _insert_event(
+                conn,
+                run_id=run_id,
+                event_type=EVENT_RUN_FAILED,
+                sequence_no=seq.next(),
+                idempotency_key=f"{run_idem}:{EVENT_RUN_FAILED}",
+                payload={
+                    "error_code": first_error_code,
+                    "error_message": first_error_message,
+                    "failed_agent_config_ids": failed_agent_config_ids,
+                },
+            )
+        )
+        _set_run_terminal(
+            conn,
+            run_id=run_id,
+            status=RUN_STATUS_FAILED,
+            failure_reason=first_error_message,
+        )
+        result_status = RESULT_STATUS_FAILED
+    else:
+        _set_run_terminal(
+            conn,
+            run_id=run_id,
+            status=RUN_STATUS_COMPLETED,
+            failure_reason=None,
+        )
+        result_status = RESULT_STATUS_SUCCEEDED
+
+    return MultiAgentMockOrchestrationResult(
+        status=result_status,
+        orchestration_run_id=run_id,
+        agent_run_ids=tuple(agent_run_ids),
+        failed_agent_config_ids=tuple(failed_agent_config_ids),
+        provider_invocation_ids=tuple(provider_invocation_ids),
+        agent_output_ids=tuple(agent_output_ids),
+        token_usage_record_ids=tuple(token_usage_record_ids),
+        agent_message_ids=tuple(agent_message_ids),
+        source_candidate_ids=tuple(source_candidate_ids),
+        event_ids=tuple(event_ids),
+        error_code=first_error_code,
+        error_message=first_error_message,
+        is_mock=True,
+        publication_status=PUBLICATION_STATUS_NOT_EVALUATED,
+        gate_report_id=None,
+    )
 
 def _execute_run(
     conn: Connection,
