@@ -1,6 +1,8 @@
 # PROJECT_STATE — Evidence-First MVP-0
 
-Documento di onboarding tecnico, una pagina, leggibile dal collaboratore al primo accesso senza dover leggere il codice. Riflette lo stato del repo al commit di chiusura tecnica della sotto-fase **8.8B-REPORT** (Anti-Hallucination Report API aggregata): `af74187c0df8d89ab7a22e9f902132de27582313` ("Fix report CVE lineage and add realistic flow").
+Documento di onboarding tecnico, una pagina, leggibile dal collaboratore al primo accesso senza dover leggere il codice. Riflette lo stato del repo al commit più recente su `main`: `28cecbe` ("Add multi-agent mock orchestration runner").
+
+**Punto più recente del repository: sotto-fase ORCH-MULTI-A** (bounded multi-agent **mock** orchestration runner). La sotto-fase **8.8B-REPORT** (Anti-Hallucination Report API aggregata, commit `af74187`, "Fix report CVE lineage and add realistic flow") **resta tecnicamente chiusa e invariata**, ma **non è più il punto più recente del repository**.
 
 ---
 
@@ -10,7 +12,7 @@ Piattaforma multi-AI **evidence-first** ed **evidence-gated**.
 
 Il sistema è progettato per impedire che claim fattuali non supportati, contraddetti o basati su fonti inadeguate vengano pubblicati come affidabili. **Il progetto non promette di eliminare le allucinazioni in senso assoluto**: promette evidenze tracciabili, registrate nel Claim Ledger, verificate dal CVE-lite, valutate sul piano della qualità delle fonti, **verificate anche sull'asse della relazione semantica claim ↔ evidence_span via Claim Entailment**, propagate via lifecycle e source-loss, **e consumate dal Final Answer Gate** prima di qualunque pubblicazione. La piattaforma rende visibili o blocca i claim non supportati, contraddetti o basati su fonti inadeguate prima della pubblicazione affidabile; non garantisce che un LLM non generi internamente output errati.
 
-Nel MVP-0 il nucleo evidence-gated è costruito **prima** della visione multi-AI. Provider AI reali, Verified Web Mode, Hybrid Mode, consensus engine, contradiction detector avanzato e critical reviewer sono fasi future. Il claim "evidence-gated" qui significa: esiste una base append-only verificabile end-to-end per draft/gate/published, una propagazione lifecycle e source-loss minimale per MVP-0, una superficie di osservabilità HTTP read-only sopra di essa, un Source Quality Evaluator deterministico mock (8.7) che scrive assessment append-only sulle fonti che supportano i claim, una policy decisionale (8.7G) che fa consultare quegli assessment al Final Answer Gate per bloccare o segnalare warning su fonti inadeguate, validata end-to-end da un realistic flow test (8.7H), un Claim Entailment Checker (8.8A) deterministico mock che scrive append-only sul piano della relazione semantica claim ↔ quote, consumato dal Final Answer Gate con policy P1 (block solo su `contradicted`), validato end-to-end da un realistic flow test (8.8A-GATE-FLOW), **e ora un'Anti-Hallucination Report API aggregata task-level (8.8B-REPORT) che espone in sola lettura una vista derivata di publication, gate, claims, evidence, CVE-lite, Source Quality, Claim Entailment, coverage gaps, mock indicators e limitations, validata end-to-end da un realistic flow test (8.8B-REPORT-FLOW) che esercita warning path con i mock reali e block path tramite stub dell'orchestrator entailment**.
+Nel MVP-0 il nucleo evidence-gated è costruito **prima** della visione multi-AI. Provider AI reali, Verified Web Mode, Hybrid Mode, consensus engine, detector avanzato di contraddizioni e critical reviewer sono fasi future. Il claim "evidence-gated" qui significa: esiste una base append-only verificabile end-to-end per draft/gate/published, una propagazione lifecycle e source-loss minimale per MVP-0, una superficie di osservabilità HTTP read-only sopra di essa, un Source Quality Evaluator deterministico mock (8.7) che scrive assessment append-only sulle fonti che supportano i claim, una policy decisionale (8.7G) che fa consultare quegli assessment al Final Answer Gate per bloccare o segnalare warning su fonti inadeguate, validata end-to-end da un realistic flow test (8.7H), un Claim Entailment Checker (8.8A) deterministico mock che scrive append-only sul piano della relazione semantica claim ↔ quote, consumato dal Final Answer Gate con policy P1 (block solo su `contradicted`), validato end-to-end da un realistic flow test (8.8A-GATE-FLOW), **e ora un'Anti-Hallucination Report API aggregata task-level (8.8B-REPORT) che espone in sola lettura una vista derivata di publication, gate, claims, evidence, CVE-lite, Source Quality, Claim Entailment, coverage gaps, mock indicators e limitations, validata end-to-end da un realistic flow test (8.8B-REPORT-FLOW) che esercita warning path con i mock reali e block path tramite stub dell'orchestrator entailment**.
 
 **Distinzioni semantiche da preservare in tutta la documentazione:**
 
@@ -33,6 +35,25 @@ Una fonte citata non implica un claim vero. Una quote presente non implica che l
 | 8.7 | Source Quality (A–H) | **chiusa** |
 | 8.8A | Claim Entailment Checker | **tecnicamente chiusa** (mancano read API claim-entailment dedicata e UI) |
 | 8.8B-REPORT | Anti-Hallucination Report API aggregata | **tecnicamente chiusa** (mancano UI, RBAC, lifecycle/source-loss details) |
+
+### Fasi orchestration (mock-only) — più recenti di 8.8B-REPORT
+
+Fasi product/orchestration concluse, tutte **mock-only** (nessun provider AI reale, nessun network I/O):
+
+| Fase | Stato |
+|---|---|
+| PRODUCT-ORCHESTRATION-PRE | done |
+| PRODUCT-ORCHESTRATION-PRE-FIX-A | done |
+| ORCH-SCHEMA-PRE | done |
+| ORCH-SCHEMA-A | done |
+| ORCH-PROVIDER-PRE | done |
+| ORCH-PROVIDER-A | done |
+| ORCH-RUNNER-PRE | done |
+| ORCH-RUNNER-A | done |
+| ORCH-MULTI-A-PRE | done |
+| ORCH-MULTI-A | **done, commit `28cecbe`** |
+
+ORCH-MULTI-A aggiunge un bounded multi-agent **mock** orchestration runner. È **mock-only**, **non integrata nella pipeline `task.created`**, **non integrata nella UI**, **non pubblica risposte**, e **non esegue il Final Answer Gate**. Vedi sezione "Orchestration foundation (mock-only)" e "ORCH-MULTI-A status" sotto. Dettaglio in `ORCH_MULTI_A_IMPLEMENTATION_REPORT.md`.
 
 ### Blocchi 8.8A
 
@@ -78,9 +99,10 @@ Una fonte citata non implica un claim vero. Una quote presente non implica che l
 | `0008_coverage_gap_source_quality.sql` | applicata (Fase 8.7G), immutabile |
 | `0009_claim_entailment_checks.sql` | applicata (Fase 8.8A-SCHEMA), immutabile |
 | `0010_coverage_gap_entailment.sql` | applicata (Fase 8.8A-GATE-SCHEMA), immutabile |
-| `0011_*` retention futura | numero da assegnare; retention reale distruttiva ancora non scritta |
+| `0011_orchestration_schema.sql` | applicata (ORCH-SCHEMA-A), immutabile |
+| `0012_*` retention futura | numero da assegnare; retention reale distruttiva ancora non scritta |
 
-**Nota di rinumerazione:** la retention futura distruttiva resta a `0011_*` o successivo. **8.8B-REPORT NON ha introdotto nessuna nuova migration**: l'endpoint è una vista derivata strettamente read-only sopra le tabelle append-only esistenti.
+**Nota di rinumerazione:** la retention futura distruttiva slitta a `0012_*` o successiva perché `0011_orchestration_schema.sql` è già occupata dalla foundation orchestration. 8.8B-REPORT non ha introdotto migration; ORCH-SCHEMA-A ha introdotto `0011_orchestration_schema.sql`.
 
 ---
 
@@ -198,7 +220,53 @@ GET /api/v1/tasks/{task_id}/anti-hallucination-report
 - `apps/api` tests → 112 passed, 8 skipped
 - root tests → 164 passed
 
-**Prossimo blocco consigliato:** **UI-PRE**. Il report aggregato è il primo contratto stabile su cui aprire la fase UI; la UI dovrebbe usarlo come superficie primaria di rendering anti-allucinazione, e gli endpoint read specialistici (8.6, 8.7F, 8.8A-READ-A) come superficie secondaria per il drill-down.
+**Prossimo blocco consigliato sul ramo UI:** **UI-PRE** (il ramo orchestration immediato è invece ORCH-MULTI-B-PRE; vedi "Prossimo passo"). Il report aggregato è il primo contratto stabile su cui aprire la fase UI; la UI dovrebbe usarlo come superficie primaria di rendering anti-allucinazione, e gli endpoint read specialistici (8.6, 8.7F, 8.8A-READ-A) come superficie secondaria per il drill-down.
+
+### Orchestration foundation (mock-only) — ORCH-SCHEMA / ORCH-PROVIDER / ORCH-RUNNER / ORCH-MULTI-A
+
+Sopra il nucleo evidence-gated esiste oggi una **orchestration foundation mock-only**, separata dalla pipeline `task.created` e non integrata in essa. Comprende:
+
+- **orchestration schema foundation** (tabelle elencate sotto);
+- **mock provider abstraction** (nessun provider AI reale, nessun network I/O);
+- **single-agent mock orchestration runner**;
+- **bounded multi-agent mock orchestration runner** (ORCH-MULTI-A).
+
+Tabelle dell'orchestration foundation:
+
+- `orchestration_runs`
+- `agent_config_snapshots`
+- `orchestration_events`
+- `orchestration_agent_runs`
+- `orchestration_agent_messages`
+- `provider_invocations`
+- `token_usage_records`
+- `orchestration_agent_outputs`
+- `source_candidates`
+- `token_budgets`
+
+**Semantica `source_candidates`.** I `source_candidates` sono **proposte non verificate** prodotte dall'adapter del provider mock:
+
+- **NON** sono `evidence_spans`;
+- **NON** sono `claim_evidence_links`;
+- una provider citation / source **non** è evidenza;
+- incidono su qualunque cosa downstream **solo dopo** future fasi di source resolution, retrieval, evidence extraction, source verification, claim binding e gate evaluation — nessuna delle quali esiste oggi.
+
+**Semantica provider output.** L'output del provider è **output auditabile dell'agent**:
+
+- **non** è una final answer;
+- **non** è una published answer;
+- **non** bypassa il Final Answer Gate.
+
+#### ORCH-MULTI-A status
+
+- ORCH-MULTI-A è **mock-only**.
+- Esiste un **bounded multi-agent mock runner**; funzione pubblica: `run_multi_agent_mock_orchestration`.
+- Test finale documentato nel report: **17 passed**.
+- Il **Final Answer Gate NON è eseguito** in questa fase.
+- I `final_gate_reports` **non** sono creati in questa fase.
+- I `published_answers` **non** sono creati in questa fase.
+- Ogni risultato multi-agent della fase mantiene `publication_status = "not_evaluated"` e `gate_report_id = None`.
+- ORCH-MULTI-A **non** è integrata nella pipeline `task.created`, **non** è integrata nella UI, **non** pubblica risposte.
 
 ---
 
@@ -242,7 +310,7 @@ GET /api/v1/tasks/{task_id}/anti-hallucination-report
 
 - **NON esiste** `GET /api/v1/claims/{logical_id}/entailment-checks` (read API claim-level entailment, rinviata a 8.8A-READ-B).
 - **NON esiste** `GET /api/v1/published-answers/{id}/anti-hallucination-report` (variante published-answer-level del report, rinviata a 8.8B-REPORT-CODE v2 se la UI lo richiederà).
-- **NON esiste** un Citation-to-Claim Validator (8.8B "storico", distinto da 8.8B-REPORT) né un Contradiction Detector reale (8.8C) né un Final Answer Sentence Gate (8.8D) né External Verification / Web-RAG (8.9) né multi-agent consensus reale (9.0).
+- **NON esiste** un validatore citazione-claim (8.8B "storico", distinto da 8.8B-REPORT) né un detector di contraddizioni reale (8.8C) né un Final Answer Sentence Gate (8.8D) né External Verification / Web-RAG (8.9) né multi-agent consensus reale (9.0).
 
 L'endpoint `/final-gate-report` non è stato modificato in 8.8B-REPORT: continua a esporre i `coverage_gap_statements` collegati al draft. Quei gap possono ora avere `kind ∈ {entailment_block, entailment_warning, source_quality_block, source_quality_warning, unverified_claim, missing_evidence, out_of_scope, source_loss}`. Il `payload` del gate report include una sezione `entailment` con counts e identità della policy.
 
@@ -345,15 +413,30 @@ Test plan implementato (in aggiunta a quelli già documentati per 8.4 / 8.5 / 8.
 
 Componenti **ancora mancanti** dopo la chiusura tecnica di 8.8B-REPORT:
 
-- **UI-PRE / UI** — Nessuna interfaccia utente espone ancora il report aggregato né i gap entailment / source_quality. Prossimo blocco consigliato.
+- **UI-PRE / UI** — Nessuna interfaccia utente espone ancora il report aggregato né i gap entailment / source_quality. Prossimo blocco consigliato sul ramo UI (il ramo orchestration immediato è ORCH-MULTI-B-PRE).
 - **8.8A-READ-B** — Read API claim-level per `claim_entailment_checks` (`GET /api/v1/claims/{logical_id}/entailment-checks`). Backlog; valutabile se la UI di dettaglio claim lo richiede.
 - **8.8B-REPORT v2 (published-answer-level)** — Variante `GET /api/v1/published-answers/{id}/anti-hallucination-report`. Rinviata; ricostruibile lato UI da `published_answers.task_id`.
 - **8.8B-REPORT-SHARED** — Promozione di `AntiHallucinationReportRead` a Pydantic shared model. Rinviata; valutare se la shape resta stabile dopo le prime due-tre integrazioni UI.
-- **8.8B — Citation-to-Claim Validator** (8.8B storico, distinto da 8.8B-REPORT). Verifica che il claim citi le evidenze corrette, non evidenze "vicine" che non lo supportano. **Mancante.**
-- **8.8C — Contradiction Detector reale.** Detector reale di contraddizioni tra claim o tra fonti (oggi il mock entailment non emette `contradicted` spontaneamente). Quando attivato, il Branch entailment_block del Gate si attiverà naturalmente. **Mancante.**
+- **8.8B — validatore citazione-claim** (8.8B storico, distinto da 8.8B-REPORT). Verifica che il claim citi le evidenze corrette, non evidenze "vicine" che non lo supportano. **Mancante.**
+- **8.8C — detector di contraddizioni reale.** Detector reale di contraddizioni tra claim o tra fonti (oggi il mock entailment non emette `contradicted` spontaneamente). Quando attivato, il Branch entailment_block del Gate si attiverà naturalmente. **Mancante.**
 - **8.8D — Final Answer Sentence Gate.** Gate a livello frase del published_answer. **Mancante.**
 - **8.9 — External Verification / Web-RAG controllato.** Verifica esterna su fonti web in modalità controllata. **Mancante.**
 - **9.0 — Multi-agent consensus + adversarial review reale.** Provider AI reali, consensus engine, critical reviewer adversariale. **Mancante.**
+
+### Orchestration — cosa NON esiste ancora (post ORCH-MULTI-A)
+
+Esiste un **bounded multi-agent mock runner** (ORCH-MULTI-A). **Non** esistono ancora:
+
+- multi-agent reale con provider reali;
+- source resolution pass;
+- source retrieval reale;
+- source verification downstream per l'orchestration;
+- evidence extraction da `source_candidates`;
+- claim binding da `source_candidates`;
+- synthesis / candidate synthesis;
+- Final Answer Gate integration per l'orchestration runner;
+- publication dall'orchestration runner;
+- API / UI orchestration.
 
 ### Altri debiti tecnici
 
@@ -363,13 +446,13 @@ Componenti **ancora mancanti** dopo la chiusura tecnica di 8.8B-REPORT:
 - **Backfill source quality per task pre-8.7E.** Analogo per Source Quality.
 - **Recompile/v2 dopo entailment_block o source_quality_block.** Un task bloccato non ha oggi un path applicativo per ritentare con un draft v2 (il compiler emette solo v1). Rejected è terminale per quel task.
 - **`coverage_gap_statements` senza trigger append-only.** La tabella non ha un trigger `reject_modify_append_only`. 8.7G/8.8A/8.8B-REPORT rispettano operativamente l'invariante insert-only, ma non c'è enforcement a DB.
-- **Retention reale distruttiva** (`0011_*` da scrivere). Le tabelle 8.5/8.7/8.8A crescono senza pruning.
+- **Retention reale distruttiva** (`0012_*` da scrivere; `0011_orchestration_schema.sql` è già occupata dalla foundation orchestration). Le tabelle 8.5/8.7/8.8A crescono senza pruning.
 - **RBAC / redaction** sui payload JSONB esposti dagli endpoint read 8.6/8.7F/8.8A-READ-A e **dal report 8.8B-REPORT** (che compone payload da molti assi in un singolo response body, aggravando il rischio di leak). Dichiarata in `limitations`.
 - **Provider AI reali, Verified Web Mode, Hybrid Mode.** MVP-0 gira con `PROVIDERS_ENABLED=mock` e `MAX_COST_PER_TASK=0`.
 - **Renderer ed export** Markdown/HTML/PDF/DOCX/JSON-LD.
 - **Auth reale.**
 - **DLQ esplicita per il worker.**
-- **UI completa.** Nessuna UI espone ancora il report aggregato né i nuovi gap `entailment_*` o i gap `source_quality_*`. Prossimo blocco consigliato (UI-PRE).
+- **UI completa.** Nessuna UI espone ancora il report aggregato né i nuovi gap `entailment_*` o i gap `source_quality_*`. Prossimo blocco consigliato sul ramo UI (UI-PRE); sul ramo orchestration il prossimo blocco è ORCH-MULTI-B-PRE.
 - **OCR / parsing PDF, vector store cloud, storage S3 / GCS / Azure operativo.**
 - **Cursor pagination** sugli endpoint read 8.6/8.7F/8.8A-READ-A. Il report 8.8B-REPORT non è paginato in v1 (task-level naturalmente bounded).
 - **Worker main loop reale negli end-to-end test.** I realistic flow 8.5/8.6/8.7H/8.8A-GATE-FLOW/8.8B-REPORT-FLOW usano FakeRedis e invocano `dispatch.handle_event` direttamente.
@@ -400,18 +483,19 @@ Componenti **ancora mancanti** dopo la chiusura tecnica di 8.8B-REPORT:
 
 ## Prossimo passo
 
-**Sotto-fase 8.8B-REPORT tecnicamente chiusa al commit `af74187`.** Il prossimo blocco operativo consigliato è:
+**Sotto-fase 8.8B-REPORT tecnicamente chiusa al commit `af74187`; punto più recente del repository: ORCH-MULTI-A (commit `28cecbe`).** Esistono due rami complementari, da decidere con prompt dedicato:
 
-- **UI-PRE** — Apertura della fase UI. Il report aggregato 8.8B-REPORT è il primo contratto stabile su cui aprire la fase UI: la UI dovrebbe usarlo come superficie primaria di rendering anti-allucinazione (publication, gate, coverage gaps, claims con CVE-lite/SQ/CE, evidence, axis_summary, mock_indicators, limitations), e gli endpoint read specialistici (8.6, 8.7F, 8.8A-READ-A) come superficie secondaria per il drill-down.
+- **Ramo orchestration (immediato consigliato) — ORCH-MULTI-B-PRE:** design di un **source resolution pass** per i `source_candidates` proposti dagli agent. Sarà **design-only** e dovrà preservare le invarianti: un `source_candidate` **non** è evidence; una provider citation / source **non** è evidence; il source resolution **non** deve automaticamente rendere publishable alcunché; **nessun Gate** e **nessuna publication** in quel pass.
+- **Ramo UI (complementare) — UI-PRE:** resta valido se si decide di tornare alla UI anti-hallucination report. Il report aggregato 8.8B-REPORT è il primo contratto stabile su cui aprire la fase UI: la UI dovrebbe usarlo come superficie primaria di rendering anti-allucinazione (publication, gate, coverage gaps, claims con CVE-lite/SQ/CE, evidence, axis_summary, mock_indicators, limitations), e gli endpoint read specialistici (8.6, 8.7F, 8.8A-READ-A) come superficie secondaria per il drill-down.
 
 Direzioni complementari (sempre da decidere con prompt dedicato):
 
 - **8.8A-READ-B** — Read API claim-level per `claim_entailment_checks` (`GET /api/v1/claims/{logical_id}/entailment-checks`). Backlog; valutabile se la UI di dettaglio claim lo richiede.
 - **8.8B-REPORT v2 (published-answer-level)** — Endpoint `GET /api/v1/published-answers/{id}/anti-hallucination-report`. Rinviato.
 - **8.8B-REPORT-SHARED** — Promozione di `AntiHallucinationReportRead` a Pydantic shared model. Rinviata.
-- **0011_* retention** una volta deciso il perimetro distruttivo.
+- **0012_* retention** una volta deciso il perimetro distruttivo.
 - **RBAC e redaction** dei JSONB esposti dagli endpoint read 8.6/8.7F/8.8A-READ-A/8.8B-REPORT e dei `details` dei `coverage_gap_statements`.
 - **Cursor pagination** sugli endpoint read.
 - **Smoke test end-to-end con Redis reale** e worker main loop reale.
 - **Trigger append-only** su `coverage_gap_statements`.
-- **8.8C — Contradiction Detector reale** per attivare spontaneamente il Branch `entailment_block` (e popolare `source_quality_assessments.contradiction_status` con valori reali).
+- **8.8C — detector di contraddizioni reale** per attivare spontaneamente il Branch `entailment_block` (e popolare `source_quality_assessments.contradiction_status` con valori reali).
