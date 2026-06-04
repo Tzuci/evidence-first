@@ -1,12 +1,15 @@
-"""Pure-logic base of the source resolution pass (Phase ORCH-MULTI-B1).
+"""Source resolution pass: pure logic (ORCH-MULTI-B1) + DB-backed pass
+(ORCH-MULTI-B2).
 
-This module is the FIRST, pure-logic-only slice of the mock/local-only
-source resolution pass designed in PHASE_ORCH_MULTI_B_PRE.md. It defines the
-request/result contracts, the deterministic value objects, and the pure
-functions that a later DB-backed pass (ORCH-MULTI-B2) will compose. It does
-NOT write to a database, does NOT open a connection, does NOT invoke a
-provider, opens NO socket, imports NO FastAPI, NO Redis, NO HTTP client and
-NO provider SDK. It uses only the Python standard library.
+This module is the mock/local-only source resolution pass designed in
+PHASE_ORCH_MULTI_B_PRE.md. ORCH-MULTI-B1 introduced the request/result
+contracts, the deterministic value objects, and the pure functions; this
+ORCH-MULTI-B2 slice composes them into the DB-backed
+``run_source_resolution_pass``. It does NOT open its own connection, does NOT
+commit and does NOT rollback: the caller owns the transaction. It opens NO
+socket, invokes NO provider, imports NO FastAPI, NO Redis, NO HTTP client and
+NO provider SDK. Beyond the Python standard library it uses only SQLAlchemy's
+``text`` / ``Connection`` to talk to the caller-owned connection.
 
 Strict scope (PHASE_ORCH_MULTI_B_PRE.md §1, §8, §16):
 
@@ -14,6 +17,7 @@ Strict scope (PHASE_ORCH_MULTI_B_PRE.md §1, §8, §16):
   - NO source verification, NO ``source_verifications`` row.
   - NO ``evidence_spans``, NO ``claim_evidence_links``, NO claim binding.
   - NO Final Answer Gate, NO ``final_gate_reports``, NO ``published_answers``.
+  - NO ``token_usage_records`` written by this pass.
   - NO UPDATE of ``source_candidates``: ``source_candidates`` is append-only;
     the current state of a candidate is DERIVED from its latest
     ``source_resolutions`` row (see ``_derive_candidate_state``), never read
@@ -42,10 +46,15 @@ Redaction note:
 """
 from __future__ import annotations
 
+import json
 import re
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
+
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
 
 
 # ===========================================================================
@@ -97,15 +106,25 @@ EVENT_SOURCE_RESOLUTION_STARTED = "source_resolution_started"
 EVENT_SOURCE_RESOLUTION_COMPLETED = "source_resolution_completed"
 
 # token_usage_records.pass_kind value reserved for this pass (0011). Not used
-# by the pure-logic slice; declared here for the later DB-backed pass.
+# by this pass; declared here for a future usage-recording phase.
 PASS_KIND_SOURCE_RESOLUTION = "source_resolution"
 
 # Publication is never evaluated by this pass (§4).
 PUBLICATION_STATUS_NOT_EVALUATED = "not_evaluated"
 
+# Synthetic pass result-status values (§6, §12).
+RESULT_STATUS_SUCCEEDED = "succeeded"
+RESULT_STATUS_FAILED = "failed"
+
 # Candidate-selection scopes (§7).
 SELECTION_SCOPE_PER_RUN = "per_run"
 SELECTION_SCOPE_PER_AGENT_OUTPUT = "per_agent_output"
+
+# Discriminant kind used to compose the resolution idempotency key (§11).
+RESOLUTION_IDEMPOTENCY_KIND = "source_resolution"
+
+# Related-entity type tag written on orchestration_events.related_entity_type.
+RELATED_SOURCE_CANDIDATE = "source_candidate"
 
 # Bounded default (§13). The exact value is an implementation constant.
 MAX_CANDIDATES_DEFAULT = 32
@@ -206,15 +225,15 @@ def _redact_failure_reason(message: object | None) -> str | None:
     """
     if message is None:
         return None
-    text = message if isinstance(message, str) else str(message)
-    text = _SENSITIVE_TEXT_RE.sub(
+    text_value = message if isinstance(message, str) else str(message)
+    text_value = _SENSITIVE_TEXT_RE.sub(
         lambda m: f"{m.group('name')}{m.group('sep')}{_REDACTED_PLACEHOLDER}",
-        text,
+        text_value,
     )
-    text = text.strip()
-    if len(text) > _MAX_FAILURE_REASON_LEN:
-        text = text[:_MAX_FAILURE_REASON_LEN] + "...[truncated]"
-    return text
+    text_value = text_value.strip()
+    if len(text_value) > _MAX_FAILURE_REASON_LEN:
+        text_value = text_value[:_MAX_FAILURE_REASON_LEN] + "...[truncated]"
+    return text_value
 
 
 # ===========================================================================
@@ -289,6 +308,26 @@ def _derive_candidate_state(latest_resolution: Mapping[str, Any] | None) -> str:
         return SOURCE_CANDIDATE_STATUS_RESOLUTION_FAILED
     # Unknown / unexpected outcome: never optimistic.
     return SOURCE_CANDIDATE_STATUS_RESOLUTION_FAILED
+
+
+def _derive_current_candidate_state(
+    candidate: Mapping[str, Any],
+    latest_resolution: Mapping[str, Any] | None,
+) -> str:
+    """Derive a candidate's current state, honouring its initial status (§9).
+
+    When a resolution exists, the latest resolution is authoritative and the
+    derived state comes from it. When NO resolution exists yet, the candidate's
+    own ``status`` is authoritative: source_candidates is append-only, so this
+    is the row's *initial* status (never a mutated one). A candidate seeded as
+    e.g. ``rejected`` or ``insufficient_metadata`` with no resolution must NOT
+    be treated as ``proposed`` and silently picked up by the pass.
+
+    Falls back to ``proposed`` only when the candidate carries no usable status.
+    """
+    if latest_resolution is not None:
+        return _derive_candidate_state(latest_resolution)
+    return str(candidate.get("status") or SOURCE_CANDIDATE_STATUS_PROPOSED)
 
 
 def _classify_candidate(candidate: Mapping[str, Any]) -> CandidateResolutionDecision:
@@ -438,19 +477,421 @@ def _increment_counters_for_outcome(counters: dict[str, int], outcome: str) -> N
 
 
 # ===========================================================================
-# DB-backed pass — stub (implemented in ORCH-MULTI-B2)
+# DB-backed pass — validation and result builders (ORCH-MULTI-B2)
+# ===========================================================================
+
+
+def _validate_pass_request(request: SourceResolutionPassRequest) -> str | None:
+    """Validate the request without any DB access (§1).
+
+    Returns an error string on the first problem, or None when the request is
+    well-formed. A controlled validation failure makes the pass return a failed
+    result that wrote nothing, never an uncaught exception.
+    """
+    if not request.tenant_id or not str(request.tenant_id).strip():
+        return "tenant_id must be a non-empty string"
+    if not request.orchestration_run_id or not str(request.orchestration_run_id).strip():
+        return "orchestration_run_id must be a non-empty string"
+    if not request.idempotency_key or not str(request.idempotency_key).strip():
+        return "idempotency_key must be a non-empty string"
+    if not isinstance(request.max_candidates, int) or request.max_candidates <= 0:
+        return "max_candidates must be a positive integer"
+    if request.candidate_selection_scope not in (
+        SELECTION_SCOPE_PER_RUN,
+        SELECTION_SCOPE_PER_AGENT_OUTPUT,
+    ):
+        return (
+            "candidate_selection_scope must be "
+            f"{SELECTION_SCOPE_PER_RUN!r} or {SELECTION_SCOPE_PER_AGENT_OUTPUT!r}"
+        )
+    if request.candidate_selection_scope == SELECTION_SCOPE_PER_AGENT_OUTPUT and (
+        not request.agent_output_id or not str(request.agent_output_id).strip()
+    ):
+        return "agent_output_id is required when scope is per_agent_output"
+    return None
+
+
+def _failed_pass_result(
+    request: SourceResolutionPassRequest,
+) -> SourceResolutionPassResult:
+    """Build a failed pass result that wrote nothing (§1, §2)."""
+    return SourceResolutionPassResult(
+        status=RESULT_STATUS_FAILED,
+        orchestration_run_id=request.orchestration_run_id or None,
+        source_resolution_ids=(),
+        per_candidate_outcomes={},
+        event_ids=(),
+        counters=_build_initial_counters(),
+        publication_status=PUBLICATION_STATUS_NOT_EVALUATED,
+        gate_report_id=None,
+    )
+
+
+# ===========================================================================
+# DB-backed pass — DB read/write helpers (ORCH-MULTI-B2)
+# ===========================================================================
+
+
+def _select_run(conn: Connection, tenant_id: str, run_id: str) -> Mapping[str, Any] | None:
+    """Confirm the run exists AND belongs to the tenant (§2)."""
+    return (
+        conn.execute(
+            text(
+                "SELECT id FROM orchestration_runs "
+                "WHERE id = :run_id AND tenant_id = :tenant_id"
+            ),
+            {"run_id": run_id, "tenant_id": tenant_id},
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _select_scoped_candidates(
+    conn: Connection, request: SourceResolutionPassRequest
+) -> list[dict[str, Any]]:
+    """Select candidates in scope, ordered deterministically (§3, §7).
+
+    Tenant + run scoped, optionally further filtered by agent_output_id; sorted
+    in memory by ``_stable_candidate_sort_key`` so the DB row order never leaks
+    into the result.
+    """
+    sql = (
+        "SELECT id, agent_output_id, status, created_at, url, provenance, "
+        "raw_citation_payload "
+        "FROM source_candidates "
+        "WHERE tenant_id = :tenant_id AND orchestration_run_id = :run_id"
+    )
+    params: dict[str, Any] = {
+        "tenant_id": request.tenant_id,
+        "run_id": request.orchestration_run_id,
+    }
+    if request.candidate_selection_scope == SELECTION_SCOPE_PER_AGENT_OUTPUT:
+        sql += " AND agent_output_id = :agent_output_id"
+        params["agent_output_id"] = request.agent_output_id
+    rows = [dict(row) for row in conn.execute(text(sql), params).mappings().all()]
+    rows.sort(key=_stable_candidate_sort_key)
+    return rows
+
+
+def _next_sequence_no(conn: Connection, run_id: str) -> int:
+    """Compute the next sequence_no in the run's existing event space (§4).
+
+    ``COALESCE(MAX(sequence_no), -1) + 1`` so a run with no events starts at 0
+    and an existing run continues contiguously; never restarts from 0.
+    """
+    value = conn.execute(
+        text(
+            "SELECT COALESCE(MAX(sequence_no), -1) + 1 "
+            "FROM orchestration_events WHERE orchestration_run_id = :run_id"
+        ),
+        {"run_id": run_id},
+    ).scalar()
+    return int(value if value is not None else 0)
+
+
+def _latest_resolution(
+    conn: Connection, candidate_id: str
+) -> Mapping[str, Any] | None:
+    """Return the candidate's latest resolution (created_at DESC, id DESC) (§3, §9)."""
+    return (
+        conn.execute(
+            text(
+                "SELECT outcome FROM source_resolutions "
+                "WHERE source_candidate_id = :cid "
+                "ORDER BY created_at DESC, id DESC LIMIT 1"
+            ),
+            {"cid": candidate_id},
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _existing_resolution(
+    conn: Connection, candidate_id: str, resolution_idem: str
+) -> Mapping[str, Any] | None:
+    """Return an existing resolution for (candidate, idempotency_key), if any (§7)."""
+    return (
+        conn.execute(
+            text(
+                "SELECT id, outcome FROM source_resolutions "
+                "WHERE source_candidate_id = :cid AND idempotency_key = :idem"
+            ),
+            {"cid": candidate_id, "idem": resolution_idem},
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _existing_event_id(
+    conn: Connection, run_id: str, event_type: str, idem: str
+) -> str | None:
+    """Return the id of an already-persisted event with this key, if any (§7)."""
+    value = conn.execute(
+        text(
+            "SELECT id FROM orchestration_events "
+            "WHERE orchestration_run_id = :run_id AND event_type = :et "
+            "AND idempotency_key = :idem"
+        ),
+        {"run_id": run_id, "et": event_type, "idem": idem},
+    ).scalar()
+    return str(value) if value is not None else None
+
+
+def _insert_resolution_event(
+    conn: Connection,
+    *,
+    run_id: str,
+    event_type: str,
+    sequence_no: int,
+    idem: str,
+    candidate_id: str,
+    payload: dict[str, Any],
+) -> str:
+    """Insert one source_resolution_* event in the run's sequence space (§5)."""
+    event_id = str(uuid.uuid4())
+    conn.execute(
+        text(
+            """
+            INSERT INTO orchestration_events
+                (id, orchestration_run_id, event_type, sequence_no,
+                 related_entity_type, related_entity_id, event_payload,
+                 idempotency_key)
+            VALUES
+                (:id, :run_id, :et, :seq, :ret, :rei, CAST(:payload AS JSONB),
+                 :idem)
+            """
+        ),
+        {
+            "id": event_id,
+            "run_id": run_id,
+            "et": event_type,
+            "seq": sequence_no,
+            "ret": RELATED_SOURCE_CANDIDATE,
+            "rei": candidate_id,
+            "payload": json.dumps(payload or {}),
+            "idem": idem,
+        },
+    )
+    return event_id
+
+
+def _insert_source_resolution(
+    conn: Connection,
+    *,
+    resolution_id: str,
+    candidate_id: str,
+    run_id: str,
+    decision: CandidateResolutionDecision,
+    idem: str,
+) -> None:
+    """Insert one append-only source_resolutions row (§6).
+
+    retrieved_artifact_ref / retrieved_artifact_hash are NULL (no retrieval);
+    created_at defaults to NOW() in the DB; no source_verifications,
+    evidence_spans or claim_evidence_links are written.
+    """
+    conn.execute(
+        text(
+            """
+            INSERT INTO source_resolutions
+                (id, source_candidate_id, orchestration_run_id,
+                 resolution_target_kind, outcome, failure_reason,
+                 retrieved_artifact_ref, retrieved_artifact_hash,
+                 idempotency_key)
+            VALUES
+                (:id, :cid, :run_id, :tk, :outcome, :fr, NULL, NULL, :idem)
+            """
+        ),
+        {
+            "id": resolution_id,
+            "cid": candidate_id,
+            "run_id": run_id,
+            "tk": decision.resolution_target_kind,
+            "outcome": decision.outcome,
+            "fr": decision.failure_reason,
+            "idem": idem,
+        },
+    )
+
+
+# ===========================================================================
+# DB-backed pass entry point (ORCH-MULTI-B2)
 # ===========================================================================
 
 
 def run_source_resolution_pass(
-    conn: Any, request: SourceResolutionPassRequest
+    conn: Connection, request: SourceResolutionPassRequest
 ) -> SourceResolutionPassResult:
     """Run the mock/local-only source resolution pass over a run's candidates.
 
-    Not implemented in this pure-logic slice: the DB-backed pass (candidate
-    selection, append-only ``source_resolutions`` writes, event emission,
-    idempotent replay) is added in ORCH-MULTI-B2.
+    DB-backed, append-only, idempotent and bounded. It writes through the
+    caller-owned ``conn`` and does NOT commit and does NOT rollback: the caller
+    owns the transaction (§10 "no transaction ownership"). It performs no
+    network I/O, invokes no provider, and never touches source_verifications,
+    evidence_spans, claim_evidence_links, final_gate_reports or
+    published_answers. publication_status stays 'not_evaluated' and
+    gate_report_id stays None in every path.
     """
-    raise NotImplementedError(
-        "DB-backed source resolution pass is implemented in ORCH-MULTI-B2"
+    # 1) Validation (no DB access). A controlled failure returns failed without
+    #    writing anything.
+    if _validate_pass_request(request) is not None:
+        return _failed_pass_result(request)
+
+    # 2) Confirm the run exists and belongs to the tenant. A missing run is a
+    #    failed pass with no write.
+    if _select_run(conn, request.tenant_id, request.orchestration_run_id) is None:
+        return _failed_pass_result(request)
+
+    base_key = request.idempotency_key
+    counters = _build_initial_counters()
+    source_resolution_ids: list[str] = []
+    event_ids: list[str] = []
+    per_candidate_outcomes: dict[str, str] = {}
+
+    # 3) Candidate selection: tenant + run (+ optional agent_output) scoped,
+    #    deterministic order. candidates_seen counts the scope before the bound.
+    candidates = _select_scoped_candidates(conn, request)
+    counters["candidates_seen"] = len(candidates)
+
+    # 4) Events append onto the run's existing sequence_no space; never from 0.
+    next_sequence_no = _next_sequence_no(conn, request.orchestration_run_id)
+
+    # Bound counter: how many ELIGIBLE candidates we newly process this pass.
+    eligible_handled = 0
+
+    for candidate in candidates:
+        candidate_id = str(candidate["id"])
+        resolution_idem = _build_candidate_scoped_idempotency_key(
+            base_key, RESOLUTION_IDEMPOTENCY_KIND, candidate_id
+        )
+        started_idem = _build_candidate_scoped_idempotency_key(
+            base_key, EVENT_SOURCE_RESOLUTION_STARTED, candidate_id
+        )
+        completed_idem = _build_candidate_scoped_idempotency_key(
+            base_key, EVENT_SOURCE_RESOLUTION_COMPLETED, candidate_id
+        )
+
+        # 7) Idempotent replay: a resolution already exists for this candidate
+        #    under this pass key. Reconstruct ids/outcome; never duplicate.
+        existing = _existing_resolution(conn, candidate_id, resolution_idem)
+        if existing is not None:
+            existing_outcome = str(existing["outcome"])
+            source_resolution_ids.append(str(existing["id"]))
+            per_candidate_outcomes[candidate_id] = existing_outcome
+            counters["candidates_attempted"] += 1
+            _increment_counters_for_outcome(counters, existing_outcome)
+            started_ev = _existing_event_id(
+                conn,
+                request.orchestration_run_id,
+                EVENT_SOURCE_RESOLUTION_STARTED,
+                started_idem,
+            )
+            completed_ev = _existing_event_id(
+                conn,
+                request.orchestration_run_id,
+                EVENT_SOURCE_RESOLUTION_COMPLETED,
+                completed_idem,
+            )
+            if started_ev is not None:
+                event_ids.append(started_ev)
+            if completed_ev is not None:
+                event_ids.append(completed_ev)
+            continue
+
+        # Eligibility from the candidate's CURRENT state: the latest resolution
+        # if one exists, otherwise the candidate's own (append-only, never
+        # mutated) initial status. A candidate whose initial status is not
+        # eligible and has no resolution is skipped, not treated as proposed.
+        latest_resolution = _latest_resolution(conn, candidate_id)
+        derived_state = _derive_current_candidate_state(candidate, latest_resolution)
+        if derived_state not in request.eligible_states:
+            counters["skipped_count"] += 1
+            continue
+
+        # 3) Bound: process at most max_candidates eligible candidates; eligible
+        #    candidates beyond the bound are skipped (left to a later pass).
+        if eligible_handled >= request.max_candidates:
+            counters["skipped_count"] += 1
+            continue
+        eligible_handled += 1
+
+        # 8) Honest, deterministic mock/local-only decision.
+        decision = _classify_candidate(candidate)
+
+        # 5) source_resolution_started event (reuse if a prior partial write
+        #    already created it under the same key; never duplicate).
+        started_event_id = _existing_event_id(
+            conn,
+            request.orchestration_run_id,
+            EVENT_SOURCE_RESOLUTION_STARTED,
+            started_idem,
+        )
+        if started_event_id is None:
+            started_event_id = _insert_resolution_event(
+                conn,
+                run_id=request.orchestration_run_id,
+                event_type=EVENT_SOURCE_RESOLUTION_STARTED,
+                sequence_no=next_sequence_no,
+                idem=started_idem,
+                candidate_id=candidate_id,
+                payload={"source_candidate_id": candidate_id},
+            )
+            next_sequence_no += 1
+        event_ids.append(started_event_id)
+
+        # 6) source_resolutions insert (append-only).
+        resolution_id = str(uuid.uuid4())
+        _insert_source_resolution(
+            conn,
+            resolution_id=resolution_id,
+            candidate_id=candidate_id,
+            run_id=request.orchestration_run_id,
+            decision=decision,
+            idem=resolution_idem,
+        )
+        source_resolution_ids.append(resolution_id)
+
+        # source_resolution_completed event.
+        completed_event_id = _existing_event_id(
+            conn,
+            request.orchestration_run_id,
+            EVENT_SOURCE_RESOLUTION_COMPLETED,
+            completed_idem,
+        )
+        if completed_event_id is None:
+            completed_event_id = _insert_resolution_event(
+                conn,
+                run_id=request.orchestration_run_id,
+                event_type=EVENT_SOURCE_RESOLUTION_COMPLETED,
+                sequence_no=next_sequence_no,
+                idem=completed_idem,
+                candidate_id=candidate_id,
+                payload={
+                    "source_candidate_id": candidate_id,
+                    "outcome": decision.outcome,
+                    "resolution_target_kind": decision.resolution_target_kind,
+                    "failure_reason": decision.failure_reason,
+                },
+            )
+            next_sequence_no += 1
+        event_ids.append(completed_event_id)
+
+        per_candidate_outcomes[candidate_id] = decision.outcome
+        counters["candidates_attempted"] += 1
+        _increment_counters_for_outcome(counters, decision.outcome)
+
+    # 9) Result. A run that exists makes the pass 'succeeded' even with zero
+    #    candidates. publication_status stays not_evaluated, gate_report_id None.
+    return SourceResolutionPassResult(
+        status=RESULT_STATUS_SUCCEEDED,
+        orchestration_run_id=request.orchestration_run_id,
+        source_resolution_ids=tuple(source_resolution_ids),
+        per_candidate_outcomes=per_candidate_outcomes,
+        event_ids=tuple(event_ids),
+        counters=counters,
+        publication_status=PUBLICATION_STATUS_NOT_EVALUATED,
+        gate_report_id=None,
     )
